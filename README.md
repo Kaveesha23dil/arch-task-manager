@@ -5,10 +5,10 @@ Linux. It reads system information **directly from Linux interfaces** such as
 `/proc/stat`, `/proc/meminfo`, and `/proc/<pid>/` — no shelling out to `ps`,
 `free`, `top`, `htop`, or other external tools.
 
-> Stage: **Step 3** — CPU, RAM, swap, and process monitoring. Everything else
-> on the roadmap is intentionally **not** implemented yet, but the code is
-> structured so future modules (process actions, process tree, disk, etc.)
-> can be added without rewriting the existing ones.
+> Stage: **Step 4** — CPU, RAM, swap, process monitoring, and process actions.
+> Everything else on the roadmap is intentionally **not** implemented yet, but
+> the code is structured so future modules (process tree, disk, etc.) can be
+> added without rewriting the existing ones.
 
 ## Why is this being built?
 
@@ -30,11 +30,14 @@ feature per milestone, hosted on GitHub.
 - [x] **Process monitoring** — a live process table (PID, name, state, UID,
       CPU %, RAM, threads, command line plus total/running/sleeping/stopped/
       zombie counters) scanned directly from `/proc/<pid>/`.
+- [x] **Process actions** — terminate (SIGTERM), kill (SIGKILL), pause
+      (SIGSTOP), resume (SIGCONT) and change scheduling priority
+      (`setpriority(2)`, niceness −20…19) for a process chosen from the live
+      table, using the `kill(2)`/`setpriority(2)` system calls directly.
 
 ### Planned
 
 - [ ] Process tree
-- [ ] Process actions
 - [ ] Disk monitoring
 - [ ] Network monitoring
 - [ ] GPU monitoring
@@ -132,6 +135,7 @@ Zombie:                4
 
 Processes: 186
 Sort: [1] CPU  [2] Memory  [3] PID  [4] Name (current: CPU)
+Manage: press 'm' (then Enter) to control a process by PID
 Updating every 1 second...
 ```
 
@@ -148,6 +152,64 @@ the next refresh:
 - `3` — PID (ascending)
 - `4` — Process name (ascending, case-insensitive)
 
+## Process actions
+
+Press `m` **and then Enter** at any time to enter process-control mode. The
+current process list is shown frozen; enter a PID (or leave it blank to
+cancel). PID `0`, PID `1` and the Task Manager's own PID are protected from
+every action. A PID that is absent from the current list is rejected — the
+list is at most one second old, so reusing the PID for a *different* (newer)
+process is impossible.
+
+Select an action from the menu:
+
+| Key | Action                    | System call                 | Notes                                    |
+| --- | ------------------------- | --------------------------- | ---------------------------------------- |
+| 1   | Terminate                 | `kill(pid, SIGTERM)`        | graceful shutdown request               |
+| 2   | Kill                      | `kill(pid, SIGKILL)`        | force; extra WARNING + confirmation     |
+| 3   | Pause                     | `kill(pid, SIGSTOP)`        | freezes the process                     |
+| 4   | Resume                    | `kill(pid, SIGCONT)`        | resumes a paused process                |
+| 5   | Change priority           | `setpriority(PRIO_PROCESS)` | niceness −20…19; lower = higher priority|
+| 6   | Cancel                    | —                           | back to the live view                   |
+
+Every action requires a `[y/N]` confirmation; anything other than `y`/`Y`/
+`yes` cancels. After the action the list is refreshed immediately so the
+effect is visible without waiting for the next tick. Quitting the live view
+(`Ctrl+C`, or EOF on stdin) also cancels any prompt.
+
+### How errors are handled
+
+All operations go through the `ProcessActions` module, which calls `kill(2)`
+and `setpriority(2)` directly — no shell, no `system()`/`popen()`, no `ps`/
+`kill`/`renice` commands. The `errno` from a failed call is mapped to a
+readable message:
+
+| errno  | Meaning                                                          |
+| ------ | ---------------------------------------------------------------- |
+| `ESRCH`| the process exited between selection and the call                |
+| `EPERM`| hold the process's `kill` permission, but the pid is not yours or belongs to another user; raising priority above your hard nice limit (for example negative values for an unprivileged user) also lands here |
+| `EINVAL`| invalid priority (already range-checked before the call)         |
+| other  | generic failure, reported with `strerror(errno)`                 |
+
+The application **never recommends running as root**. Lower-priority (nicer)
+changes and signals to your own processes work without privileges; making a
+process run *faster* by giving it a negative niceness normally requires being
+root. `PPid`-based permission checks, `getpriority(2)` reports the current
+niceness, which is shown before a change so the requested value is explicit.
+
+### A safe way to test
+
+A background `sleep` is a harmless target for every action:
+
+```bash
+sleep 300 &
+# note its PID, then in the Task Manager:
+#   m → <sleep's PID> → 3 (Pause)   → table shows state "Stopped"
+#   m → <sleep's PID> → 4 (Resume)  → state back to "Sleeping"
+#   m → <sleep's PID> → 5 → 19      → priority lowered, then back to 0
+#   m → <sleep's PID> → 1 (Terminate)/2 (Kill)
+```
+
 ## Project structure
 
 ```text
@@ -159,12 +221,14 @@ arch-task-manager/
 ├── include/
 │   ├── cpu_monitor.hpp         # CpuTimes, readCpuTimes(), CpuMonitor
 │   ├── memory_monitor.hpp      # MemoryInfo, readMemoryInfo(), MemoryMonitor
-│   └── process_monitor.hpp     # Process, ProcessState, ProcessMonitor
+│   ├── process_monitor.hpp     # Process, ProcessState, ProcessMonitor
+│   └── process_actions.hpp     # ProcessActions, ActionResult, ActionStatus
 ├── src/
-│   ├── main.cpp                # UI loop: frame rendering + 1 s refresh
+│   ├── main.cpp                # UI loop: frame rendering + 1 s refresh + control flow
 │   ├── cpu_monitor.cpp         # /proc/stat reading + utilization math
 │   ├── memory_monitor.cpp      # /proc/meminfo reading + memory/swap math
-│   └── process_monitor.cpp     # /proc scanning + per-process parsing
+│   ├── process_monitor.cpp     # /proc scanning + per-process parsing
+│   └── process_actions.cpp     # kill(2)/setpriority(2) wrappers + errno mapping
 └── build/                      # generated; never committed to git
 ```
 
