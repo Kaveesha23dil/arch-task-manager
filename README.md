@@ -5,11 +5,11 @@ Linux. It reads system information **directly from Linux interfaces** such as
 `/proc/stat`, `/proc/meminfo`, and `/proc/<pid>/` — no shelling out to `ps`,
 `free`, `top`, `htop`, or other external tools.
 
-> Stage: **Step 8** — CPU, RAM, swap, process monitoring, process actions, the
-> process tree, disk/storage monitoring, network monitoring, and GPU
-> monitoring. Everything else on the roadmap is intentionally **not**
-> implemented yet, but the code is structured so future modules (temperature,
-> etc.) can be added without rewriting the existing ones.
+> Stage: **Step 9** — CPU, RAM, swap, process monitoring, process actions, the
+> process tree, disk/storage monitoring, network monitoring, GPU monitoring,
+> and temperature & hardware sensor monitoring. Everything else on the roadmap
+> is intentionally **not** implemented yet, but the code is structured so
+> future modules can be added without rewriting the existing ones.
 
 ## Why is this being built?
 
@@ -58,11 +58,20 @@ feature per milestone, hosted on GitHub.
       residency delta; NVIDIA and unknown vendors report everything they
       cannot expose as "N/A". Unavailable metrics always degrade gracefully.
       Press `g` for the full per-GPU detail screen.
+- [x] **Temperature & hardware sensors** — automatic discovery of every hwmon
+      temperature and fan channel under `/sys/class/hwmon` (CPU cores/package
+      from `coretemp`/`k10temp`, GPU from `amdgpu`/`nouveau`/`i915`, NVMe/SATA
+      from `nvme`/`drivetemp`, motherboard/PCH/ACPI zones, plus fan RPM where
+      the driver exposes it), with sensor labels when available and safe
+      fallbacks when not. Temperatures are reported in °C with their
+      `tempN_max`/`tempN_crit` limits and a simple NORMAL/WARM/HIGH/CRITICAL
+      status; the `s` detail screen shows every sensor. Nothing is shelled out
+      to `sensors`/`lm-sensors` and the app runs fine on hardware with no
+      sensors at all.
 
 ### Planned
 
 - [ ] Process tree — interactive expand/collapse (deferred to the GUI)
-- [ ] Temperature monitoring
 - [ ] Systemd service management
 - [ ] Startup applications
 - [ ] Arch Linux package/update information
@@ -177,6 +186,23 @@ Kaby Lake-R GT2 [UHD  35.0%               N/A    300 MHz
 
 Detailed GPU info: press 'g' (then Enter)
 
+## SENSORS
+
+CPU
+Package id 0       52.0 °C
+Core 0             49.0 °C
+Core 1             51.0 °C
+Core 2             48.0 °C
+Core 3             50.0 °C
+
+Motherboard
+acpitz             42.0 °C
+
+FANS
+Fan 1              1240 RPM
+
+Detailed sensor info: press 's' (then Enter)
+
 ## PROCESSES
 
     PID  NAME             CPU       RAM     STATE
@@ -201,6 +227,7 @@ View: [l] Process List  [t] Process Tree (current: List)
 Manage: press 'm' (then Enter) to control a process by PID
 Network detail: press 'i' (then Enter) to inspect an interface
 GPU detail: press 'g' (then Enter) to inspect a GPU
+Sensor detail: press 's' (then Enter) to inspect a sensor
 Updating every 1 second...
 ```
 
@@ -225,6 +252,7 @@ While it runs you can switch views at any time (then Enter):
 - `t` — Process Tree (hierarchical)
 - `i` — inspect one network interface in detail (list view only)
 - `g` — read the full per-GPU breakdown (list view only)
+- `s` — read the full sensor breakdown with limits and status (list view only)
 
 ### Sorting
 
@@ -451,6 +479,7 @@ arch-task-manager/
 │   ├── disk_monitor.hpp        # DiskUsage, BlockDevice, DiskSnapshot, DiskMonitor
 │   ├── network_monitor.hpp     # NetworkInterfaceStats, NetworkSnapshot, NetworkMonitor
 │   ├── gpu_monitor.hpp         # GpuStats, GpuSnapshot, GpuMonitor, GPU format helpers
+│   ├── sensor_monitor.hpp      # TemperatureSensor, FanSensor, SensorSnapshot, SensorMonitor
 │   └── format_bytes.hpp        # shared byte-formatter (KB/MB/GB, used by disk + network)
 ├── src/
 │   ├── main.cpp                # UI loop: frame rendering + 1 s refresh + control flow
@@ -461,7 +490,8 @@ arch-task-manager/
 │   ├── process_tree.cpp        # PID/PPID tree build + box-drawing renderer
 │   ├── disk_monitor.cpp        # statvfs(2) usage + /proc/diskstats rates + /sys/block
 │   ├── network_monitor.cpp     # /proc/net/dev two-sample rates + operstate
-│   └── gpu_monitor.cpp         # /sys/class/drm GPU discovery + vendor metrics
+│   ├── gpu_monitor.cpp         # /sys/class/drm GPU discovery + vendor metrics
+│   └── sensor_monitor.cpp      # /sys/class/hwmon temperature/fan discovery + readings
 └── build/                      # generated; never committed to git
 ```
 
@@ -912,6 +942,117 @@ Power: N/A
 
 Multiple GPUs each get their own block, labeled `GPU 0`, `GPU 1`, … Press
 Enter to return to the live view.
+
+## Temperature & Hardware Sensors
+
+Temperature and fan monitoring is provided by `SensorMonitor`
+(`src/sensor_monitor.cpp`). It reads the kernel's hwmon interface directly —
+**nothing is ever shelled out to `sensors(1)`, `lm-sensors` or `watch`**, and
+it performs no hardware *control* (fan speed, overclocking, voltage or power
+settings are never written; the module is strictly read-only).
+
+### `/sys/class/hwmon`
+
+The Linux hwmon subsystem exposes every kernel-registered hardware monitoring
+device under `/sys/class/hwmon/hwmonN/`. Each device carries a `name` file
+(such as `coretemp`, `k10temp`, `amdgpu`, `nvme`, `thinkpad` or `nct6775`)
+plus numbered attribute channels:
+
+```text
+temp1_input   temp1_label   temp1_max   temp1_crit
+fan1_input    fan1_label
+```
+
+Temperature values are reported in **millidegrees Celsius** (`45000` = `45.0 °C`)
+and converted with `value / 1000.0`. `SensorMonitor` enumerates every `hwmonN`
+directory and every `temp*_input` / `fan*_input` channel; it never hard-codes
+a driver, so whatever sensors the current hardware and loaded drivers expose
+are picked up automatically.
+
+### Sensor discovery and refresh
+
+- **Discovery** is static: `discover()` reads each device's `name`, resolves
+  each channel's label (`tempN_label` / `fanN_label`, falling back to
+  "Temperature N" / "Fan N"), classifies the channel, and caches the file
+  paths. This happens once at startup.
+- **Refresh** reads only the dynamic values (`tempN_input`, `fanN_input` and
+  the `tempN_max`/`tempN_crit` limits) every tick of the main loop. As a
+  guard against hotplugged/unplugged hardware, each refresh cheaply re-lists
+  the `/sys/class/hwmon` directory and re-runs discovery only when the set of
+  devices changes.
+
+### What is monitored
+
+| Category     | Driver / devices               | Example                    |
+| ------------ | ------------------------------ | -------------------------- |
+| CPU          | `coretemp`, `k10temp`, `x86_pkg_temp`, `zenpower`, … | `Package id 0`, `Core 0` … |
+| GPU          | `amdgpu`, `nouveau`, `radeon`, `nvidia`, `i915` | "edge" / "junction" temps, shown with the GPU model |
+| Storage      | `nvme`, `drivetemp` (SATA), `ataN` | NVMe `Composite`, SATA drive temp |
+| Motherboard  | `acpitz`, `pch_*`, `it87`, `nct6775`, … | ACPI zones, PCH/chipset temp |
+| Fans         | any `fanN_input`               | CPU/chassis fan RPM        |
+
+Channel types are derived from the hwmon **device name and label together**,
+never from the label alone. Sensors that do not fit a known category fall
+back to `Other` and are shown in the same group as motherboard sensors.
+
+### Limits and status
+
+Where the driver exposes them, the `tempN_max` and `tempN_crit` limits are
+shown and a simple status is derived:
+
+| Status    | Meaning                                             |
+| --------- | --------------------------------------------------- |
+| `NORMAL`  | below 85% of the nearest operating limit            |
+| `WARM`    | 85% … limit                                         |
+| `HIGH`    | at/above `tempN_max`                                |
+| `CRITICAL`| at/above `tempN_crit`                               |
+| `N/A`     | no `max`/`crit` exposed — the application never invents limits |
+
+This is display-only; there is no alerting or notification in this step.
+
+### The `s` detail screen
+
+`s` (list view) prints every temperature with its `Current` / `Maximum` /
+`Critical` / `Status` block grouped per hwmon device, followed by every fan's
+speed:
+
+```text
+CPU Package
+--------------------------------
+Current:             52.0 °C
+Maximum:             95.0 °C
+Critical:            100.0 °C
+Status:              NORMAL
+```
+
+### Driver and hardware limitations
+
+Sensor availability depends entirely on the hardware and the loaded Linux
+drivers:
+
+- **CPU temperatures** need the CPU's hwmon driver loaded (`coretemp` on Intel,
+  `k10temp` on AMD). A missing package or core sensor simply means that
+  channel is absent.
+- **GPU temperatures** come from the driver's hwmon device (`amdgpu` exposes
+  edge/junction/SOC/HBM temps; some `nouveau` cards expose them too). The
+  proprietary `nvidia` driver exposes them only through non-standard files, so
+  NVIDIA temperatures may be missing; the section simply omits them.
+- **Storage temperatures** are only present when the drive exposes them
+  (NVMe controllers report a `Composite` temperature; only some SATA/USB
+  drives do, via `drivetemp`).
+- **Fans** appear only when the machine has a measurable, driver-exposed fan.
+- A laptop battery or AC-adapter hwmon device contributes no temperature; it is
+  discovered but not shown.
+
+Any channel whose value is missing, malformed, unreadable or implausible is
+skipped for that refresh — a single broken sensor never crashes the
+application, and a machine with **no** sensors at all simply shows:
+
+```text
+## SENSORS
+
+No hardware temperature sensors available.
+```
 
 ## License
 

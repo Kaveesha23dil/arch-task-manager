@@ -15,6 +15,7 @@
 #include <string>
 #include <thread>
 #include <unistd.h>
+#include <unordered_map>
 #include <vector>
 
 #include "cpu_monitor.hpp"
@@ -26,6 +27,7 @@
 #include "process_actions.hpp"
 #include "process_monitor.hpp"
 #include "process_tree.hpp"
+#include "sensor_monitor.hpp"
 
 namespace {
 
@@ -54,6 +56,9 @@ constexpr std::size_t kGpuNameWidth = 20;
 constexpr std::size_t kGpuUsageWidth = 7;
 constexpr std::size_t kGpuVramWidth = 18;
 constexpr std::size_t kGpuClockWidth = 11;
+constexpr std::size_t kSensorLabelWidth = 18;
+constexpr std::size_t kSensorValueWidth = 9;
+constexpr std::size_t kSensorDetailRuleWidth = 32;
 constexpr int kMinNice = -20;
 constexpr int kMaxNice = 19;
 
@@ -324,6 +329,188 @@ void renderGpuSections(std::ostringstream &out, const atm::GpuSnapshot &gpu) {
       << "Detailed GPU info: press 'g' (then Enter)\n";
 }
 
+/// Formats a temperature with one decimal place, e.g. "51.4 °C".
+std::string formatCelsius(double celsius) {
+  std::ostringstream out;
+  out << std::fixed << std::setprecision(1) << celsius << " °C";
+  return out.str();
+}
+
+/// Best display name for a GPU temperature sensor: resolves the hwmon device
+/// name (e.g. "amdgpu") against the GPU monitor's detected devices so the GPU
+/// model is shown instead of the generic driver name. Falls back to the
+/// driver name when no GPU is known to be bound to it.
+std::string gpuSensorDisplayName(const std::string &hwmon_device,
+                                 const atm::GpuSnapshot &gpu) {
+  for (const atm::GpuStats &stats : gpu.devices) {
+    if (stats.driver == hwmon_device) {
+      return stats.name;
+    }
+  }
+  return hwmon_device;
+}
+
+/// Renders the SENSORS section of the live view: temperatures grouped by
+/// category (CPU / GPU / Storage / Motherboard+Other) followed by fan speeds
+/// when any are exposed. A machine with no temperature/fan channels at all
+/// gets a single "no sensors" line — never a crash and never fake values.
+void renderSensorSections(std::ostringstream &out,
+                          const atm::SensorSnapshot &sensors,
+                          const atm::GpuSnapshot &gpu) {
+  out << "\n## SENSORS\n\n";
+  if (sensors.temperatures.empty() && sensors.fans.empty()) {
+    out << "No hardware temperature sensors available.\n"
+        << "Detailed sensor info: press 's' (then Enter)\n";
+    return;
+  }
+
+  // The display label of one sensor: the GPU model for GPU sensors, the
+  // sensor label (or its "Temperature N" fallback) otherwise.
+  const auto displayLabel = [&](const atm::TemperatureSensor &sensor,
+                                bool gpu_group) {
+    return gpu_group ? gpuSensorDisplayName(sensor.device, gpu)
+                     : sensor.label;
+  };
+
+  // One temperature group: title + one aligned row per matching sensor. When
+  // two sensors in the group share the same label (e.g. label-less acpitz and
+  // PCH devices both fall back to "Temperature 1"), the owning device name is
+  // shown instead so rows stay unambiguous.
+  const auto renderTemperatureGroup = [&](const char *title,
+                                          atm::SensorType type,
+                                          bool gpu_group) {
+    std::vector<const atm::TemperatureSensor *> rows;
+    for (const atm::TemperatureSensor &sensor : sensors.temperatures) {
+      if (sensor.type == type) {
+        rows.push_back(&sensor);
+      }
+    }
+    if (rows.empty()) {
+      return;
+    }
+    std::unordered_map<std::string, std::size_t> label_count;
+    for (const atm::TemperatureSensor *sensor : rows) {
+      ++label_count[displayLabel(*sensor, gpu_group)];
+    }
+    out << title << "\n";
+    for (const atm::TemperatureSensor *sensor : rows) {
+      const std::string base = displayLabel(*sensor, gpu_group);
+      const std::string label =
+          !gpu_group && label_count[base] > 1 ? sensor->device : base;
+      out << std::left << std::setw(kSensorLabelWidth)
+          << fitTo(label, kSensorLabelWidth) << std::right
+          << std::setw(kSensorValueWidth)
+          << formatCelsius(sensor->temperature_celsius) << '\n';
+    }
+    out << '\n';
+  };
+
+  renderTemperatureGroup("CPU", atm::SensorType::CPU, false);
+  renderTemperatureGroup("GPU", atm::SensorType::GPU, true);
+  renderTemperatureGroup("Storage", atm::SensorType::Storage, false);
+
+  // Motherboard and unclassified sensors share the last temperature group,
+  // titled by what is actually present.
+  std::vector<const atm::TemperatureSensor *> board_rows;
+  bool any_motherboard = false;
+  for (const atm::TemperatureSensor &sensor : sensors.temperatures) {
+    if (sensor.type == atm::SensorType::Motherboard) {
+      board_rows.push_back(&sensor);
+      any_motherboard = true;
+    } else if (sensor.type == atm::SensorType::Other) {
+      board_rows.push_back(&sensor);
+    }
+  }
+  if (!board_rows.empty()) {
+    std::unordered_map<std::string, std::size_t> label_count;
+    for (const atm::TemperatureSensor *sensor : board_rows) {
+      ++label_count[sensor->label];
+    }
+    out << (any_motherboard ? "Motherboard" : "Other") << "\n";
+    for (const atm::TemperatureSensor *sensor : board_rows) {
+      const std::string &base = sensor->label;
+      const std::string label =
+          label_count[base] > 1 ? sensor->device : base;
+      out << std::left << std::setw(kSensorLabelWidth)
+          << fitTo(label, kSensorLabelWidth) << std::right
+          << std::setw(kSensorValueWidth)
+          << formatCelsius(sensor->temperature_celsius) << '\n';
+    }
+    out << '\n';
+  }
+
+  if (!sensors.fans.empty()) {
+    std::unordered_map<std::string, std::size_t> label_count;
+    for (const atm::FanSensor &fan : sensors.fans) {
+      ++label_count[fan.label];
+    }
+    out << "FANS\n";
+    for (const atm::FanSensor &fan : sensors.fans) {
+      const std::string label =
+          label_count[fan.label] > 1 ? fan.device : fan.label;
+      out << std::left << std::setw(kSensorLabelWidth)
+          << fitTo(label, kSensorLabelWidth) << std::right
+          << std::setw(kSensorValueWidth)
+          << (std::to_string(fan.rpm) + " RPM") << '\n';
+    }
+    out << '\n';
+  }
+
+  out << "Detailed sensor info: press 's' (then Enter)\n";
+}
+
+/// Full per-sensor breakdown used by the sensor-detail screen: every
+/// temperature with its limits and derived status, then every fan. Sensors
+/// are grouped under a header per hwmon device so multi-device machines stay
+/// readable.
+std::string renderSensorDetails(const atm::SensorSnapshot &sensors,
+                                const atm::GpuSnapshot &gpu) {
+  std::ostringstream out;
+  if (sensors.temperatures.empty() && sensors.fans.empty()) {
+    out << "No hardware temperature sensors available.\n";
+    return out.str();
+  }
+
+  std::string current_device;
+  for (const atm::TemperatureSensor &sensor : sensors.temperatures) {
+    if (sensor.device != current_device) {
+      if (!current_device.empty()) {
+        out << '\n';
+      }
+      current_device = sensor.device;
+      out << "## " << sensor.device << "\n\n";
+    }
+    const std::string label =
+        sensor.type == atm::SensorType::GPU
+            ? gpuSensorDisplayName(sensor.device, gpu)
+            : sensor.label;
+    out << label << "\n"
+        << std::string(kSensorDetailRuleWidth, '-') << "\n";
+    appendLabeled(out, "Current:", formatCelsius(sensor.temperature_celsius));
+    appendLabeled(out, "Maximum:",
+                  sensor.max_temperature_celsius.has_value()
+                      ? formatCelsius(*sensor.max_temperature_celsius)
+                      : "N/A");
+    appendLabeled(out, "Critical:",
+                  sensor.critical_temperature_celsius.has_value()
+                      ? formatCelsius(*sensor.critical_temperature_celsius)
+                      : "N/A");
+    appendLabeled(out, "Status:", atm::sensorStatusName(sensor.status));
+    out << '\n';
+  }
+
+  if (!sensors.fans.empty()) {
+    out << "## FANS\n\n";
+    for (const atm::FanSensor &fan : sensors.fans) {
+      out << fan.label << "\n"
+          << std::string(kSensorDetailRuleWidth, '-') << "\n";
+      appendLabeled(out, "Speed:", std::to_string(fan.rpm) + " RPM");
+      out << '\n';
+    }
+  }
+  return out.str();
+}
+
 /// Full per-GPU breakdown used by the GPU-detail screen. Multiple GPUs are
 /// shown one after another with the index and card node on each header.
 std::string renderGpuDetails(const atm::GpuSnapshot &gpu) {
@@ -427,7 +614,7 @@ std::string renderTreeFrame(double cpu_usage, const atm::MemoryInfo &memory,
 }
 
 /// Renders the full text view (banner + summary + memory + swap + storage +
-/// network + GPU + processes + statistics + footer). Each frame is a
+/// network + GPU + sensors + processes + statistics + footer). Each frame is a
 /// self-contained 1 s snapshot.
 std::string renderFrame(double cpu_usage, const atm::MemoryInfo &memory,
                         const std::vector<atm::Process> &processes,
@@ -435,7 +622,8 @@ std::string renderFrame(double cpu_usage, const atm::MemoryInfo &memory,
                         ViewMode view, const atm::ProcessTree &tree,
                         const atm::DiskSnapshot &disk,
                         const atm::NetworkSnapshot &network,
-                        const atm::GpuSnapshot &gpu) {
+                        const atm::GpuSnapshot &gpu,
+                        const atm::SensorSnapshot &sensors) {
   if (view == ViewMode::Tree) {
     // The tree view stays deliberately focused on the hierarchy; the storage
     // and network sections are part of the table view.
@@ -448,6 +636,7 @@ std::string renderFrame(double cpu_usage, const atm::MemoryInfo &memory,
   renderStorageSections(out, disk);
   renderNetworkSections(out, network);
   renderGpuSections(out, gpu);
+  renderSensorSections(out, sensors, gpu);
   renderProcessTable(out, processes);
   renderProcessStats(out, stats);
   out << "\n---\n\n"
@@ -460,6 +649,7 @@ std::string renderFrame(double cpu_usage, const atm::MemoryInfo &memory,
       << "Manage: press 'm' (then Enter) to control a process by PID\n"
       << "Network detail: press 'i' (then Enter) to inspect an interface\n"
       << "GPU detail: press 'g' (then Enter) to inspect a GPU\n"
+      << "Sensor detail: press 's' (then Enter) to inspect a sensor\n"
       << "Updating every " << kRefreshInterval.count() << " second...\n";
   return out.str();
 }
@@ -471,12 +661,13 @@ void renderView(double cpu_usage, const atm::MemoryInfo &memory,
                 ViewMode view, const atm::ProcessTree &tree,
                 const atm::DiskSnapshot &disk,
                 const atm::NetworkSnapshot &network,
-                const atm::GpuSnapshot &gpu) {
+                const atm::GpuSnapshot &gpu,
+                const atm::SensorSnapshot &sensors) {
   // ANSI "clear entire screen" + "cursor to home" so the multi-line frame
   // refreshes in place instead of scrolling the terminal.
   std::cout << "\033[2J\033[H";
   std::cout << renderFrame(cpu_usage, memory, processes, stats, sort, view, tree,
-                           disk, network, gpu)
+                           disk, network, gpu, sensors)
             << std::flush;
 }
 
@@ -534,6 +725,7 @@ class ConsoleInput {
     Manage,
     InspectNetwork,
     InspectGpu,
+    InspectSensors,
   };
 
   /// Non-blocking: drains whatever stdin currently has, then returns the next
@@ -629,6 +821,7 @@ class ConsoleInput {
     if (token == "m" || token == "M") return Command::Manage;
     if (token == "i" || token == "I") return Command::InspectNetwork;
     if (token == "g" || token == "G") return Command::InspectGpu;
+    if (token == "s" || token == "S") return Command::InspectSensors;
     return Command::None;
   }
 };
@@ -972,6 +1165,20 @@ void interactGpuDetail(const atm::GpuSnapshot &gpu, ConsoleInput &input) {
   static_cast<void>(input.readLine());  // wait for the user, EOF cancels
 }
 
+/// "s": shows the full sensor breakdown (current/maximum/critical/status for
+/// every temperature, RPM for every fan). The snapshot is at most ~1 s old;
+/// the SensorMonitor owns all cached channel state.
+void interactSensorDetail(const atm::SensorSnapshot &sensors,
+                          const atm::GpuSnapshot &gpu, ConsoleInput &input) {
+  std::cout << "\033[2J\033[H";
+  std::cout << "========================================\n"
+               "ARCH TASK MANAGER — Sensor Detail\n"
+               "========================================\n\n"
+            << renderSensorDetails(sensors, gpu)
+            << "\n\nPress Enter to return to the live view.\n" << std::flush;
+  static_cast<void>(input.readLine());  // wait for the user, EOF cancels
+}
+
 }  // namespace
 
 int main() {
@@ -981,6 +1188,7 @@ int main() {
   atm::DiskMonitor disk_monitor;
   atm::NetworkMonitor network_monitor;
   atm::GpuMonitor gpu_monitor;
+  atm::SensorMonitor sensor_monitor;
   atm::ProcessActions actions;
   ConsoleInput input;
 
@@ -1006,6 +1214,8 @@ int main() {
   static_cast<void>(disk_monitor.read());
   static_cast<void>(network_monitor.read());
   static_cast<void>(gpu_monitor.read());
+  sensor_monitor.discover();
+  static_cast<void>(sensor_monitor.read());
   std::this_thread::sleep_for(kRefreshInterval);
 
   const auto first_cpu = cpu_monitor.readUsage();
@@ -1023,14 +1233,17 @@ int main() {
   const atm::DiskSnapshot first_disk = disk_monitor.read();
   const atm::NetworkSnapshot first_network = network_monitor.read();
   const atm::GpuSnapshot first_gpu = gpu_monitor.read();
+  const atm::SensorSnapshot first_sensors = sensor_monitor.read();
   auto snapshot = process_monitor.read(first_memory->total);
   atm::sortProcesses(snapshot.processes, sort);
   atm::ProcessTree tree = atm::buildProcessTree(snapshot.processes);
   renderView(*first_cpu, *first_memory, snapshot.processes, snapshot.stats,
-             sort, view, tree, first_disk, first_network, first_gpu);
+             sort, view, tree, first_disk, first_network, first_gpu,
+             first_sensors);
 
   atm::NetworkSnapshot network = first_network;
   atm::GpuSnapshot gpu = first_gpu;
+  atm::SensorSnapshot sensors = first_sensors;
 
   for (;;) {
     std::this_thread::sleep_for(kRefreshInterval);
@@ -1069,11 +1282,12 @@ int main() {
             const atm::DiskSnapshot disk = disk_monitor.read();
             const atm::NetworkSnapshot network = network_monitor.read();
             gpu = gpu_monitor.read();
+            sensors = sensor_monitor.read();
             snapshot = process_monitor.read(memory->total);
             atm::sortProcesses(snapshot.processes, sort);
             tree = atm::buildProcessTree(snapshot.processes);
             renderView(*cpu, *memory, snapshot.processes, snapshot.stats,
-                       sort, view, tree, disk, network, gpu);
+                       sort, view, tree, disk, network, gpu, sensors);
           }
         }
         continue;
@@ -1085,6 +1299,11 @@ int main() {
       case ConsoleInput::Command::InspectGpu:
         if (view == ViewMode::List) {
           interactGpuDetail(gpu, input);
+        }
+        break;
+      case ConsoleInput::Command::InspectSensors:
+        if (view == ViewMode::List) {
+          interactSensorDetail(sensors, gpu, input);
         }
         break;
       case ConsoleInput::Command::None:
@@ -1109,7 +1328,8 @@ int main() {
     const atm::DiskSnapshot disk = disk_monitor.read();
     network = network_monitor.read();
     gpu = gpu_monitor.read();
+    sensors = sensor_monitor.read();
     renderView(*cpu, *memory, snapshot.processes, snapshot.stats, sort, view,
-               tree, disk, network, gpu);
+               tree, disk, network, gpu, sensors);
   }
 }

@@ -35,6 +35,7 @@ add_executable(arch-task-manager
   src/disk_monitor.cpp
   src/network_monitor.cpp
   src/gpu_monitor.cpp
+  src/sensor_monitor.cpp
 )
 
 target_include_directories(arch-task-manager PRIVATE include)
