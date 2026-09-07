@@ -5,11 +5,12 @@ Linux. It reads system information **directly from Linux interfaces** such as
 `/proc/stat`, `/proc/meminfo`, and `/proc/<pid>/` — no shelling out to `ps`,
 `free`, `top`, `htop`, or other external tools.
 
-> Stage: **Step 9** — CPU, RAM, swap, process monitoring, process actions, the
+> Stage: **Step 10** — CPU, RAM, swap, process monitoring, process actions, the
 > process tree, disk/storage monitoring, network monitoring, GPU monitoring,
-> and temperature & hardware sensor monitoring. Everything else on the roadmap
-> is intentionally **not** implemented yet, but the code is structured so
-> future modules can be added without rewriting the existing ones.
+> temperature & hardware sensor monitoring, and systemd service management.
+> Everything else on the roadmap is intentionally **not** implemented yet, but
+> the code is structured so future modules can be added without rewriting the
+> existing ones.
 
 ## Why is this being built?
 
@@ -68,11 +69,26 @@ feature per milestone, hosted on GitHub.
       status; the `s` detail screen shows every sensor. Nothing is shelled out
       to `sensors`/`lm-sensors` and the app runs fine on hardware with no
       sensors at all.
+- [x] **Systemd service management** — discover and list loaded `*.service`
+      units through systemd's native D-Bus API (`org.freedesktop.systemd1`
+      via `sd-bus`/`libsystemd`), with live runtime status (active/inactive/
+      FAILED/activating/deactivating/reloading), boot-time enablement
+      (enabled/disabled/static/…), a case-insensitive search, sortable
+      columns, and a per-service detail view (description, load/active/sub
+      state, enabled state, main PID, unit path). Management operations are
+      available from the `u` detail screen: **Start / Stop / Restart /
+      Enable / Disable**, each gated behind a confirmation prompt. No shell
+      commands (`systemctl`, `system()`, `popen()`) are used — everything
+      goes through the D-Bus API, so systemd's normal authorization/polkit
+      rules apply and privileged operations that the user is not permitted
+      to perform report a clear "Permission denied." error instead of
+      crashing. The `u` screen never asks for a password. If systemd cannot
+      be reached the section reports "Unable to connect to systemd." while
+      every other monitor keeps working.
 
 ### Planned
 
 - [ ] Process tree — interactive expand/collapse (deferred to the GUI)
-- [ ] Systemd service management
 - [ ] Startup applications
 - [ ] Arch Linux package/update information
 - [ ] Historical graphs
@@ -85,19 +101,23 @@ feature per milestone, hosted on GitHub.
 - Build system: **CMake** (works for both Debug and Release)
 - Compiler: **g++** (`GCC`)
 - OS interfaces: the `/proc` and `/sys` filesystems, `statvfs(2)`,
-  `sysconf(3)`
-- Standard library only (`std::thread`, `std::chrono`, `<fstream>`, …)
-- No third-party dependencies
+  `sysconf(3)`, and systemd's D-Bus API (`sd-bus`/`libsystemd`)
+- Standard library plus `libsystemd` (the only third-party dependency; it
+  provides the `sd-bus` D-Bus client used for systemd service management)
+- No shelling out to external tools
 
 ## Build on Arch Linux
 
 Requirements:
 
 ```bash
-sudo pacman -S base-devel cmake
+sudo pacman -S base-devel cmake systemd-libs
 ```
 
-`base-devel` provides `g++`; `cmake` provides the build tooling.
+`base-devel` provides `g++`; `cmake` provides the build tooling; `systemd-libs`
+provides the `libsystemd`/`sd-bus` D-Bus client used for systemd service
+management (it is present by default on any Arch Linux system that boots
+with systemd).
 
 Configure and build:
 
@@ -202,6 +222,15 @@ FANS
 Fan 1              1240 RPM
 
 Detailed sensor info: press 's' (then Enter)
+
+## SYSTEMD SERVICES
+
+Service                    Status       Enabled       Description
+NetworkManager.service     active       enabled       Network Manager
+bluetooth.service          inactive     disabled      Bluetooth service
+systemd-journald.service   active       static        Journal Service
+
+Service detail: press 'u' (then Enter)
 
 ## PROCESSES
 
@@ -480,6 +509,7 @@ arch-task-manager/
 │   ├── network_monitor.hpp     # NetworkInterfaceStats, NetworkSnapshot, NetworkMonitor
 │   ├── gpu_monitor.hpp         # GpuStats, GpuSnapshot, GpuMonitor, GPU format helpers
 │   ├── sensor_monitor.hpp      # TemperatureSensor, FanSensor, SensorSnapshot, SensorMonitor
+│   ├── systemd_manager.hpp     # SystemdService, SystemdSnapshot, SystemdManager (D-Bus)
 │   └── format_bytes.hpp        # shared byte-formatter (KB/MB/GB, used by disk + network)
 ├── src/
 │   ├── main.cpp                # UI loop: frame rendering + 1 s refresh + control flow
@@ -491,7 +521,8 @@ arch-task-manager/
 │   ├── disk_monitor.cpp        # statvfs(2) usage + /proc/diskstats rates + /sys/block
 │   ├── network_monitor.cpp     # /proc/net/dev two-sample rates + operstate
 │   ├── gpu_monitor.cpp         # /sys/class/drm GPU discovery + vendor metrics
-│   └── sensor_monitor.cpp      # /sys/class/hwmon temperature/fan discovery + readings
+│   ├── sensor_monitor.cpp      # /sys/class/hwmon temperature/fan discovery + readings
+│   └── systemd_manager.cpp     # sd-bus / org.freedesktop.systemd1 discovery + management
 └── build/                      # generated; never committed to git
 ```
 
@@ -1053,6 +1084,97 @@ application, and a machine with **no** sensors at all simply shows:
 
 No hardware temperature sensors available.
 ```
+
+## Systemd Services
+
+Systemd service management is implemented as a dedicated `SystemdManager`
+module and is kept strictly separate from the process manager. It talks to
+systemd entirely through its native D-Bus API — **no** `systemctl`,
+`system()` or `popen()` is used anywhere.
+
+### Systemd / D-Bus integration
+
+The module connects to the system D-Bus via the `sd-bus` client from
+`libsystemd` and interacts with the primary service manager:
+
+- Destination: `org.freedesktop.systemd1`
+- Path: `/org/freedesktop/systemd1`
+- Interfaces: `org.freedesktop.systemd1.Manager`, `org.freedesktop.systemd1.Unit`
+
+Methods and properties used:
+
+| Purpose | Call |
+|---|---|
+| List loaded services | `Manager.ListUnits` |
+| Per-unit boot enablement | `Unit` `UnitFileState` property |
+| Main process PID | `Unit` `MainPID` property |
+| Start | `Manager.StartUnit(name, "replace")` |
+| Stop | `Manager.StopUnit(name, "replace")` |
+| Restart | `Manager.RestartUnit(name, "replace")` |
+| Reload | `Manager.ReloadUnit(name, "replace")` |
+| Enable | `Manager.EnableUnitFiles(asbb)` |
+| Disable | `Manager.DisableUnitFiles(asb)` |
+
+### Service discovery
+
+Only `*.service` units are surfaced; `.target`, `.socket`, `.timer`,
+`.mount`, `.device` and other unit types are intentionally excluded. The
+relatively static identity (name, description, unit object path) is cached,
+while dynamic values (active/sub state, `MainPID`) are refreshed on the
+application's normal 1-second tick. The manager never starts its own thread —
+it integrates into the existing update loop.
+
+### Service status
+
+Each service shows its runtime state (derived from `ActiveState`) and its
+boot-time enablement (derived from the unit-file state):
+
+```text
+Service                    Status       Enabled       Description
+NetworkManager.service     active       enabled       Network Manager
+bluetooth.service          inactive     disabled      Bluetooth service
+systemd-journald.service   active       static        Journal Service
+```
+
+A service can validly be `active` while `disabled`, or `inactive` while
+`enabled` — runtime state and boot-time enablement are tracked separately, not
+conflated. Failed services are highlighted `FAILED` in the status column.
+
+### Start / stop / restart / enable / disable
+
+From the `u` detail screen you can start, stop, restart, enable or disable a
+service by name. **Every operation requires an explicit confirmation
+prompt** — nothing is changed silently. Failures (including permission
+denials and unknown unit names) are reported cleanly without crashing.
+
+### Permission handling
+
+Systemd operations may require elevated privileges. The app does **not**
+collect or store passwords, and it does not run anything through `sudo`. It
+relies on systemd's normal authorization mechanism (polkit/D-Bus): when the
+calling user is not permitted to perform an operation, the D-Bus call fails
+with an access-denied error that is reported as `Permission denied.`
+
+### Read-only failure mode
+
+If the D-Bus connection to systemd cannot be established (e.g. the system does
+not use systemd), the section shows:
+
+```text
+Unable to connect to systemd.
+Service management unavailable.
+```
+
+and all other monitors (CPU, memory, processes, disk, network, GPU, sensors)
+continue to function normally.
+
+### Limitations
+
+- Only `.service` units are listed; other unit types are deferred.
+- Journal/log viewing is not implemented and is a future feature.
+- No automatic startup-application or package-installation management.
+- `MainPID` and some unit values are only shown when systemd reports them
+  reliably (a value of `0` means systemd reports no main process).
 
 ## License
 
