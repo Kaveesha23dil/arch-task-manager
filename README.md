@@ -2,12 +2,12 @@
 
 A native Linux task manager / system monitor, built specifically for Arch
 Linux. It reads system information **directly from Linux interfaces** such as
-`/proc/stat` — no shelling out to `top`, `htop`, or other external tools.
+`/proc/stat` and `/proc/meminfo` — no shelling out to `free`, `top`, `htop`,
+or other external tools.
 
-> Stage: **Step 1** — project foundation with a single feature
-> (CPU monitoring). Everything else on the roadmap is intentionally **not**
-> implemented yet, but the code is structured so future modules can be added
-> without rewriting the CPU module.
+> Stage: **Step 2** — CPU, RAM, and swap monitoring. Everything else on the
+> roadmap is intentionally **not** implemented yet, but the code is structured
+> so future modules can be added without rewriting the existing ones.
 
 ## Why is this being built?
 
@@ -19,11 +19,19 @@ feature per milestone, hosted on GitHub.
 
 ## Current features
 
+### Completed
+
 - [x] **CPU monitoring** — overall CPU utilization via `/proc/stat`,
       calculated from the difference between two successive samples.
-- [ ] RAM monitoring
+- [x] **RAM / Memory monitoring** — total, used, available, free, cached and
+      buffered memory via `/proc/meminfo`.
+- [x] **Swap monitoring** — total, used and free swap via `/proc/meminfo`.
+
+### Planned
+
 - [ ] Process manager
 - [ ] Process tree
+- [ ] Process actions
 - [ ] Disk monitoring
 - [ ] Network monitoring
 - [ ] GPU monitoring
@@ -31,9 +39,9 @@ feature per milestone, hosted on GitHub.
 - [ ] Systemd service management
 - [ ] Startup applications
 - [ ] Arch Linux package/update information
-- [ ] Process actions (terminate, kill, pause, resume)
 - [ ] Historical graphs
 - [ ] System alerts
+- [ ] GUI
 
 ## Technology
 
@@ -81,20 +89,37 @@ From the project root:
 ./build/arch-task-manager
 ```
 
-Expected output (the value updates every second, in place):
+Expected output (refreshed every second, in place):
 
 ```text
 ========================================
 ARCH TASK MANAGER
 =================
 
-CPU Usage:  34.7%
+## CPU
 
-Updating every 1 second...
+Usage:              34.7%
 
-========================================
+## MEMORY
 
-CPU Usage:  35.1%
+Total:              15.5 GB
+Used:               8.2 GB
+Available:          7.3 GB
+Free:               4.1 GB
+Cached:             3.2 GB
+Buffers:            512 MB
+Usage:              52.9%
+
+## SWAP
+
+Total:              8.0 GB
+Used:               1.2 GB
+Free:               6.8 GB
+Usage:              15.0%
+
+---
+
+# Updating every 1 second...
 ```
 
 Press `Ctrl+C` to stop.
@@ -108,11 +133,13 @@ arch-task-manager/
 ├── .gitignore
 ├── LICENSE
 ├── include/
-│   └── cpu_monitor.hpp        # CpuTimes, readCpuTimes(), CpuMonitor
+│   ├── cpu_monitor.hpp         # CpuTimes, readCpuTimes(), CpuMonitor
+│   └── memory_monitor.hpp      # MemoryInfo, readMemoryInfo(), MemoryMonitor
 ├── src/
-│   ├── main.cpp               # UI loop: banner + 1 s refresh
-│   └── cpu_monitor.cpp        # /proc/stat reading + utilization math
-└── build/                     # generated; never committed to git
+│   ├── main.cpp                # UI loop: banner + 1 s refresh
+│   ├── cpu_monitor.cpp         # /proc/stat reading + utilization math
+│   └── memory_monitor.cpp      # /proc/meminfo reading + memory/swap math
+└── build/                      # generated; never committed to git
 ```
 
 `build/` is git-ignored.
@@ -143,21 +170,34 @@ treated as idle. The application records one baseline sample on startup, then
 reads a new sample every second and prints the percentage computed from the
 difference, never the raw counters.
 
-## Planned future features
+## How RAM / swap usage is obtained
 
-- **RAM monitoring** — `meminfo`-based usage
-- **Process manager** — listing, sorting, and search over processes
-- **Process tree** — hierarchical process view
-- **Disk monitoring** — usage and throughput
-- **Network monitoring** — per-interface traffic
-- **GPU monitoring**
-- **Temperature monitoring**
-- **Systemd service management**
-- **Startup applications**
-- **Arch Linux package / update information**
-- **Process actions** — terminate, kill, pause, resume
-- **Historical graphs**
-- **System alerts**
+Memory information comes from `/proc/meminfo`, a kernel-generated file with
+one `Field: value kB` pair per line. The relevant fields:
+
+```text
+MemTotal:      the total amount of physical memory
+MemFree:       memory completely unused
+MemAvailable:  an estimate of memory available to start new applications
+Cached:        memory used for page cache (includes reclaimable slab)
+Buffers:       memory used for raw disk buffers
+SwapTotal:     total swap space
+SwapFree:      swap space currently unused
+```
+
+All values are reported by the kernel in kibibytes (kB, 1024 bytes); the
+application converts them to MB/GB for display. The reported figures are
+derived as follows:
+
+```text
+Used RAM    = MemTotal − MemAvailable
+RAM usage%  = Used RAM ÷ MemTotal × 100
+Swap used   = SwapTotal − SwapFree
+Swap usage% = Swap used ÷ SwapTotal × 100
+```
+
+`SwapTotal` (and thus swap usage) is 0% when no swap is configured; the
+application guards that division-by-zero case instead of crashing.
 
 ## License
 

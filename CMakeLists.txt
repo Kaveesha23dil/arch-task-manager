@@ -28,6 +28,7 @@ find_package(Threads REQUIRED)
 add_executable(arch-task-manager
   src/main.cpp
   src/cpu_monitor.cpp
+  src/memory_monitor.cpp
 )
 
 target_include_directories(arch-task-manager PRIVATE include)
