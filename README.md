@@ -5,10 +5,10 @@ Linux. It reads system information **directly from Linux interfaces** such as
 `/proc/stat`, `/proc/meminfo`, and `/proc/<pid>/` — no shelling out to `ps`,
 `free`, `top`, `htop`, or other external tools.
 
-> Stage: **Step 4** — CPU, RAM, swap, process monitoring, and process actions.
-> Everything else on the roadmap is intentionally **not** implemented yet, but
-> the code is structured so future modules (process tree, disk, etc.) can be
-> added without rewriting the existing ones.
+> Stage: **Step 5** — CPU, RAM, swap, process monitoring, process actions, and
+> the process tree. Everything else on the roadmap is intentionally **not**
+> implemented yet, but the code is structured so future modules (disk,
+> network, etc.) can be added without rewriting the existing ones.
 
 ## Why is this being built?
 
@@ -34,10 +34,14 @@ feature per milestone, hosted on GitHub.
       (SIGSTOP), resume (SIGCONT) and change scheduling priority
       (`setpriority(2)`, niceness −20…19) for a process chosen from the live
       table, using the `kill(2)`/`setpriority(2)` system calls directly.
+- [x] **Process tree** — a hierarchical parent/child view of the process
+      population built from the PPID field of the existing `/proc/<pid>/stat`
+      scan, with box-drawing connectors (├──, └──, │), orphan handling and
+      dynamic tree statistics.
 
 ### Planned
 
-- [ ] Process tree
+- [ ] Process tree — interactive expand/collapse (deferred to the GUI)
 - [ ] Disk monitoring
 - [ ] Network monitoring
 - [ ] GPU monitoring
@@ -110,11 +114,6 @@ Memory Usage:    52.4%
 Total:           15.5 GB
 ...
 
-## SWAP
-
-Total:           8.0 GB
-...
-
 ## PROCESSES
 
     PID  NAME             CPU       RAM     STATE
@@ -135,15 +134,34 @@ Zombie:                4
 
 Processes: 186
 Sort: [1] CPU  [2] Memory  [3] PID  [4] Name (current: CPU)
+View: [l] Process List  [t] Process Tree (current: List)
 Manage: press 'm' (then Enter) to control a process by PID
 Updating every 1 second...
 ```
 
 Press `Ctrl+C` to stop.
 
+### Choosing a view
+
+On startup the application asks which view to show:
+
+```text
+Select view:
+[1] Process List
+[2] Process Tree
+
+Enter a number, or press Enter for the default (Process List):
+>
+```
+
+While it runs you can switch views at any time (then Enter):
+
+- `l` — Process List (flat table)
+- `t` — Process Tree (hierarchical)
+
 ### Sorting
 
-The table is sorted by **CPU usage (descending)** by default. While the
+The **table** is sorted by **CPU usage (descending)** by default. While the
 application runs, press a digit **and then Enter** to change the sort order on
 the next refresh:
 
@@ -151,6 +169,132 @@ the next refresh:
 - `2` — Memory usage (descending)
 - `3` — PID (ascending)
 - `4` — Process name (ascending, case-insensitive)
+
+The tree is always drawn with children ordered by **PID ascending** — sorting
+options for the tree are deliberately not added yet to keep the CLI simple.
+The same keys still work for the table after you switch back with `l`.
+
+## Process tree
+
+### How Linux parent/child relationships work
+
+Every process on Linux (except the very first, PID 1) is created by exactly
+one other process via `fork()`/`clone()` (or, across boot, by the kernel
+spawning kernel threads). That creator is the *parent*; the new process is its
+*child*. Each child holds one immutable **PPID (Parent PID)**; a normal
+process never has more than one parent. Tree discipline follows a few rules:
+
+- PID 1 (`systemd` on Arch) reparents any process whose parent died while it
+  was still alive — an *orphan* is adopted by the init process, never left
+  parentless.
+- Zombie children are stored under their parent until it reaps them with
+  `wait()`; a parent that exits without reaping leaves zombies behind.
+- Kernel threads have PID 0 as their parent.
+
+Because processes start and exit continuously, any two consecutive `/proc`
+scans can disagree about the relationships: a parent can vanish before its
+children are read, so the tree must be robust to references to PIDs that no
+longer exist.
+
+### How PPID is obtained
+
+`ProcessMonitor` already reads `/proc/<pid>/stat` once per refresh — **the
+tree does not rescan `/proc`**. The PPID is field 4 of that file, which is a
+space-separated set of tokens *after* a `(...)` comm block (comm can contain
+spaces and parentheses, so the parser takes everything between the first `(`
+and the last `)` as the name):
+
+```text
+pid (comm) state ppid pgrp session tty_nr tpgid flags minflt ...
+#                ^^^^ — this is the Parent PID
+```
+
+The value ends up in `Process.parent_pid` (see parseStat in
+`src/process_monitor.cpp`). The process tree consumes that count, never the
+raw `/proc` entry.
+
+### How the tree is built
+
+The `ProcessTree` module (`src/process_tree.cpp`) turns a `ProcessMonitor`
+snapshot into a hierarchy in O(n):
+
+1. A `std::unordered_map<pid_t, index>` indexes every process by PID once.
+2. Each process whose PPID is present in the map is recorded as a child of
+   that index; everything else (PPID 0, missing parent, self-reference) is
+   flagged as a root.
+3. Roots and child lists are sorted by PID ascending, so the drawing is
+   deterministic no matter what order `/proc` returned.
+4. A value-semantics `ProcessTreeNode { Process process; std::vector<...>
+   children; }` hierarchy is materialized from the root set.
+
+Self-references and (hypothetically malformed) parent/child cycles are
+guarded, and recursion is depth-capped, so a pathological snapshot can never
+crash the build.
+
+### How orphan processes are handled
+
+A process becomes a **root** of the tree in exactly three cases:
+
+- its PPID is 0 (kernel threads);
+- its PPID names a process that is **not** in the current snapshot — the
+  parent died between scans (or is unreadable, e.g. another user's); or
+- its PPID equals its own PID (defensive; the kernel never produces this).
+
+Orphans are drawn flush-left like any other root, and a missing parent never
+aborts the build. Because the tree is rebuilt from a fresh snapshot every
+second, an orphan moves back under its (new) parent automatically as soon as
+that parent is visible again.
+
+### How the tree is rendered
+
+Rendering is the recursive classic "tree glyphs" algorithm:
+
+```text
+systemd (1)
+├── NetworkManager (512)
+├── Hyprland (982)
+│   ├── waybar (1201)
+│   ├── kitty (1402)
+│   │   └── bash (1403)
+│   └── rofi (1510)
+└── firefox (1245)
+    ├── firefox (1251)
+    └── firefox (1252)
+```
+
+- `├── ` heads a node that has following siblings, `└── ` the last one.
+- A parent with more siblings extends the vertical bar `│   ` down to its
+  children; a last child instead draws nothing there (`    `).
+- Roots are flush-left and their children start at column 0.
+- Each line is `name (pid)` — deliberately minimal so deep trees stay
+  readable; the CPU/RAM columns provide the live numbers in the *table* view.
+
+Above/below the tree, dynamic statistics are printed:
+
+```text
+Total processes: 186
+Root processes: 5
+Maximum tree depth: 8
+```
+
+`Maximum tree depth` counts a root as depth 1. An empty snapshot renders
+`No processes found.`
+
+### Process actions from the tree
+
+Pressing `m` in the tree view shows the tree as a selection aid, then asks
+exactly like the table flow does:
+
+```text
+Enter PID to manage (blank to cancel):
+>
+```
+
+The tree is used **only to identify the selected PID**. Validation is
+identical to the table path (protected PID 1 and the monitor's own PID are
+refused, unknown PIDs are rejected), and the action menu reuses the same
+`ProcessActions` module — `kill(2)` (SIGTERM/SIGKILL/SIGSTOP/SIGCONT) and
+`setpriority(2)` are never re-implemented in the tree code.
 
 ## Process actions
 
@@ -210,6 +354,19 @@ sleep 300 &
 #   m → <sleep's PID> → 1 (Terminate)/2 (Kill)
 ```
 
+To exercise the tree, build a real parent/child chain and watch it appear
+(and later disappear) with `t` / `m`:
+
+```bash
+bash -c 'sleep 300 & exec sleep 400' &
+#   t  → the new "bash" node appears with "sleep" children under it
+#   kill <bash's PID>  → both sleeps are reparented under systemd, then,
+#                         being orphans, they survive as flush-left roots
+```
+
+Orphaned children stay alive and simply move under their new parent (usually
+PID 1) on the next refresh; they never disappear into a crash.
+
 ## Project structure
 
 ```text
@@ -222,13 +379,15 @@ arch-task-manager/
 │   ├── cpu_monitor.hpp         # CpuTimes, readCpuTimes(), CpuMonitor
 │   ├── memory_monitor.hpp      # MemoryInfo, readMemoryInfo(), MemoryMonitor
 │   ├── process_monitor.hpp     # Process, ProcessState, ProcessMonitor
-│   └── process_actions.hpp     # ProcessActions, ActionResult, ActionStatus
+│   ├── process_actions.hpp    # ProcessActions, ActionResult, ActionStatus
+│   └── process_tree.hpp       # ProcessTreeNode, ProcessTree, build/render
 ├── src/
 │   ├── main.cpp                # UI loop: frame rendering + 1 s refresh + control flow
 │   ├── cpu_monitor.cpp         # /proc/stat reading + utilization math
 │   ├── memory_monitor.cpp      # /proc/meminfo reading + memory/swap math
 │   ├── process_monitor.cpp     # /proc scanning + per-process parsing
-│   └── process_actions.cpp     # kill(2)/setpriority(2) wrappers + errno mapping
+│   ├── process_actions.cpp     # kill(2)/setpriority(2) wrappers + errno mapping
+│   └── process_tree.cpp        # PID/PPID tree build + box-drawing renderer
 └── build/                      # generated; never committed to git
 ```
 
