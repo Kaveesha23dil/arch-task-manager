@@ -5,7 +5,6 @@
 #include <chrono>
 #include <filesystem>
 #include <fstream>
-#include <iomanip>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -268,21 +267,6 @@ std::uint64_t readSectorSizeBytes(const std::string &name) {
     return *physical;  // older kernels: hardware sector size
   }
   return 512;  // the unit defined by the /proc/diskstats ABI
-}
-
-std::string formatBytes(std::uint64_t bytes) {
-  static constexpr std::array kSuffixes = {"B", "kB", "MB", "GB", "TB"};
-  double value = static_cast<double>(bytes);
-  std::size_t suffix = 0;
-  constexpr double kKilobyte = 1024.0;
-  while (value >= kKilobyte && suffix + 1 < kSuffixes.size()) {
-    value /= kKilobyte;
-    ++suffix;
-  }
-  std::ostringstream out;
-  out << std::fixed << std::setprecision(value >= 100.0 ? 0 : 1) << value
-      << ' ' << kSuffixes[suffix];
-  return out.str();
 }
 
 DiskSnapshot DiskMonitor::read() {

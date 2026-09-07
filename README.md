@@ -5,11 +5,11 @@ Linux. It reads system information **directly from Linux interfaces** such as
 `/proc/stat`, `/proc/meminfo`, and `/proc/<pid>/` — no shelling out to `ps`,
 `free`, `top`, `htop`, or other external tools.
 
-> Stage: **Step 6** — CPU, RAM, swap, process monitoring, process actions, the
-> process tree, and disk/storage monitoring. Everything else on the roadmap is
-> intentionally **not** implemented yet, but the code is structured so future
-> modules (network, GPU, temperature, etc.) can be added without rewriting the
-> existing ones.
+> Stage: **Step 7** — CPU, RAM, swap, process monitoring, process actions, the
+> process tree, disk/storage monitoring, and network monitoring. Everything
+> else on the roadmap is intentionally **not** implemented yet, but the code
+> is structured so future modules (GPU, temperature, etc.) can be added without
+> rewriting the existing ones.
 
 ## Why is this being built?
 
@@ -45,11 +45,15 @@ feature per milestone, hosted on GitHub.
       physical disks (sizes shown) enumerated from `/sys/block`. Virtual,
       temporary and network filesystems are filtered out so `/proc`, `/sys`,
       tmpfs, overlay, NFS etc. are never presented as disk capacity.
+- [x] **Network monitoring** — per-interface RX/TX speeds computed from two
+      samples of `/proc/net/dev`, cumulative RX/TX bytes, packet/error/dropped
+      counters, physical link state from `/sys/class/net/<name>/operstate`,
+      plus a per-interface detail screen (press `i`). Loopback is shown last
+      and excluded from the aggregate totals.
 
 ### Planned
 
 - [ ] Process tree — interactive expand/collapse (deferred to the GUI)
-- [ ] Network monitoring
 - [ ] GPU monitoring
 - [ ] Temperature monitoring
 - [ ] Systemd service management
@@ -146,6 +150,19 @@ Write:               34 MB/s
 ## DEVICE         SIZE        READ      WRITE
 sda             238 GB    124 MB/s    34 MB/s
 
+## NETWORK
+
+Interface         RX Speed    TX Speed        RX        TX  State
+docker0            0.0 B/s     0.0 B/s     0.0 B     0.0 B  DOWN
+enp1s0             0.0 B/s     0.0 B/s     0.0 B     0.0 B  DOWN
+wlp2s0           802 B/s     410 B/s   94.8 MB    119 MB   UP
+lo                 710 B/s     710 B/s    8.1 MB    8.1 MB   UNKNOWN (loopback)
+
+Total RX: 802 B/s
+Total TX: 410 B/s
+Loopback traffic is excluded from the totals.
+Detailed stats: press 'i' (then Enter)
+
 ## PROCESSES
 
     PID  NAME             CPU       RAM     STATE
@@ -168,6 +185,7 @@ Processes: 186
 Sort: [1] CPU  [2] Memory  [3] PID  [4] Name (current: CPU)
 View: [l] Process List  [t] Process Tree (current: List)
 Manage: press 'm' (then Enter) to control a process by PID
+Network detail: press 'i' (then Enter) to inspect an interface
 Updating every 1 second...
 ```
 
@@ -190,6 +208,7 @@ While it runs you can switch views at any time (then Enter):
 
 - `l` — Process List (flat table)
 - `t` — Process Tree (hierarchical)
+- `i` — inspect one network interface in detail (list view only)
 
 ### Sorting
 
@@ -413,7 +432,9 @@ arch-task-manager/
 │   ├── process_monitor.hpp     # Process, ProcessState, ProcessMonitor
 │   ├── process_actions.hpp     # ProcessActions, ActionResult, ActionStatus
 │   ├── process_tree.hpp        # ProcessTreeNode, ProcessTree, build/render
-│   └── disk_monitor.hpp        # DiskUsage, BlockDevice, DiskSnapshot, DiskMonitor
+│   ├── disk_monitor.hpp        # DiskUsage, BlockDevice, DiskSnapshot, DiskMonitor
+│   ├── network_monitor.hpp     # NetworkInterfaceStats, NetworkSnapshot, NetworkMonitor
+│   └── format_bytes.hpp        # shared byte-formatter (KB/MB/GB, used by disk + network)
 ├── src/
 │   ├── main.cpp                # UI loop: frame rendering + 1 s refresh + control flow
 │   ├── cpu_monitor.cpp         # /proc/stat reading + utilization math
@@ -421,7 +442,8 @@ arch-task-manager/
 │   ├── process_monitor.cpp     # /proc scanning + per-process parsing
 │   ├── process_actions.cpp     # kill(2)/setpriority(2) wrappers + errno mapping
 │   ├── process_tree.cpp        # PID/PPID tree build + box-drawing renderer
-│   └── disk_monitor.cpp        # statvfs(2) usage + /proc/diskstats rates + /sys/block
+│   ├── disk_monitor.cpp        # statvfs(2) usage + /proc/diskstats rates + /sys/block
+│   └── network_monitor.cpp     # /proc/net/dev two-sample rates + operstate
 └── build/                      # generated; never committed to git
 ```
 
@@ -685,6 +707,71 @@ dd if=/dev/zero of=~/burst.bin bs=32M count=2 conv=fdatasync && rm ~/burst.bin
 ```
 
 The write rate column should jump during the flush window.
+
+## How network monitoring works
+
+Network monitoring reads `/proc/net/dev` directly — nothing is ever shelled
+out to `ip`, `ifconfig`, `ss`, `bmon`, or `nload`.
+
+### `/proc/net/dev`
+
+Each non-bridge interface contributes one line:
+
+```text
+Inter-|   Receive                                                |  Transmit
+ face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed
+    lo: 8485632    19841    0    0    0     0          0         0  8485632    19841    0    0    0     0          0         0
+wlp2s0: 99496400   269910    0    0    0     0          0         0 124783716   108928    0    0    0     0          0         0
+```
+
+Per interface the parser reads 16 numeric, whitespace-separated columns
+(`bytes packets errs drop` × receive/transmit) and ignores everything after
+them, so the file keeps working if the kernel appends more columns in the
+future. The name column ends before a `:`. Lines may be indented (`lo:`) or
+flush-left (`wlp2s0:`), and the header and blank line are skipped.
+
+### RX / TX speed
+
+Speeds use the same two-sample-delta technique as CPU and disk monitoring:
+
+1. Record each interface's `rx_bytes`/`tx_bytes` plus a `steady_clock`
+   timestamp (the startup read only establishes a baseline, so no speeds on
+   the first frame).
+2. After the ~1 s refresh interval, re-read `/proc/net/dev`.
+3. `rate = Δbytes ÷ real_elapsed_seconds`, using the real elapsed time, never
+   an assumed 1 s.
+4. A counter that is *smaller* than the previous sample means the counters
+   were reset (interface recreated, driver reload); the interface's baseline
+   is silently re-seeded that tick instead of reporting a negative rate.
+
+### Link state, loopback, totals
+
+- The physical link state is read from `/sys/class/net/<name>/operstate`
+  (`up`, `down`, `unknown`, `dormant`, …); a missing file (an interface that
+  vanished mid-scan) defaults to `unknown`.
+- **Loopback** (`lo`) is drawn last and flagged `(loopback)` so it is never
+  mistaken for a real connection; the **Total RX / Total TX** figures sum
+  non-loopback interfaces only.
+- Non-loopback interfaces are sorted by name; the aggregate is the sum over
+  the interfaces shown, matching what `ss`/`nload` would report for the
+  machine's real uplink.
+
+### The `i` detail screen
+
+`i` (list view) freezes the network table and asks for an interface name:
+
+```text
+Enter interface name to inspect (blank to cancel):
+>
+```
+
+It then prints the full breakdown — RX/TX speed, cumulative bytes, packets
+(with thousands separators), errors, dropped, and link state, plus a
+`Loopback: yes` note where applicable. The snapshot used is the most recent
+one (at most ~1 s old); a blank name cancels and an unknown name is rejected,
+so the detail screen never sleeps on a vanished interface. Like the tree view,
+the `i` screen is available from list view; the tree view deliberately stays a
+pure process hierarchy.
 
 ## License
 

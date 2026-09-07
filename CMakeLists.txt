@@ -33,6 +33,7 @@ add_executable(arch-task-manager
   src/process_actions.cpp
   src/process_tree.cpp
   src/disk_monitor.cpp
+  src/network_monitor.cpp
 )
 
 target_include_directories(arch-task-manager PRIVATE include)

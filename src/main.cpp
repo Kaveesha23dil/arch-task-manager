@@ -1,4 +1,6 @@
 #include <array>
+#include <algorithm>
+#include <cctype>
 #include <cerrno>
 #include <chrono>
 #include <climits>
@@ -17,7 +19,9 @@
 
 #include "cpu_monitor.hpp"
 #include "disk_monitor.hpp"
+#include "format_bytes.hpp"
 #include "memory_monitor.hpp"
+#include "network_monitor.hpp"
 #include "process_actions.hpp"
 #include "process_monitor.hpp"
 #include "process_tree.hpp"
@@ -41,6 +45,10 @@ constexpr std::size_t kNameColumnWidth = 18;
 constexpr std::size_t kMaxNameWidth = 16;
 constexpr std::size_t kStorageMountWidth = 28;
 constexpr std::size_t kDeviceNameWidth = 14;
+constexpr std::size_t kNetworkInterfaceWidth = 14;
+constexpr std::size_t kNetworkRateWidth = 12;
+constexpr std::size_t kNetworkBytesWidth = 10;
+constexpr std::size_t kNetworkStateWidth = 18;
 constexpr int kMinNice = -20;
 constexpr int kMaxNice = 19;
 
@@ -51,6 +59,38 @@ std::string formatPercent(double percent) {
   out << std::fixed << std::setprecision(kPercentPrecision)
       << std::setw(kPercentWidth) << percent;
   return out.str();
+}
+
+/// Truncates text to `width` characters so columns stay aligned.
+std::string fitTo(const std::string &text, std::size_t width) {
+  if (text.size() <= width) {
+    return text;
+  }
+  return text.substr(0, width);
+}
+
+/// Uppercases ASCII characters (the kernel reports operstate in lowercase).
+std::string toUpperAscii(std::string text) {
+  std::transform(text.begin(), text.end(), text.begin(),
+                 [](unsigned char c) {
+                   return static_cast<char>(std::toupper(c));
+                 });
+  return text;
+}
+
+/// Formats an integer with thousands separators, e.g. 1245223 -> "1,245,223".
+std::string formatThousands(std::uint64_t value) {
+  const std::string digits = std::to_string(value);
+  std::string out;
+  out.reserve(digits.size() + digits.size() / 3);
+  const int n = static_cast<int>(digits.size());
+  for (int i = 0; i < n; ++i) {
+    if (i > 0 && (n - i) % 3 == 0) {
+      out.push_back(',');
+    }
+    out.push_back(digits[i]);
+  }
+  return out;
 }
 
 /// Formats a value given in kibibytes as a human-readable size with the
@@ -183,6 +223,75 @@ void renderStorageSections(std::ostringstream &out,
   }
 }
 
+/// Renders the NETWORK summary table (interface, RX/TX speed, cumulative
+/// RX/TX bytes, state). Non-loopback interfaces come first by name;
+/// loopback (lo) is always last and marked so it is never read as the real
+/// connection.
+std::string renderNetworkTableText(const atm::NetworkSnapshot &network) {
+  std::ostringstream out;
+  out << std::left << std::setw(kNetworkInterfaceWidth) << "Interface"
+      << std::right << std::setw(kNetworkRateWidth) << "RX Speed"
+      << std::setw(kNetworkRateWidth) << "TX Speed"
+      << std::setw(kNetworkBytesWidth) << "RX"
+      << std::setw(kNetworkBytesWidth) << "TX"
+      << "  State\n";
+  if (network.interfaces.empty()) {
+    out << "No network interfaces found.\n";
+    return out.str();
+  }
+  for (const atm::NetworkInterfaceStats &iface : network.interfaces) {
+    out << std::left << std::setw(kNetworkInterfaceWidth)
+        << fitTo(iface.name, kNetworkInterfaceWidth) << std::right
+        << std::setw(kNetworkRateWidth)
+        << atm::formatNetworkRate(iface.rx_bytes_per_second)
+        << std::setw(kNetworkRateWidth)
+        << atm::formatNetworkRate(iface.tx_bytes_per_second)
+        << std::setw(kNetworkBytesWidth) << atm::formatBytes(iface.rx_bytes)
+        << std::setw(kNetworkBytesWidth) << atm::formatBytes(iface.tx_bytes)
+        << "  " << std::left << std::setw(kNetworkStateWidth)
+        << (toUpperAscii(iface.state) +
+            (iface.loopback ? " (loopback)" : ""))
+        << '\n';
+  }
+  return out.str();
+}
+
+/// Renders the NETWORK section: the summary table plus the aggregate RX/TX
+/// rates. Totals cover non-loopback interfaces only.
+void renderNetworkSections(std::ostringstream &out,
+                           const atm::NetworkSnapshot &network) {
+  out << "\n## NETWORK\n\n" << renderNetworkTableText(network);
+  out << "\nTotal RX: " << atm::formatNetworkRate(network.total_rx_bytes_per_second)
+      << '\n'
+      << "Total TX: " << atm::formatNetworkRate(network.total_tx_bytes_per_second)
+      << '\n'
+      << "Loopback traffic is excluded from the totals."
+      << "\nDetailed stats: press 'i' (then Enter)\n";
+}
+
+/// Full per-interface breakdown used by the network-detail screen.
+std::string buildInterfaceDetail(const atm::NetworkInterfaceStats &iface) {
+  std::ostringstream out;
+  out << "Interface: " << iface.name << "\n\n"
+      << "Receive\n";
+  appendLabeled(out, "  Speed:", atm::formatNetworkRate(iface.rx_bytes_per_second));
+  appendLabeled(out, "  Total:", atm::formatBytes(iface.rx_bytes));
+  appendLabeled(out, "  Packets:", formatThousands(iface.rx_packets));
+  appendLabeled(out, "  Errors:", std::to_string(iface.rx_errors));
+  appendLabeled(out, "  Dropped:", std::to_string(iface.rx_dropped));
+  out << "\nTransmit\n";
+  appendLabeled(out, "  Speed:", atm::formatNetworkRate(iface.tx_bytes_per_second));
+  appendLabeled(out, "  Total:", atm::formatBytes(iface.tx_bytes));
+  appendLabeled(out, "  Packets:", formatThousands(iface.tx_packets));
+  appendLabeled(out, "  Errors:", std::to_string(iface.tx_errors));
+  appendLabeled(out, "  Dropped:", std::to_string(iface.tx_dropped));
+  out << "\nState: " << toUpperAscii(iface.state) << "\n";
+  if (iface.loopback) {
+    out << "Loopback: yes\n";
+  }
+  return out.str();
+}
+
 /// Renders the process table, sorted by `sort`.
 void renderProcessTable(std::ostringstream &out,
                         const std::vector<atm::Process> &processes) {
@@ -224,16 +333,17 @@ std::string renderTreeFrame(double cpu_usage, const atm::MemoryInfo &memory,
 }
 
 /// Renders the full text view (banner + summary + memory + swap + storage +
-/// processes + statistics + footer). Each frame is a self-contained
-/// 1 s snapshot.
+/// network + processes + statistics + footer). Each frame is a
+/// self-contained 1 s snapshot.
 std::string renderFrame(double cpu_usage, const atm::MemoryInfo &memory,
                         const std::vector<atm::Process> &processes,
                         const atm::ProcessStats &stats, atm::ProcessSort sort,
                         ViewMode view, const atm::ProcessTree &tree,
-                        const atm::DiskSnapshot &disk) {
+                        const atm::DiskSnapshot &disk,
+                        const atm::NetworkSnapshot &network) {
   if (view == ViewMode::Tree) {
     // The tree view stays deliberately focused on the hierarchy; the storage
-    // sections are part of the table view.
+    // and network sections are part of the table view.
     return renderTreeFrame(cpu_usage, memory, tree);
   }
 
@@ -241,6 +351,7 @@ std::string renderFrame(double cpu_usage, const atm::MemoryInfo &memory,
   renderHeader(out, cpu_usage, memory);
   renderMemorySections(out, memory);
   renderStorageSections(out, disk);
+  renderNetworkSections(out, network);
   renderProcessTable(out, processes);
   renderProcessStats(out, stats);
   out << "\n---\n\n"
@@ -251,6 +362,7 @@ std::string renderFrame(double cpu_usage, const atm::MemoryInfo &memory,
       << atm::processSortName(sort) << ")\n"
       << "View: [l] Process List  [t] Process Tree (current: List)\n"
       << "Manage: press 'm' (then Enter) to control a process by PID\n"
+      << "Network detail: press 'i' (then Enter) to inspect an interface\n"
       << "Updating every " << kRefreshInterval.count() << " second...\n";
   return out.str();
 }
@@ -260,12 +372,13 @@ void renderView(double cpu_usage, const atm::MemoryInfo &memory,
                 const std::vector<atm::Process> &processes,
                 const atm::ProcessStats &stats, atm::ProcessSort sort,
                 ViewMode view, const atm::ProcessTree &tree,
-                const atm::DiskSnapshot &disk) {
+                const atm::DiskSnapshot &disk,
+                const atm::NetworkSnapshot &network) {
   // ANSI "clear entire screen" + "cursor to home" so the multi-line frame
   // refreshes in place instead of scrolling the terminal.
   std::cout << "\033[2J\033[H";
   std::cout << renderFrame(cpu_usage, memory, processes, stats, sort, view, tree,
-                           disk)
+                           disk, network)
             << std::flush;
 }
 
@@ -320,6 +433,7 @@ class ConsoleInput {
     ViewList,
     ViewTree,
     Manage,
+    InspectNetwork,
   };
 
   /// Non-blocking: drains whatever stdin currently has, then returns the next
@@ -413,6 +527,7 @@ class ConsoleInput {
     if (token == "l" || token == "L") return Command::ViewList;
     if (token == "t" || token == "T") return Command::ViewTree;
     if (token == "m" || token == "M") return Command::Manage;
+    if (token == "i" || token == "I") return Command::InspectNetwork;
     return Command::None;
   }
 };
@@ -703,6 +818,46 @@ void manageFromTree(atm::ProcessActions &actions, ConsoleInput &input,
   }
 }
 
+/// "i": shows the network table frozen and inspects one interface in detail.
+/// The snapshot is ~1 s old; reading it is safe because NetworkMonitor owns
+/// all the counter state.
+void interactNetworkDetail(const atm::NetworkSnapshot &network,
+                           ConsoleInput &input) {
+  std::cout << "\033[2J\033[H";
+  std::cout << "========================================\n"
+               "ARCH TASK MANAGER — Network Interface Detail\n"
+               "========================================\n\n"
+            << renderNetworkTableText(network) << "\n\n"
+            << "Enter interface name to inspect (blank to cancel):\n> "
+            << std::flush;
+
+  const std::optional<std::string> line = input.readLine();
+  if (!line) {
+    std::cout << "\nInput cancelled.\n";
+    return;
+  }
+  const std::string name = trimWhitespace(*line);
+  if (name.empty()) {
+    std::cout << "Cancelled.\n";
+    return;
+  }
+
+  const auto found =
+      std::find_if(network.interfaces.begin(), network.interfaces.end(),
+                   [&](const atm::NetworkInterfaceStats &iface) {
+                     return iface.name == name;
+                   });
+  if (found == network.interfaces.end()) {
+    std::cout << "Interface does not exist (not found in the current "
+                 "interface list).\n";
+    return;
+  }
+
+  std::cout << '\n' << buildInterfaceDetail(*found)
+            << "\n\nPress Enter to return to the live view.\n" << std::flush;
+  static_cast<void>(input.readLine());  // wait for the user, EOF cancels
+}
+
 }  // namespace
 
 int main() {
@@ -710,6 +865,7 @@ int main() {
   atm::MemoryMonitor memory_monitor;
   atm::ProcessMonitor process_monitor;
   atm::DiskMonitor disk_monitor;
+  atm::NetworkMonitor network_monitor;
   atm::ProcessActions actions;
   ConsoleInput input;
 
@@ -728,11 +884,11 @@ int main() {
   }
 
   // Baseline samples so the first printed frame already shows real deltas:
-  // CPU usage over the sleep below, per-process CPU over the same window, and
-  // disk read/write rates over the same window.
+  // CPU usage, per-process CPU, disk and network rates over the sleep below.
   static_cast<void>(cpu_monitor.readUsage());
   static_cast<void>(process_monitor.read(0));
   static_cast<void>(disk_monitor.read());
+  static_cast<void>(network_monitor.read());
   std::this_thread::sleep_for(kRefreshInterval);
 
   const auto first_cpu = cpu_monitor.readUsage();
@@ -748,11 +904,14 @@ int main() {
   }
 
   const atm::DiskSnapshot first_disk = disk_monitor.read();
+  const atm::NetworkSnapshot first_network = network_monitor.read();
   auto snapshot = process_monitor.read(first_memory->total);
   atm::sortProcesses(snapshot.processes, sort);
   atm::ProcessTree tree = atm::buildProcessTree(snapshot.processes);
   renderView(*first_cpu, *first_memory, snapshot.processes, snapshot.stats,
-             sort, view, tree, first_disk);
+             sort, view, tree, first_disk, first_network);
+
+  atm::NetworkSnapshot network = first_network;
 
   for (;;) {
     std::this_thread::sleep_for(kRefreshInterval);
@@ -789,14 +948,20 @@ int main() {
           const auto memory = memory_monitor.read();
           if (cpu.has_value() && memory.has_value()) {
             const atm::DiskSnapshot disk = disk_monitor.read();
+            const atm::NetworkSnapshot network = network_monitor.read();
             snapshot = process_monitor.read(memory->total);
             atm::sortProcesses(snapshot.processes, sort);
             tree = atm::buildProcessTree(snapshot.processes);
             renderView(*cpu, *memory, snapshot.processes, snapshot.stats,
-                       sort, view, tree, disk);
+                       sort, view, tree, disk, network);
           }
         }
         continue;
+      case ConsoleInput::Command::InspectNetwork:
+        if (view == ViewMode::List) {
+          interactNetworkDetail(network, input);
+        }
+        break;
       case ConsoleInput::Command::None:
         break;
     }
@@ -817,7 +982,8 @@ int main() {
     atm::sortProcesses(snapshot.processes, sort);
     tree = atm::buildProcessTree(snapshot.processes);
     const atm::DiskSnapshot disk = disk_monitor.read();
+    network = network_monitor.read();
     renderView(*cpu, *memory, snapshot.processes, snapshot.stats, sort, view,
-               tree, disk);
+               tree, disk, network);
   }
 }

@@ -114,10 +114,6 @@ struct DiskCounters {
 /// diskstats ABI — when neither is available.
 [[nodiscard]] std::uint64_t readSectorSizeBytes(const std::string &name);
 
-/// Formats a byte count with the largest whole prefix on a 1024 base,
-/// e.g. formatBytes(80'000'000'000) -> "74.5 GB", formatBytes(0) -> "0 B".
-[[nodiscard]] std::string formatBytes(std::uint64_t bytes);
-
 /**
  * Monitors disk storage and activity by reading kernel-provided interfaces.
  *
