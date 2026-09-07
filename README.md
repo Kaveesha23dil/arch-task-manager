@@ -5,11 +5,11 @@ Linux. It reads system information **directly from Linux interfaces** such as
 `/proc/stat`, `/proc/meminfo`, and `/proc/<pid>/` — no shelling out to `ps`,
 `free`, `top`, `htop`, or other external tools.
 
-> Stage: **Step 7** — CPU, RAM, swap, process monitoring, process actions, the
-> process tree, disk/storage monitoring, and network monitoring. Everything
-> else on the roadmap is intentionally **not** implemented yet, but the code
-> is structured so future modules (GPU, temperature, etc.) can be added without
-> rewriting the existing ones.
+> Stage: **Step 8** — CPU, RAM, swap, process monitoring, process actions, the
+> process tree, disk/storage monitoring, network monitoring, and GPU
+> monitoring. Everything else on the roadmap is intentionally **not**
+> implemented yet, but the code is structured so future modules (temperature,
+> etc.) can be added without rewriting the existing ones.
 
 ## Why is this being built?
 
@@ -50,11 +50,18 @@ feature per milestone, hosted on GitHub.
       counters, physical link state from `/sys/class/net/<name>/operstate`,
       plus a per-interface detail screen (press `i`). Loopback is shown last
       and excluded from the aggregate totals.
+- [x] **GPU monitoring** — automatic GPU detection from `/sys/class/drm/card*`
+      with PCI vendor/model identification, and live GPU utilization, VRAM,
+      clock and power where the vendor's kernel driver exposes them. AMD
+      (amdgpu) reads `gpu_busy_percent`, VRAM files and `pp_dpm_sclk`; Intel
+      (i915) reads the per-GT clocks and derives GT busy from the RC6
+      residency delta; NVIDIA and unknown vendors report everything they
+      cannot expose as "N/A". Unavailable metrics always degrade gracefully.
+      Press `g` for the full per-GPU detail screen.
 
 ### Planned
 
 - [ ] Process tree — interactive expand/collapse (deferred to the GUI)
-- [ ] GPU monitoring
 - [ ] Temperature monitoring
 - [ ] Systemd service management
 - [ ] Startup applications
@@ -163,6 +170,13 @@ Total TX: 410 B/s
 Loopback traffic is excluded from the totals.
 Detailed stats: press 'i' (then Enter)
 
+## GPU
+
+GPU                   Usage                VRAM     Clock
+Kaby Lake-R GT2 [UHD  35.0%               N/A    300 MHz
+
+Detailed GPU info: press 'g' (then Enter)
+
 ## PROCESSES
 
     PID  NAME             CPU       RAM     STATE
@@ -186,6 +200,7 @@ Sort: [1] CPU  [2] Memory  [3] PID  [4] Name (current: CPU)
 View: [l] Process List  [t] Process Tree (current: List)
 Manage: press 'm' (then Enter) to control a process by PID
 Network detail: press 'i' (then Enter) to inspect an interface
+GPU detail: press 'g' (then Enter) to inspect a GPU
 Updating every 1 second...
 ```
 
@@ -209,6 +224,7 @@ While it runs you can switch views at any time (then Enter):
 - `l` — Process List (flat table)
 - `t` — Process Tree (hierarchical)
 - `i` — inspect one network interface in detail (list view only)
+- `g` — read the full per-GPU breakdown (list view only)
 
 ### Sorting
 
@@ -434,6 +450,7 @@ arch-task-manager/
 │   ├── process_tree.hpp        # ProcessTreeNode, ProcessTree, build/render
 │   ├── disk_monitor.hpp        # DiskUsage, BlockDevice, DiskSnapshot, DiskMonitor
 │   ├── network_monitor.hpp     # NetworkInterfaceStats, NetworkSnapshot, NetworkMonitor
+│   ├── gpu_monitor.hpp         # GpuStats, GpuSnapshot, GpuMonitor, GPU format helpers
 │   └── format_bytes.hpp        # shared byte-formatter (KB/MB/GB, used by disk + network)
 ├── src/
 │   ├── main.cpp                # UI loop: frame rendering + 1 s refresh + control flow
@@ -443,7 +460,8 @@ arch-task-manager/
 │   ├── process_actions.cpp     # kill(2)/setpriority(2) wrappers + errno mapping
 │   ├── process_tree.cpp        # PID/PPID tree build + box-drawing renderer
 │   ├── disk_monitor.cpp        # statvfs(2) usage + /proc/diskstats rates + /sys/block
-│   └── network_monitor.cpp     # /proc/net/dev two-sample rates + operstate
+│   ├── network_monitor.cpp     # /proc/net/dev two-sample rates + operstate
+│   └── gpu_monitor.cpp         # /sys/class/drm GPU discovery + vendor metrics
 └── build/                      # generated; never committed to git
 ```
 
@@ -772,6 +790,128 @@ one (at most ~1 s old); a blank name cancels and an unknown name is rejected,
 so the detail screen never sleeps on a vanished interface. Like the tree view,
 the `i` screen is available from list view; the tree view deliberately stays a
 pure process hierarchy.
+
+## How GPU monitoring works
+
+GPU monitoring (`GpuMonitor`, `src/gpu_monitor.cpp`) reads the kernel's DRM
+and driver sysfs interfaces directly — nothing is ever shelled out to
+`nvidia-smi`, `glxinfo`, `intel_gpu_top`, or `lspci`, and no GPU *control*
+(overclocking, fan/voltage/power-limit changes, resets) is performed or even
+possible. The UI is `## GPU` in the live list view, plus a `g` detail screen
+showing every metric per GPU.
+
+### GPU detection
+
+Available GPUs are discovered by enumerating `/sys/class/drm/card*` — the
+kernel's *DRM primary nodes*. Each `cardN` maps to one graphics device (or
+display adapter): `card0`, `card1`, … Connectors (`card1-eDP-1`) and render
+nodes (`renderD128`) are not primary nodes and are skipped. Devices are
+ordered by card number ascending.
+
+Per card, stable identity is read once and cached from the kernel:
+
+| Source                                  | Provides                        |
+| --------------------------------------- | ------------------------------- |
+| `card*/device/vendor`                   | PCI vendor ID (`0x8086`)        |
+| `card*/device/device`                   | PCI device ID (`0x5917`)        |
+| `card*/device/driver`  (symlink target) | bound driver (`i915`, `amdgpu`) |
+| `card*/device/uevent`                   | `PCI_SLOT_NAME` (`0000:00:02.0`)|
+
+A friendly model name is resolved from the read-only PCI ID database
+(`/usr/share/hwdata/pci.ids` or `/usr/share/misc/pci.ids` when installed,
+e.g. *"Kaby Lake-R GT2 [UHD Graphics 620]"*). If the database is missing the
+name falls back to `Vendor 0x<device-id>`. The vendor comes from the PCI
+vendor ID via a small fixed mapping (`0x1002` AMD, `0x10de` NVIDIA,
+`0x8086` Intel); anything else is reported as *Unknown*.
+
+### Supported vendors and metrics
+
+What is actually available depends entirely on the GPU and its Linux driver.
+Every metric is `std::optional` internally and is rendered as `N/A` when the
+driver does not expose it — an unsupported value is never faked as 0.
+
+| Vendor  | Usage                      | VRAM                     | Clock                          | Power                |
+| ------- | -------------------------- | ------------------------ | ------------------------------ | -------------------- |
+| AMD     | `gpu_busy_percent`         | `mem_info_vram_total/used` | `pp_dpm_sclk` (active state) | hwmon `power1_input` |
+| Intel   | RC6 residency delta        | — (shared system RAM)    | `gt/gtN/rps_act_freq_mhz` / `gt_act_freq_mhz` | hwmon `power1_input` (rare) |
+| NVIDIA  | —                          | —                        | —                              | hwmon `power1_input` (rare) |
+| Unknown | —                          | —                        | —                              | hwmon `power1_input` (rare) |
+
+All of these are read **only if the file exists**; `read()` never fails or
+crashes because a value is absent, malformed, unreadable, or the GPU was
+removed. The dynamic metrics are refreshed every tick of the main loop (the
+monitor never runs its own thread), while identity is cached and only
+re-discovered if the set of DRM primary nodes changes.
+
+> **NVIDIA note.** The proprietary `nvidia` driver does not export these
+> values through generic kernel interfaces, so NVIDIA GPUs are detected
+> (vendor, model, driver) and reported with `N/A` for utilization/VRAM/clock
+> unless a hwmon power sensor happens to exist. The application deliberately
+> does **not** shell out to `nvidia-smi` every second — that would be a
+> fragile, potentially leaking dependency.
+
+### GPU utilization
+
+- **AMD:** the kernel exposes `gpu_busy_percent` (already 0–100), read
+  directly.
+- **Intel:** the kernel exposes cumulative `rc6_residency_ms` (time the GT
+  spent in its deepest sleep state) per GT engine. The monitor samples it
+  like `CpuMonitor` samples `/proc/stat` and derives busy time from the delta:
+
+  ```text
+  busy% = 100 − rc6_delta_ms ÷ wall_elapsed_ms × 100   (clamped to 0–100)
+  ```
+
+  This is the same measurement `intel_gpu_top` uses for older kernels. The
+  first sample only records a baseline, so `N/A` appears on the very first
+  frame and a real percentage from the second tick on. A counter reset (RC6
+  counter smaller than before) re-seeds the baseline instead of printing a
+  bogus figure.
+- **Everything else:** displayed as `Usage: N/A`.
+
+### VRAM
+
+AMD GPUs expose `mem_info_vram_total` and `mem_info_vram_used` in bytes;
+`free` and `usage%` are derived with a division-by-zero guard (`usage% = used
+÷ total × 100`, computed only when `total > 0`). Intel iGPUs share system RAM
+and expose no VRAM interface, so the whole memory block is `N/A`. In the
+summary table VRAM shows as `used/total`, e.g. `3.2 GB/8.0 GB`.
+
+### Frequency and power
+
+Clock is reported as `1200 MHz` below 1 GHz and `1.20 GHz` at/above it. Power
+is read from the generic hwmon `power1_input` sensor (microwatts converted to
+watts, shown as `45.2 W`) when the driver exposes one; it is **never guessed**
+from utilization. Both degrade to `N/A` when unavailable.
+
+### The `g` detail screen
+
+`g` (list view) shows the frozen GPU summary followed by the full per-GPU
+breakdown — name, vendor, driver, PCI slot, usage, memory (Total/Used/Free/
+Usage) and clock/power:
+
+```text
+GPU 0 (card1)
+
+Name:                Kaby Lake-R GT2 [UHD Graphics 620]
+Vendor:              Intel
+Driver:              i915
+PCI Slot:            0000:00:02.0
+
+Usage: 35.0%
+
+Memory:
+  Total:             N/A
+  Used:              N/A
+  Free:              N/A
+  Usage:             N/A
+
+Frequency: 300 MHz
+Power: N/A
+```
+
+Multiple GPUs each get their own block, labeled `GPU 0`, `GPU 1`, … Press
+Enter to return to the live view.
 
 ## License
 

@@ -20,6 +20,7 @@
 #include "cpu_monitor.hpp"
 #include "disk_monitor.hpp"
 #include "format_bytes.hpp"
+#include "gpu_monitor.hpp"
 #include "memory_monitor.hpp"
 #include "network_monitor.hpp"
 #include "process_actions.hpp"
@@ -49,6 +50,10 @@ constexpr std::size_t kNetworkInterfaceWidth = 14;
 constexpr std::size_t kNetworkRateWidth = 12;
 constexpr std::size_t kNetworkBytesWidth = 10;
 constexpr std::size_t kNetworkStateWidth = 18;
+constexpr std::size_t kGpuNameWidth = 20;
+constexpr std::size_t kGpuUsageWidth = 7;
+constexpr std::size_t kGpuVramWidth = 18;
+constexpr std::size_t kGpuClockWidth = 11;
 constexpr int kMinNice = -20;
 constexpr int kMaxNice = 19;
 
@@ -269,6 +274,95 @@ void renderNetworkSections(std::ostringstream &out,
       << "\nDetailed stats: press 'i' (then Enter)\n";
 }
 
+/// Formats a utilization value with a trailing '%' ("72.0%"), or "N/A" when
+/// the driver does not expose it.
+std::string formatGpuUsage(const std::optional<double> &usage_percent) {
+  if (!usage_percent.has_value()) {
+    return "N/A";
+  }
+  std::ostringstream out;
+  out << std::fixed << std::setprecision(1) << *usage_percent << '%';
+  return out.str();
+}
+
+/// One VRAM table cell: "3.2 GB/8.0 GB", or "N/A" when the driver does not
+/// expose VRAM usage (e.g. Intel iGPUs that share system memory).
+std::string formatGpuVramSummary(const atm::GpuStats &gpu) {
+  if (!gpu.memory_used_bytes.has_value() || !gpu.memory_total_bytes.has_value()) {
+    return "N/A";
+  }
+  return atm::formatBytes(*gpu.memory_used_bytes) + "/" +
+         atm::formatBytes(*gpu.memory_total_bytes);
+}
+
+/// Renders the GPU summary table (name, usage, VRAM, clock). Missing metrics
+/// degrade to "N/A" per cell; a GPU is never hidden because one metric is
+/// unavailable.
+std::string renderGpuTableText(const atm::GpuSnapshot &gpu) {
+  std::ostringstream out;
+  out << std::left << std::setw(kGpuNameWidth) << "GPU" << std::right
+      << std::setw(kGpuUsageWidth) << "Usage" << std::setw(kGpuVramWidth)
+      << "VRAM" << std::setw(kGpuClockWidth) << "Clock\n";
+  if (gpu.devices.empty()) {
+    out << "No GPU detected.\n";
+    return out.str();
+  }
+  for (const atm::GpuStats &gpu_stats : gpu.devices) {
+    out << std::left << std::setw(kGpuNameWidth)
+        << fitTo(gpu_stats.name, kGpuNameWidth) << std::right
+        << std::setw(kGpuUsageWidth) << formatGpuUsage(gpu_stats.utilization_percent)
+        << std::setw(kGpuVramWidth) << formatGpuVramSummary(gpu_stats)
+        << std::setw(kGpuClockWidth)
+        << atm::formatGpuFrequency(gpu_stats.frequency_hz) << '\n';
+  }
+  return out.str();
+}
+
+/// Renders the GPU section of the live view.
+void renderGpuSections(std::ostringstream &out, const atm::GpuSnapshot &gpu) {
+  out << "\n## GPU\n\n" << renderGpuTableText(gpu)
+      << "Detailed GPU info: press 'g' (then Enter)\n";
+}
+
+/// Full per-GPU breakdown used by the GPU-detail screen. Multiple GPUs are
+/// shown one after another with the index and card node on each header.
+std::string renderGpuDetails(const atm::GpuSnapshot &gpu) {
+  std::ostringstream out;
+  if (gpu.devices.empty()) {
+    out << "No GPU detected.\n";
+    return out.str();
+  }
+  for (std::size_t index = 0; index < gpu.devices.size(); ++index) {
+    const atm::GpuStats &g = gpu.devices[index];
+    if (index > 0) {
+      out << "\n---\n\n";
+    }
+    out << "GPU " << index << " (" << g.card << ")\n\n";
+    appendLabeled(out, "Name:", g.name);
+    appendLabeled(out, "Vendor:", atm::gpuVendorName(g.vendor));
+    appendLabeled(out, "Driver:", g.driver.empty() ? "N/A" : g.driver);
+    appendLabeled(out, "PCI Slot:", g.pci_slot.empty() ? "N/A" : g.pci_slot);
+    out << "\n" << "Usage: " << formatGpuUsage(g.utilization_percent)
+        << "\n\nMemory:\n";
+    appendLabeled(out, "  Total:",
+                  g.memory_total_bytes.has_value()
+                      ? atm::formatBytes(*g.memory_total_bytes)
+                      : "N/A");
+    appendLabeled(out, "  Used:",
+                  g.memory_used_bytes.has_value()
+                      ? atm::formatBytes(*g.memory_used_bytes)
+                      : "N/A");
+    appendLabeled(out, "  Free:",
+                  g.memory_free_bytes.has_value()
+                      ? atm::formatBytes(*g.memory_free_bytes)
+                      : "N/A");
+    appendLabeled(out, "  Usage:", formatGpuUsage(g.memory_usage_percent));
+    out << "\nFrequency: " << atm::formatGpuFrequency(g.frequency_hz) << '\n'
+        << "Power: " << atm::formatGpuPower(g.power_watts) << '\n';
+  }
+  return out.str();
+}
+
 /// Full per-interface breakdown used by the network-detail screen.
 std::string buildInterfaceDetail(const atm::NetworkInterfaceStats &iface) {
   std::ostringstream out;
@@ -333,14 +427,15 @@ std::string renderTreeFrame(double cpu_usage, const atm::MemoryInfo &memory,
 }
 
 /// Renders the full text view (banner + summary + memory + swap + storage +
-/// network + processes + statistics + footer). Each frame is a
+/// network + GPU + processes + statistics + footer). Each frame is a
 /// self-contained 1 s snapshot.
 std::string renderFrame(double cpu_usage, const atm::MemoryInfo &memory,
                         const std::vector<atm::Process> &processes,
                         const atm::ProcessStats &stats, atm::ProcessSort sort,
                         ViewMode view, const atm::ProcessTree &tree,
                         const atm::DiskSnapshot &disk,
-                        const atm::NetworkSnapshot &network) {
+                        const atm::NetworkSnapshot &network,
+                        const atm::GpuSnapshot &gpu) {
   if (view == ViewMode::Tree) {
     // The tree view stays deliberately focused on the hierarchy; the storage
     // and network sections are part of the table view.
@@ -352,6 +447,7 @@ std::string renderFrame(double cpu_usage, const atm::MemoryInfo &memory,
   renderMemorySections(out, memory);
   renderStorageSections(out, disk);
   renderNetworkSections(out, network);
+  renderGpuSections(out, gpu);
   renderProcessTable(out, processes);
   renderProcessStats(out, stats);
   out << "\n---\n\n"
@@ -363,6 +459,7 @@ std::string renderFrame(double cpu_usage, const atm::MemoryInfo &memory,
       << "View: [l] Process List  [t] Process Tree (current: List)\n"
       << "Manage: press 'm' (then Enter) to control a process by PID\n"
       << "Network detail: press 'i' (then Enter) to inspect an interface\n"
+      << "GPU detail: press 'g' (then Enter) to inspect a GPU\n"
       << "Updating every " << kRefreshInterval.count() << " second...\n";
   return out.str();
 }
@@ -373,12 +470,13 @@ void renderView(double cpu_usage, const atm::MemoryInfo &memory,
                 const atm::ProcessStats &stats, atm::ProcessSort sort,
                 ViewMode view, const atm::ProcessTree &tree,
                 const atm::DiskSnapshot &disk,
-                const atm::NetworkSnapshot &network) {
+                const atm::NetworkSnapshot &network,
+                const atm::GpuSnapshot &gpu) {
   // ANSI "clear entire screen" + "cursor to home" so the multi-line frame
   // refreshes in place instead of scrolling the terminal.
   std::cout << "\033[2J\033[H";
   std::cout << renderFrame(cpu_usage, memory, processes, stats, sort, view, tree,
-                           disk, network)
+                           disk, network, gpu)
             << std::flush;
 }
 
@@ -418,8 +516,9 @@ bool parseSignedInteger(const std::string &text, int &out) {
 }
 
 /// Reads raw terminal input without blocking. One complete line at a time is
-/// interpreted: digits 1-4 switch the sort order, 'm' enters process-control
-/// mode, anything else is ignored. Because the live loop must not lose bytes
+/// interpreted: digits 1-4 switch the sort order, 'l'/'t' switch views, 'm'
+/// enters process-control mode, 'i'/'g' open the network/GPU detail screens;
+/// anything else is ignored. Because the live loop must not lose bytes
 /// meant for the (blocking) control prompts, all input funnels through an
 /// internal buffer shared with readLine().
 class ConsoleInput {
@@ -434,6 +533,7 @@ class ConsoleInput {
     ViewTree,
     Manage,
     InspectNetwork,
+    InspectGpu,
   };
 
   /// Non-blocking: drains whatever stdin currently has, then returns the next
@@ -528,6 +628,7 @@ class ConsoleInput {
     if (token == "t" || token == "T") return Command::ViewTree;
     if (token == "m" || token == "M") return Command::Manage;
     if (token == "i" || token == "I") return Command::InspectNetwork;
+    if (token == "g" || token == "G") return Command::InspectGpu;
     return Command::None;
   }
 };
@@ -858,6 +959,19 @@ void interactNetworkDetail(const atm::NetworkSnapshot &network,
   static_cast<void>(input.readLine());  // wait for the user, EOF cancels
 }
 
+/// "g": shows the GPU summary frozen followed by the full per-GPU breakdown.
+/// The snapshot is at most ~1 s old; all device state lives in GpuMonitor.
+void interactGpuDetail(const atm::GpuSnapshot &gpu, ConsoleInput &input) {
+  std::cout << "\033[2J\033[H";
+  std::cout << "========================================\n"
+               "ARCH TASK MANAGER — GPU Detail\n"
+               "========================================\n\n"
+            << renderGpuTableText(gpu) << "\n\n"
+            << renderGpuDetails(gpu)
+            << "\n\nPress Enter to return to the live view.\n" << std::flush;
+  static_cast<void>(input.readLine());  // wait for the user, EOF cancels
+}
+
 }  // namespace
 
 int main() {
@@ -866,6 +980,7 @@ int main() {
   atm::ProcessMonitor process_monitor;
   atm::DiskMonitor disk_monitor;
   atm::NetworkMonitor network_monitor;
+  atm::GpuMonitor gpu_monitor;
   atm::ProcessActions actions;
   ConsoleInput input;
 
@@ -884,11 +999,13 @@ int main() {
   }
 
   // Baseline samples so the first printed frame already shows real deltas:
-  // CPU usage, per-process CPU, disk and network rates over the sleep below.
+  // CPU usage, per-process CPU, disk, network and GPU (Intel RC6) over the
+  // sleep below.
   static_cast<void>(cpu_monitor.readUsage());
   static_cast<void>(process_monitor.read(0));
   static_cast<void>(disk_monitor.read());
   static_cast<void>(network_monitor.read());
+  static_cast<void>(gpu_monitor.read());
   std::this_thread::sleep_for(kRefreshInterval);
 
   const auto first_cpu = cpu_monitor.readUsage();
@@ -905,13 +1022,15 @@ int main() {
 
   const atm::DiskSnapshot first_disk = disk_monitor.read();
   const atm::NetworkSnapshot first_network = network_monitor.read();
+  const atm::GpuSnapshot first_gpu = gpu_monitor.read();
   auto snapshot = process_monitor.read(first_memory->total);
   atm::sortProcesses(snapshot.processes, sort);
   atm::ProcessTree tree = atm::buildProcessTree(snapshot.processes);
   renderView(*first_cpu, *first_memory, snapshot.processes, snapshot.stats,
-             sort, view, tree, first_disk, first_network);
+             sort, view, tree, first_disk, first_network, first_gpu);
 
   atm::NetworkSnapshot network = first_network;
+  atm::GpuSnapshot gpu = first_gpu;
 
   for (;;) {
     std::this_thread::sleep_for(kRefreshInterval);
@@ -949,17 +1068,23 @@ int main() {
           if (cpu.has_value() && memory.has_value()) {
             const atm::DiskSnapshot disk = disk_monitor.read();
             const atm::NetworkSnapshot network = network_monitor.read();
+            gpu = gpu_monitor.read();
             snapshot = process_monitor.read(memory->total);
             atm::sortProcesses(snapshot.processes, sort);
             tree = atm::buildProcessTree(snapshot.processes);
             renderView(*cpu, *memory, snapshot.processes, snapshot.stats,
-                       sort, view, tree, disk, network);
+                       sort, view, tree, disk, network, gpu);
           }
         }
         continue;
       case ConsoleInput::Command::InspectNetwork:
         if (view == ViewMode::List) {
           interactNetworkDetail(network, input);
+        }
+        break;
+      case ConsoleInput::Command::InspectGpu:
+        if (view == ViewMode::List) {
+          interactGpuDetail(gpu, input);
         }
         break;
       case ConsoleInput::Command::None:
@@ -983,7 +1108,8 @@ int main() {
     tree = atm::buildProcessTree(snapshot.processes);
     const atm::DiskSnapshot disk = disk_monitor.read();
     network = network_monitor.read();
+    gpu = gpu_monitor.read();
     renderView(*cpu, *memory, snapshot.processes, snapshot.stats, sort, view,
-               tree, disk, network);
+               tree, disk, network, gpu);
   }
 }
