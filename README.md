@@ -5,9 +5,10 @@ Linux. It reads system information **directly from Linux interfaces** such as
 `/proc/stat`, `/proc/meminfo`, and `/proc/<pid>/` — no shelling out to `ps`,
 `free`, `top`, `htop`, or other external tools.
 
-> Stage: **Step 10** — CPU, RAM, swap, process monitoring, process actions, the
+> Stage: **Step 11** — CPU, RAM, swap, process monitoring, process actions, the
 > process tree, disk/storage monitoring, network monitoring, GPU monitoring,
-> temperature & hardware sensor monitoring, and systemd service management.
+> temperature & hardware sensor monitoring, systemd service management, and
+> startup application management.
 > Everything else on the roadmap is intentionally **not** implemented yet, but
 > the code is structured so future modules can be added without rewriting the
 > existing ones.
@@ -85,11 +86,25 @@ feature per milestone, hosted on GitHub.
       crashing. The `u` screen never asks for a password. If systemd cannot
       be reached the section reports "Unable to connect to systemd." while
       every other monitor keeps working.
+- [x] **Startup applications** — an XDG autostart manager that discovers
+      desktop autostart entries from the system directories
+      (`/etc/xdg/autostart` plus `$XDG_CONFIG_DIRS` entries) and the user's
+      own `~/.config/autostart` (or `$XDG_CONFIG_HOME/autostart`), showing
+      name, description, `Exec=` command, icon, scope (User/System), and the
+      effective enabled state per the XDG rules (`Hidden=true`, `OnlyShowIn`/
+      `NotShowIn`, `X-GNOME-Autostart-enabled=false`). It supports a
+      case-insensitive search, sorting by name/enabled/scope, a per-application
+      detail view, and **Enable / Disable** management from the `a` screen.
+      Management never modifies `/etc/xdg`; enabling or disabling a system
+      entry writes a user-level override (with `Hidden=true`/`false`) into the
+      user's autostart directory, and unrelated fields/comments in `.desktop`
+      files are preserved. This is configuration management only — commands
+      are never executed — and it is deliberately separate from the systemd
+      service manager (Step 10).
 
 ### Planned
 
 - [ ] Process tree — interactive expand/collapse (deferred to the GUI)
-- [ ] Startup applications
 - [ ] Arch Linux package/update information
 - [ ] Historical graphs
 - [ ] System alerts
@@ -101,7 +116,8 @@ feature per milestone, hosted on GitHub.
 - Build system: **CMake** (works for both Debug and Release)
 - Compiler: **g++** (`GCC`)
 - OS interfaces: the `/proc` and `/sys` filesystems, `statvfs(2)`,
-  `sysconf(3)`, and systemd's D-Bus API (`sd-bus`/`libsystemd`)
+  `sysconf(3)`, the standard `std::filesystem` API, and systemd's D-Bus API
+  (`sd-bus`/`libsystemd`)
 - Standard library plus `libsystemd` (the only third-party dependency; it
   provides the `sd-bus` D-Bus client used for systemd service management)
 - No shelling out to external tools
@@ -231,6 +247,15 @@ bluetooth.service          inactive     disabled      Bluetooth service
 systemd-journald.service   active       static        Journal Service
 
 Service detail: press 'u' (then Enter)
+
+## STARTUP APPLICATIONS
+
+Name                    Enabled   Scope  Command
+Discord                    Yes    User   /usr/bin/discord --start-minimized
+Bluetooth Manager          Yes  System   blueman-applet
+NetworkManager Applet      Yes  System   nm-applet
+
+Startup apps: press 'a' (then Enter) to manage autostart
 
 ## PROCESSES
 
@@ -510,6 +535,7 @@ arch-task-manager/
 │   ├── gpu_monitor.hpp         # GpuStats, GpuSnapshot, GpuMonitor, GPU format helpers
 │   ├── sensor_monitor.hpp      # TemperatureSensor, FanSensor, SensorSnapshot, SensorMonitor
 │   ├── systemd_manager.hpp     # SystemdService, SystemdSnapshot, SystemdManager (D-Bus)
+│   ├── startup_manager.hpp     # StartupApplication, StartupSnapshot, StartupManager (XDG)
 │   └── format_bytes.hpp        # shared byte-formatter (KB/MB/GB, used by disk + network)
 ├── src/
 │   ├── main.cpp                # UI loop: frame rendering + 1 s refresh + control flow
@@ -522,7 +548,8 @@ arch-task-manager/
 │   ├── network_monitor.cpp     # /proc/net/dev two-sample rates + operstate
 │   ├── gpu_monitor.cpp         # /sys/class/drm GPU discovery + vendor metrics
 │   ├── sensor_monitor.cpp      # /sys/class/hwmon temperature/fan discovery + readings
-│   └── systemd_manager.cpp     # sd-bus / org.freedesktop.systemd1 discovery + management
+│   ├── systemd_manager.cpp     # sd-bus / org.freedesktop.systemd1 discovery + management
+│   └── startup_manager.cpp     # XDG autostart scan, .desktop parse, enable/disable
 └── build/                      # generated; never committed to git
 ```
 
@@ -1175,6 +1202,121 @@ continue to function normally.
 - No automatic startup-application or package-installation management.
 - `MainPID` and some unit values are only shown when systemd reports them
   reliably (a value of `0` means systemd reports no main process).
+
+## Startup Applications
+
+Startup application management is a dedicated `StartupManager` module that
+implements the **standard XDG autostart mechanism** for graphical desktop
+applications. It is deliberately separate from the systemd service manager
+(which handles `.service` units) and from other startup mechanisms it does
+**not** manage: `/etc/rc.local`, cron, shell profiles (`.bashrc`, `.zshrc`),
+bootloader configuration, or kernel parameters.
+
+### XDG autostart
+
+The manager scans the standard autostart directories:
+
+- System: `/etc/xdg/autostart` plus one `autostart` directory per
+  `$XDG_CONFIG_DIRS` entry (defaulting to `/etc/xdg`).
+- User: `~/.config/autostart`, or `$XDG_CONFIG_HOME/autostart` when that
+  variable is set to an absolute path.
+
+Directories that do not exist are simply skipped. Only `*.desktop` files are
+considered; hidden/temporary/backup files (names starting with `.`, `#` or
+containing `~`) and non-regular files (including broken symlinks) are ignored.
+The home directory is read from `$HOME` (never hard-coded), so the tool works
+for any user.
+
+### `[Desktop Entry]` parsing
+
+A small, dependency-free parser reads the `[Desktop Entry]` group of each
+file. Localized keys (e.g. `Name[de]`) are folded into their base key (the plain
+`Name=` wins; otherwise the first localized value is used). The supported keys:
+
+| Key | Purpose |
+|---|---|
+| `Name` | display name (falls back to the file name when missing) |
+| `Comment` | description |
+| `Exec` | the command line — displayed only, **never executed** |
+| `Icon` | icon name |
+| `Hidden` | `true` hides the entry (see override behavior below) |
+| `OnlyShowIn` / `NotShowIn` | desktop-environment restrictions |
+| `X-GNOME-Autostart-enabled` | GNOME-specific enable switch (recognized without requiring GNOME) |
+
+Entries with no `[Desktop Entry]` group or with a `Type=` other than
+`Application` are ignored, as are entries whose `Name` and `Exec` are both
+absent-and-unusable. A single malformed file never prevents the others from
+loading.
+
+### Enabled state
+
+The effective enabled state is computed with the XDG rules:
+
+- a missing or unparseable boolean field does **not** mean "disabled";
+- `Hidden=true` disables the entry;
+- `X-GNOME-Autostart-enabled=false` disables the entry;
+- `OnlyShowIn`/`NotShowIn` are applied against `$XDG_CURRENT_DESKTOP` when a
+  desktop environment is running (e.g. `Hyprland`, `GNOME`, `KDE`); when no
+  desktop environment is set, those keys do not disable the entry.
+
+### User vs system entries and overrides
+
+Every entry is tagged with its scope (`User` or `System`). The standard XDG
+precedence applies automatically: a user entry with the same file name as a
+system entry **shadows** it, and the UI flags the result with
+`Overrides System: Yes`.
+
+Enabling or disabling never writes below `/etc/xdg`:
+
+- **User entry** — enable/disable rewrites the user's own file in place,
+  only adding or updating `Hidden=` and `X-GNOME-Autostart-enabled=`.
+  Comments and all unrelated keys are preserved.
+- **System entry** — enable/disable copies the system file into the user's
+  autostart directory and sets the same two keys there, creating
+  `~/.config/autostart` if needed. The system file is never touched. A copied
+  override keeps the original `Exec`, `Name`, and other fields, so the
+  application still launches exactly as before.
+
+Both operations require an explicit confirmation prompt.
+
+### Management screen
+
+Press `a` (then Enter) to open the frozen management screen:
+
+```text
+[1] Enable Startup Application
+[2] Disable Startup Application
+[3] View Application Details
+[4] Search/Filter Applications
+[5] Sort Applications
+[6] Refresh Application List
+[0] Cancel
+```
+
+Search covers name, description, command and file name (case-insensitive) and
+filters the already-loaded list. Sorting covers Name (default), Enabled state
+and Scope. The `STARTUP APPLICATIONS` section in the live view shows the same
+columns and reflects enable/disable overrides immediately. The directories are
+scanned once and cached; `refresh()` rescans on demand (startup, `[6]`, and
+after every management action), so the filesystem is not polled continuously.
+
+### Security and permissions
+
+`.desktop` files are treated as configuration data: the `Exec=` value is
+displayed but never run (`system()`/`popen()`/`exec()` are not used for
+startup entries), no passwords are collected, and writes are confined to the
+user's autostart directory. Reading `/etc/xdg/autostart` normally needs no
+privileges; if a file cannot be read or written, the app reports a clear
+`Permission denied.`/error message and continues running.
+
+### Desktop-environment limitations
+
+The implementation follows the standard XDG autostart spec first, and only
+recognizes `X-GNOME-Autostart-enabled` as a convenience field — GNOME is not a
+dependency. It does not emulate DE-specific autostart features such as
+`AutostartCondition=` (GSettings-backed conditions), KDE's `X-KDE-*` phases, or
+`StartupNotify`. Startup **timing** (`X-GNOME-Autostart-Phase`,
+`X-KDE-autostart-phase`) is not acted upon; those keys are ignored.
 
 ## License
 

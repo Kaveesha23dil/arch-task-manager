@@ -28,6 +28,7 @@
 #include "process_monitor.hpp"
 #include "process_tree.hpp"
 #include "sensor_monitor.hpp"
+#include "startup_manager.hpp"
 #include "systemd_manager.hpp"
 
 namespace {
@@ -64,6 +65,10 @@ constexpr std::size_t kServiceNameWidth = 28;
 constexpr std::size_t kServiceStatusWidth = 12;
 constexpr std::size_t kServiceEnabledWidth = 12;
 constexpr std::size_t kServiceDetailRuleWidth = 32;
+constexpr std::size_t kStartupNameWidth = 26;
+constexpr std::size_t kStartupEnabledWidth = 10;
+constexpr std::size_t kStartupScopeWidth = 8;
+constexpr std::size_t kStartupDetailRuleWidth = 36;
 constexpr int kMinNice = -20;
 constexpr int kMaxNice = 19;
 
@@ -659,6 +664,139 @@ std::string renderSystemdServiceDetails(const atm::SystemdService &svc) {
   return out.str();
 }
 
+/// Case-insensitive search match against a startup application's id, name,
+/// description and command.
+bool startupMatchesQuery(const atm::StartupApplication &app,
+                         const std::string &lower_query) {
+  if (lower_query.empty()) {
+    return true;
+  }
+  return toLowerAscii(app.id).find(lower_query) != std::string::npos ||
+         toLowerAscii(app.name).find(lower_query) != std::string::npos ||
+         toLowerAscii(app.description).find(lower_query) !=
+             std::string::npos ||
+         toLowerAscii(app.exec_command).find(lower_query) !=
+             std::string::npos;
+}
+
+/// Returns the startup applications sorted by the requested field. The input
+/// is copied and re-sorted so callers keep ownership of their own snapshot.
+std::vector<atm::StartupApplication> sortStartupApps(
+    const std::vector<atm::StartupApplication> &apps,
+    atm::StartupSort sort) {
+  std::vector<atm::StartupApplication> sorted = apps;
+  switch (sort) {
+    case atm::StartupSort::Name:
+      std::stable_sort(
+          sorted.begin(), sorted.end(),
+          [](const atm::StartupApplication &a,
+             const atm::StartupApplication &b) {
+            return toLowerAscii(a.name) < toLowerAscii(b.name);
+          });
+      break;
+    case atm::StartupSort::Enabled:
+      std::stable_sort(
+          sorted.begin(), sorted.end(),
+          [](const atm::StartupApplication &a,
+             const atm::StartupApplication &b) {
+            return a.enabled && !b.enabled;
+          });
+      break;
+    case atm::StartupSort::Scope:
+      std::stable_sort(
+          sorted.begin(), sorted.end(),
+          [](const atm::StartupApplication &a,
+             const atm::StartupApplication &b) {
+            return a.scope < b.scope;
+          });
+      break;
+  }
+  return sorted;
+}
+
+/// Filters a startup list by a case-insensitive query, then sorts it.
+std::vector<atm::StartupApplication> filterAndSortStartupApps(
+    const std::vector<atm::StartupApplication> &apps,
+    const std::string &query, atm::StartupSort sort) {
+  const std::string lower_query = toLowerAscii(query);
+  std::vector<atm::StartupApplication> filtered;
+  filtered.reserve(apps.size());
+  for (const atm::StartupApplication &app : apps) {
+    if (startupMatchesQuery(app, lower_query)) {
+      filtered.push_back(app);
+    }
+  }
+  return sortStartupApps(filtered, sort);
+}
+
+/// Renders the STARTUP APPLICATIONS table for a list of entries.
+std::string renderStartupTableText(
+    const std::vector<atm::StartupApplication> &apps, bool available) {
+  std::ostringstream out;
+  out << std::left << std::setw(kStartupNameWidth) << "Name"
+      << std::right << std::setw(kStartupEnabledWidth) << "Enabled"
+      << std::setw(kStartupScopeWidth) << "Scope"
+      << "  Command\n";
+  if (!available) {
+    out << "No autostart directories found.\n";
+    return out.str();
+  }
+  if (apps.empty()) {
+    out << "No startup applications found.\n";
+    return out.str();
+  }
+  for (const atm::StartupApplication &app : apps) {
+    const std::string enabled_str = app.enabled ? "Yes" : "No";
+    out << std::left << std::setw(kStartupNameWidth)
+        << fitTo(app.name, kStartupNameWidth) << std::right
+        << std::setw(kStartupEnabledWidth) << enabled_str
+        << std::setw(kStartupScopeWidth)
+        << atm::startupScopeName(app.scope)
+        << "  " << fitTo(app.exec_command, 44) << '\n';
+  }
+  return out.str();
+}
+
+/// Renders the STARTUP APPLICATIONS section of the live view.
+void renderStartupSections(std::ostringstream &out,
+                           const atm::StartupSnapshot &startup,
+                           const std::string &startup_search,
+                           atm::StartupSort startup_sort) {
+  const std::vector<atm::StartupApplication> apps =
+      filterAndSortStartupApps(startup.apps, startup_search, startup_sort);
+  out << "\n## STARTUP APPLICATIONS\n\n"
+      << renderStartupTableText(apps, startup.available);
+  if (startup.apps.size() > 0 && !startup_search.empty()) {
+    out << "Showing " << apps.size() << " of " << startup.apps.size()
+        << " applications (search: \"" << startup_search << "\")\n";
+  }
+  out << "Startup apps: press 'a' (then Enter) to manage autostart\n";
+}
+
+/// Full per-application breakdown used by the startup detail screen.
+std::string renderStartupDetails(const atm::StartupApplication &app) {
+  std::ostringstream out;
+  out << app.id << "\n"
+      << std::string(kStartupDetailRuleWidth, '-') << "\n";
+  appendLabeled(out, "Name:", app.name);
+  appendLabeled(out, "Description:", app.description);
+  appendLabeled(out, "Command:", app.exec_command);
+  appendLabeled(out, "Icon:", app.icon.empty() ? "N/A" : app.icon);
+  appendLabeled(out, "Desktop File:", app.desktop_file);
+  appendLabeled(out, "Scope:", atm::startupScopeName(app.scope));
+  appendLabeled(out, "Enabled:", app.enabled ? "Yes" : "No");
+  appendLabeled(out, "Hidden:", app.hidden ? "Yes" : "No");
+  appendLabeled(out, "Overrides System:",
+                app.overrides_system ? "Yes" : "No");
+  if (!app.only_show_in.empty()) {
+    appendLabeled(out, "OnlyShowIn:", app.only_show_in);
+  }
+  if (!app.not_show_in.empty()) {
+    appendLabeled(out, "NotShowIn:", app.not_show_in);
+  }
+  return out.str();
+}
+
 /// Full per-GPU breakdown used by the GPU-detail screen. Multiple GPUs are
 /// shown one after another with the index and card node on each header.
 std::string renderGpuDetails(const atm::GpuSnapshot &gpu) {
@@ -773,8 +911,11 @@ std::string renderFrame(double cpu_usage, const atm::MemoryInfo &memory,
                         const atm::GpuSnapshot &gpu,
                         const atm::SensorSnapshot &sensors,
                         const atm::SystemdSnapshot &systemd,
+                        const atm::StartupSnapshot &startup,
                         const std::string &service_search,
-                        atm::ServiceSort service_sort) {
+                        atm::ServiceSort service_sort,
+                        const std::string &startup_search,
+                        atm::StartupSort startup_sort) {
   if (view == ViewMode::Tree) {
     // The tree view stays deliberately focused on the hierarchy; the storage
     // and network sections are part of the table view.
@@ -789,6 +930,7 @@ std::string renderFrame(double cpu_usage, const atm::MemoryInfo &memory,
   renderGpuSections(out, gpu);
   renderSensorSections(out, sensors, gpu);
   renderSystemdSections(out, systemd, service_search, service_sort);
+  renderStartupSections(out, startup, startup_search, startup_sort);
   renderProcessTable(out, processes);
   renderProcessStats(out, stats);
   out << "\n---\n\n"
@@ -803,6 +945,7 @@ std::string renderFrame(double cpu_usage, const atm::MemoryInfo &memory,
       << "GPU detail: press 'g' (then Enter) to inspect a GPU\n"
       << "Sensor detail: press 's' (then Enter) to inspect a sensor\n"
       << "Systemd services: press 'u' (then Enter) to manage services\n"
+      << "Startup apps: press 'a' (then Enter) to manage autostart\n"
       << "Updating every " << kRefreshInterval.count() << " second...\n";
   return out.str();
 }
@@ -817,14 +960,18 @@ void renderView(double cpu_usage, const atm::MemoryInfo &memory,
                 const atm::GpuSnapshot &gpu,
                 const atm::SensorSnapshot &sensors,
                 const atm::SystemdSnapshot &systemd,
+                const atm::StartupSnapshot &startup,
                 const std::string &service_search,
-                atm::ServiceSort service_sort) {
+                atm::ServiceSort service_sort,
+                const std::string &startup_search,
+                atm::StartupSort startup_sort) {
   // ANSI "clear entire screen" + "cursor to home" so the multi-line frame
   // refreshes in place instead of scrolling the terminal.
   std::cout << "\033[2J\033[H";
   std::cout << renderFrame(cpu_usage, memory, processes, stats, sort, view, tree,
-                           disk, network, gpu, sensors, systemd, service_search,
-                           service_sort)
+                           disk, network, gpu, sensors, systemd, startup,
+                           service_search, service_sort, startup_search,
+                           startup_sort)
             << std::flush;
 }
 
@@ -884,6 +1031,7 @@ class ConsoleInput {
     InspectGpu,
     InspectSensors,
     InspectSystemd,
+    InspectStartup,
   };
 
   /// Non-blocking: drains whatever stdin currently has, then returns the next
@@ -981,6 +1129,7 @@ class ConsoleInput {
     if (token == "g" || token == "G") return Command::InspectGpu;
     if (token == "s" || token == "S") return Command::InspectSensors;
     if (token == "u" || token == "U") return Command::InspectSystemd;
+    if (token == "a" || token == "A") return Command::InspectStartup;
     return Command::None;
   }
 };
@@ -1542,6 +1691,206 @@ void interactSystemdDetail(atm::SystemdManager &systemd_mgr,
   std::this_thread::sleep_for(1000ms);
 }
 
+/// "1"/"2"/"3" prompt to change the startup application sort order; updates
+/// `startup_sort`.
+void chooseStartupSort(ConsoleInput &input, atm::StartupSort &startup_sort) {
+  std::cout << "\nSort startup applications by:\n"
+               "[1] Name\n"
+               "[2] Enabled state\n"
+               "[3] Scope\n\n"
+               "Enter a number (default: Name):\n> "
+            << std::flush;
+  const std::optional<std::string> line = input.readLine();
+  if (!line) {
+    std::cout << "\nInput cancelled.\n";
+    return;
+  }
+  const std::string choice = trimWhitespace(*line);
+  if (choice == "1") startup_sort = atm::StartupSort::Name;
+  else if (choice == "2") startup_sort = atm::StartupSort::Enabled;
+  else if (choice == "3") startup_sort = atm::StartupSort::Scope;
+  else std::cout << "Invalid choice; keeping the current sort.\n";
+}
+
+/// "a": shows the startup applications list frozen and provides management
+/// options (details, enable, disable, search, sort, refresh).
+void interactStartupDetail(atm::StartupManager &startup_mgr,
+                           const atm::StartupSnapshot &startup,
+                           ConsoleInput &input,
+                           std::string &startup_search,
+                           atm::StartupSort &startup_sort) {
+  const std::vector<atm::StartupApplication> apps =
+      filterAndSortStartupApps(startup.apps, startup_search, startup_sort);
+
+  std::cout << "\033[2J\033[H";
+  std::cout << "========================================\n"
+               "ARCH TASK MANAGER — Startup Applications\n"
+               "========================================\n\n"
+            << renderStartupTableText(apps, startup.available);
+  if (startup.available && !startup_search.empty()) {
+    std::cout << "Showing " << apps.size() << " of " << startup.apps.size()
+              << " applications (search: \"" << startup_search << "\")\n";
+  }
+  std::cout << "Sort: " << atm::startupSortName(startup_sort) << "\n\n"
+            << "Management:\n"
+               "[1] Enable Startup Application\n"
+               "[2] Disable Startup Application\n"
+               "[3] View Application Details\n"
+               "[4] Search/Filter Applications\n"
+               "[5] Sort Applications\n"
+               "[6] Refresh Application List\n"
+               "[0] Cancel\n\n"
+               "Select action:\n> "
+            << std::flush;
+
+  const std::optional<std::string> action_line = input.readLine();
+  if (!action_line) {
+    std::cout << "\nInput cancelled.\n";
+    return;
+  }
+  const std::string action_text = trimWhitespace(*action_line);
+  if (action_text == "0" || action_text.empty()) {
+    std::cout << "Cancelled.\n";
+    return;
+  }
+  if (action_text != "1" && action_text != "2" && action_text != "3" &&
+      action_text != "4" && action_text != "5" && action_text != "6") {
+    std::cout << "Invalid action.\n";
+    return;
+  }
+
+  // Search, sort and refresh do not require an application name.
+  if (action_text == "4" || action_text == "5" || action_text == "6") {
+    if (action_text == "4") {
+      std::cout << "\nSearch startup applications (name, command,\n"
+                   "description, file name; blank to clear):\n> "
+                << std::flush;
+      const std::optional<std::string> search_line = input.readLine();
+      if (!search_line) {
+        std::cout << "\nInput cancelled.\n";
+        return;
+      }
+      startup_search = trimWhitespace(*search_line);
+      if (startup_search.empty()) {
+        std::cout << "Search cleared.\n";
+      } else {
+        std::cout << "Filtering applications by: \"" << startup_search
+                  << "\"\n";
+      }
+    } else if (action_text == "5") {
+      chooseStartupSort(input, startup_sort);
+    } else {
+      std::cout << "\nRefreshing startup applications...\n";
+      startup_mgr.refresh();
+      std::this_thread::sleep_for(300ms);
+    }
+    return;
+  }
+
+  if (action_text == "3") {
+    std::cout << "\nEnter application name or file name\n"
+                 "(e.g. discord or discord.desktop):\n> "
+              << std::flush;
+    const std::optional<std::string> name_line = input.readLine();
+    if (!name_line) {
+      std::cout << "\nInput cancelled.\n";
+      return;
+    }
+    std::string app_key = trimWhitespace(*name_line);
+    if (app_key.empty()) {
+      std::cout << "Cancelled.\n";
+      return;
+    }
+    if (app_key.size() < 8 ||
+        app_key.compare(app_key.size() - 8, 8, ".desktop") != 0) {
+      app_key += ".desktop";
+    }
+    const auto found =
+        std::find_if(startup.apps.begin(), startup.apps.end(),
+                     [&](const atm::StartupApplication &app) {
+                       return app.id == app_key || app.name == app_key;
+                     });
+    if (found == startup.apps.end()) {
+      std::cout << "Startup application not found: " << app_key << "\n";
+      return;
+    }
+    std::cout << '\n' << renderStartupDetails(*found)
+              << "\n\nPress Enter to return to the live view.\n"
+              << std::flush;
+    static_cast<void>(input.readLine());
+    return;
+  }
+
+  // Ask for the application to enable/disable.
+  std::cout << "\nEnter application name or file name\n"
+               "(e.g. discord or discord.desktop):\n> "
+            << std::flush;
+  const std::optional<std::string> name_line = input.readLine();
+  if (!name_line) {
+    std::cout << "\nInput cancelled.\n";
+    return;
+  }
+  std::string app_key = trimWhitespace(*name_line);
+  if (app_key.empty()) {
+    std::cout << "Cancelled.\n";
+    return;
+  }
+  if (app_key.size() < 8 ||
+      app_key.compare(app_key.size() - 8, 8, ".desktop") != 0) {
+    app_key += ".desktop";
+  }
+  const auto found =
+      std::find_if(startup.apps.begin(), startup.apps.end(),
+                   [&](const atm::StartupApplication &app) {
+                     return app.id == app_key || app.name == app_key;
+                   });
+  if (found == startup.apps.end()) {
+    std::cout << "Startup application not found: " << app_key << "\n";
+    return;
+  }
+  const atm::StartupApplication &app = *found;
+
+  const std::string prompt = (action_text == "1")
+                                 ? "Enable " + app.name +
+                                       " to start automatically at login?"
+                                 : "Disable " + app.name +
+                                       " from starting automatically at login?";
+  if (!confirm(prompt, input)) {
+    std::cout << "Cancelled.\n";
+    std::this_thread::sleep_for(300ms);
+    return;
+  }
+
+  const atm::StartupOperationResult result = (action_text == "1")
+                                                 ? startup_mgr.enableApp(app.id)
+                                                 : startup_mgr.disableApp(app.id);
+  if (result.success()) {
+    std::cout << "Started automatically at login: "
+              << ((action_text == "1") ? "enabled" : "disabled") << ".\n";
+  } else {
+    switch (result.status) {
+      case atm::StartupOperationStatus::PermissionDenied:
+        std::cout << "Permission denied.\n"
+                     "Cannot write to the user autostart directory.\n";
+        break;
+      case atm::StartupOperationStatus::NotFound:
+        std::cout << "Startup application not found: " << app_key << "\n";
+        break;
+      case atm::StartupOperationStatus::IoError:
+        std::cout << "Failed: "
+                  << (result.message.empty() ? "unknown error"
+                                             : result.message)
+                  << '\n';
+        break;
+      case atm::StartupOperationStatus::Success:
+        break;
+    }
+  }
+
+  std::cout << "\nRefreshing startup applications...\n";
+  std::this_thread::sleep_for(300ms);
+}
+
 }  // namespace
 
 int main() {
@@ -1553,6 +1902,7 @@ int main() {
   atm::GpuMonitor gpu_monitor;
   atm::SensorMonitor sensor_monitor;
   atm::SystemdManager systemd_manager;
+  atm::StartupManager startup_manager;
   atm::ProcessActions actions;
   ConsoleInput input;
 
@@ -1560,6 +1910,8 @@ int main() {
   ViewMode view = ViewMode::List;
   atm::ServiceSort service_sort = atm::ServiceSort::Name;
   std::string service_search;
+  atm::StartupSort startup_sort = atm::StartupSort::Name;
+  std::string startup_search;
 
   // Choose the starting view. EOF (e.g. /dev/null stdin) defaults to List.
   std::cout << "Select view:\n"
@@ -1602,17 +1954,20 @@ int main() {
   const atm::GpuSnapshot first_gpu = gpu_monitor.read();
   const atm::SensorSnapshot first_sensors = sensor_monitor.read();
   const atm::SystemdSnapshot first_systemd = systemd_manager.read();
+  const atm::StartupSnapshot first_startup = startup_manager.read();
   auto snapshot = process_monitor.read(first_memory->total);
   atm::sortProcesses(snapshot.processes, sort);
   atm::ProcessTree tree = atm::buildProcessTree(snapshot.processes);
   renderView(*first_cpu, *first_memory, snapshot.processes, snapshot.stats,
              sort, view, tree, first_disk, first_network, first_gpu,
-             first_sensors, first_systemd, service_search, service_sort);
+             first_sensors, first_systemd, first_startup, service_search,
+             service_sort, startup_search, startup_sort);
 
   atm::NetworkSnapshot network = first_network;
   atm::GpuSnapshot gpu = first_gpu;
   atm::SensorSnapshot sensors = first_sensors;
   atm::SystemdSnapshot systemd = first_systemd;
+  atm::StartupSnapshot startup = first_startup;
 
   for (;;) {
     std::this_thread::sleep_for(kRefreshInterval);
@@ -1653,12 +2008,14 @@ int main() {
             gpu = gpu_monitor.read();
             sensors = sensor_monitor.read();
             systemd = systemd_manager.read();
+            startup = startup_manager.read();
             snapshot = process_monitor.read(memory->total);
             atm::sortProcesses(snapshot.processes, sort);
             tree = atm::buildProcessTree(snapshot.processes);
             renderView(*cpu, *memory, snapshot.processes, snapshot.stats,
                        sort, view, tree, disk, network, gpu, sensors,
-                       systemd, service_search, service_sort);
+                       systemd, startup, service_search, service_sort,
+                       startup_search, startup_sort);
           }
         }
         continue;
@@ -1681,6 +2038,12 @@ int main() {
         if (view == ViewMode::List) {
           interactSystemdDetail(systemd_manager, systemd, input, service_search,
                               service_sort);
+        }
+        break;
+      case ConsoleInput::Command::InspectStartup:
+        if (view == ViewMode::List) {
+          interactStartupDetail(startup_manager, startup, input, startup_search,
+                                startup_sort);
         }
         break;
       case ConsoleInput::Command::None:
@@ -1707,8 +2070,9 @@ int main() {
     gpu = gpu_monitor.read();
     sensors = sensor_monitor.read();
     systemd = systemd_manager.read();
+    startup = startup_manager.read();
     renderView(*cpu, *memory, snapshot.processes, snapshot.stats, sort, view,
-               tree, disk, network, gpu, sensors, systemd, service_search,
-               service_sort);
+               tree, disk, network, gpu, sensors, systemd, startup,
+               service_search, service_sort, startup_search, startup_sort);
   }
 }
