@@ -1,0 +1,453 @@
+#include "process_monitor.hpp"
+
+#include <algorithm>
+#include <cctype>
+#include <charconv>
+#include <filesystem>
+#include <fstream>
+#include <optional>
+#include <sstream>
+#include <string>
+#include <string_view>
+#include <unistd.h>
+
+#include "cpu_monitor.hpp"
+
+namespace atm {
+
+namespace {
+
+namespace fs = std::filesystem;
+
+/// Reads a whole file into a string, or std::nullopt when it cannot be
+/// opened or read through to the end (e.g. the process exited meanwhile).
+std::optional<std::string> readFile(std::string_view path) {
+  std::ifstream in{std::string(path)};
+  if (!in.is_open()) {
+    return std::nullopt;
+  }
+  std::ostringstream contents;
+  contents << in.rdbuf();
+  if (in.bad()) {
+    return std::nullopt;
+  }
+  return contents.str();
+}
+
+/// True when every character is ASCII '0'..'9'. /proc/<pid> directories are
+/// the only entries whose names are all digits.
+bool isAllDigits(std::string_view value) {
+  return !value.empty() && std::all_of(value.begin(), value.end(), [](char c) {
+           return c >= '0' && c <= '9';
+         });
+}
+
+/// Parses a leading integer without throwing; returns 0 on failure.
+int parseInt(std::string_view view) {
+  int result = 0;
+  std::from_chars(view.data(), view.data() + view.size(), result);
+  return result;
+}
+
+/// Parses a leading unsigned 64-bit integer without throwing; returns 0 on
+/// failure, so a malformed field degrades to "no data" instead of crashing.
+std::uint64_t parseU64(std::string_view view) {
+  std::uint64_t result = 0;
+  std::from_chars(view.data(), view.data() + view.size(), result);
+  return result;
+}
+
+/// Parsed fields of /proc/<pid>/stat that the monitor needs.
+struct StatData {
+  std::string comm;
+  char state = '?';
+  int ppid = 0;
+  std::uint64_t utime = 0;
+  std::uint64_t stime = 0;
+  std::uint32_t num_threads = 0;
+};
+
+/**
+ * Parses a /proc/<pid>/stat line.
+ *
+ * The comm field is wrapped in parentheses and may itself contain spaces or
+ * parentheses, so it is located between the first '(' and the last ')'.
+ * Every field after that closing ')' is whitespace-separated. Skipping the
+ * two leading fields (pid, comm), the fields used here (1-indexed in the
+ * kernel ABI) are: 3=state, 4=ppid, 14=utime, 15=stime, 20=num_threads.
+ * Tail index N maps to kernel field N + 3, so utime/stime are indices 11/12
+ * and num_threads is index 17.
+ */
+std::optional<StatData> parseStat(std::string_view line) {
+  const std::size_t open = line.find('(');
+  const std::size_t close = line.rfind(')');
+  if (open == std::string_view::npos || close == std::string_view::npos ||
+      close < open) {
+    return std::nullopt;  // malformed — no well-formed comm
+  }
+
+  std::vector<std::string> fields;
+  {
+    std::istringstream tail{std::string(line.substr(close + 1))};
+    std::string field;
+    while (tail >> field) {
+      fields.push_back(field);
+    }
+  }
+  // Indices 0..12 map to kernel fields 3..15; stime is the last required
+  // one, so anything shorter is a truncated (orphaned) line.
+  if (fields.size() < 13) {
+    return std::nullopt;
+  }
+
+  StatData data;
+  data.comm = std::string(line.substr(open + 1, close - open - 1));
+  if (!fields[0].empty()) {
+    data.state = fields[0].front();
+  }
+  data.ppid = parseInt(fields[1]);
+  data.utime = parseU64(fields[11]);
+  data.stime = parseU64(fields[12]);
+  if (fields.size() > 17) {
+    data.num_threads = static_cast<std::uint32_t>(parseU64(fields[17]));
+  }
+  return data;
+}
+
+/// Parsed fields of /proc/<pid>/status that the monitor needs.
+struct StatusData {
+  char state = '?';
+  std::uint32_t uid = 0;
+  std::uint32_t threads = 0;
+  std::uint64_t vm_rss_kib = 0;
+};
+
+/**
+ * Parses /proc/<pid>/status, picking out State, Uid (real, first value),
+ * Threads, and VmRSS. Missing fields keep their defaults.
+ */
+StatusData parseStatus(std::string_view contents) {
+  StatusData data;
+  std::istringstream lines{std::string(contents)};
+  std::string line;
+  while (std::getline(lines, line)) {
+    std::istringstream head(line);
+    std::string key;
+    if (!(head >> key)) {
+      continue;
+    }
+    if (key == "State:") {
+      std::string value;
+      if (head >> value && !value.empty()) {
+        data.state = value.front();
+      }
+    } else if (key == "Uid:") {
+      std::uint32_t value = 0;
+      if (head >> value) {
+        data.uid = value;  // real UID; effective/saved/fs follow on the line
+      }
+    } else if (key == "Threads:") {
+      std::uint32_t value = 0;
+      if (head >> value) {
+        data.threads = value;
+      }
+    } else if (key == "VmRSS:") {
+      std::uint64_t value = 0;
+      std::string unit;
+      if (head >> value >> unit) {
+        data.vm_rss_kib = value;
+      }
+    }
+  }
+  return data;
+}
+
+/// Reads /proc/<pid>/cmdline (NUL-separated argv) joined with spaces. Returns
+/// an empty string for kernel threads, whose cmdline is empty.
+std::string readCommandLine(std::string_view dir) {
+  const std::optional<std::string> raw =
+      readFile(std::string(dir) + "/cmdline");
+  if (!raw) {
+    return {};
+  }
+  std::string command;
+  command.reserve(raw->size());
+  for (const char c : *raw) {
+    command.push_back(c == '\0' ? ' ' : c);
+  }
+  while (!command.empty() && command.back() == ' ') {
+    command.pop_back();
+  }
+  return command;
+}
+
+/// Reads a single process from `/proc/<pid>`, or std::nullopt when the entry
+/// is gone or unreadable. Never throws.
+std::optional<Process> readProcess(const std::string &dir, int pid,
+                                   std::uint64_t system_total_kib) {
+  const std::optional<std::string> stat = readFile(dir + "/stat");
+  if (!stat) {
+    return std::nullopt;
+  }
+  const std::optional<StatData> stat_data = parseStat(*stat);
+  if (!stat_data) {
+    return std::nullopt;  // malformed stat — treat as invalid
+  }
+
+  Process process;
+  process.pid = pid;
+  process.name = stat_data->comm;
+  process.state_char = stat_data->state;
+  process.state = processStateFromChar(stat_data->state);
+  process.parent_pid = stat_data->ppid;
+  process.thread_count = stat_data->num_threads;
+  process.cpu_ticks = stat_data->utime + stat_data->stime;
+  process.command_line = readCommandLine(dir);
+
+  const std::optional<std::string> status = readFile(dir + "/status");
+  if (status) {
+    const StatusData status_data = parseStatus(*status);
+    if (process.state == ProcessState::Unknown && status_data.state != '?') {
+      process.state_char = status_data.state;
+      process.state = processStateFromChar(status_data.state);
+    }
+    // Uid line is always present for a visible process; the real UID from
+    // status takes precedence over the default. (0 is a valid UID: root.)
+    process.uid = status_data.uid;
+    if (status_data.threads != 0) {
+      process.thread_count = status_data.threads;
+    }
+    process.memory_kib = status_data.vm_rss_kib;
+  }
+
+  if (system_total_kib != 0) {
+    process.memory_percent =
+        static_cast<double>(process.memory_kib) * 100.0 /
+        static_cast<double>(system_total_kib);
+  }
+  return process;
+}
+
+/// Case-insensitive, locale-independent name comparison for the Name sort.
+bool nameLess(const std::string &a, const std::string &b) {
+  const std::size_t n = std::min(a.size(), b.size());
+  for (std::size_t i = 0; i < n; ++i) {
+    const char ca = static_cast<char>(
+        std::tolower(static_cast<unsigned char>(a[i])));
+    const char cb = static_cast<char>(
+        std::tolower(static_cast<unsigned char>(b[i])));
+    if (ca != cb) {
+      return ca < cb;
+    }
+  }
+  return a.size() < b.size();
+}
+
+/// Counts the process population by state.
+ProcessStats computeStats(const std::vector<Process> &processes) {
+  ProcessStats stats;
+  stats.total = processes.size();
+  for (const Process &process : processes) {
+    switch (process.state) {
+      case ProcessState::Running:
+        ++stats.running;
+        break;
+      case ProcessState::Sleeping:
+      case ProcessState::Idle:
+      case ProcessState::DiskSleep:
+        ++stats.sleeping;  // "Disk Sleep" and "Idle" are sleeping-like states
+        break;
+      case ProcessState::Stopped:
+        ++stats.stopped;
+        break;
+      case ProcessState::Zombie:
+        ++stats.zombie;
+        break;
+      case ProcessState::Unknown:
+        break;
+    }
+  }
+  return stats;
+}
+
+}  // namespace
+
+ProcessState processStateFromChar(char state) {
+  switch (state) {
+    case 'R':
+      return ProcessState::Running;
+    case 'S':
+      return ProcessState::Sleeping;
+    case 'D':
+      return ProcessState::DiskSleep;
+    case 'T':
+    case 't':
+      return ProcessState::Stopped;
+    case 'Z':
+    case 'X':
+    case 'x':
+      return ProcessState::Zombie;
+    case 'I':
+      return ProcessState::Idle;
+    default:
+      return ProcessState::Unknown;
+  }
+}
+
+const char *processStateName(ProcessState state) {
+  switch (state) {
+    case ProcessState::Running:
+      return "Running";
+    case ProcessState::Sleeping:
+      return "Sleeping";
+    case ProcessState::DiskSleep:
+      return "Disk Sleep";
+    case ProcessState::Stopped:
+      return "Stopped";
+    case ProcessState::Zombie:
+      return "Zombie";
+    case ProcessState::Idle:
+      return "Idle";
+    case ProcessState::Unknown:
+      return "Unknown";
+  }
+  return "Unknown";
+}
+
+void sortProcesses(std::vector<Process> &processes, ProcessSort sort) {
+  switch (sort) {
+    case ProcessSort::Cpu:
+      std::stable_sort(processes.begin(), processes.end(),
+                       [](const Process &a, const Process &b) {
+                         if (a.cpu_percent != b.cpu_percent) {
+                           return a.cpu_percent > b.cpu_percent;
+                         }
+                         return a.pid < b.pid;
+                       });
+      break;
+    case ProcessSort::Memory:
+      std::stable_sort(processes.begin(), processes.end(),
+                       [](const Process &a, const Process &b) {
+                         if (a.memory_kib != b.memory_kib) {
+                           return a.memory_kib > b.memory_kib;
+                         }
+                         return a.pid < b.pid;
+                       });
+      break;
+    case ProcessSort::Pid:
+      std::stable_sort(processes.begin(), processes.end(),
+                       [](const Process &a, const Process &b) {
+                         return a.pid < b.pid;
+                       });
+      break;
+    case ProcessSort::Name:
+      std::stable_sort(processes.begin(), processes.end(),
+                       [](const Process &a, const Process &b) {
+                         if (a.name != b.name) {
+                           return nameLess(a.name, b.name);
+                         }
+                         return a.pid < b.pid;
+                       });
+      break;
+  }
+}
+
+const char *processSortName(ProcessSort sort) {
+  switch (sort) {
+    case ProcessSort::Cpu:
+      return "CPU";
+    case ProcessSort::Memory:
+      return "Memory";
+    case ProcessSort::Pid:
+      return "PID";
+    case ProcessSort::Name:
+      return "Name";
+  }
+  return "CPU";
+}
+
+ProcessSnapshot ProcessMonitor::read(std::uint64_t system_total_kib) {
+  ProcessSnapshot snapshot;
+
+  // Sample the system-wide CPU counter once for this scan and, if we have a
+  // previous sample, derive a ticks-per-percent scale. 100% means exactly one
+  // full online CPU (thread): process_delta / total_delta * num_cpus * 100.
+  const std::optional<CpuTimes> total = readCpuTimes();
+  const std::optional<std::uint64_t> current_total =
+      total.has_value() ? std::optional<std::uint64_t>(total->total())
+                        : std::nullopt;
+
+  long online = ::sysconf(_SC_NPROCESSORS_ONLN);
+  const std::uint64_t num_cpus =
+      online > 0 ? static_cast<std::uint64_t>(online) : 1;
+
+  std::optional<double> ticks_to_percent;
+  if (previous_total_ticks_.has_value() && current_total.has_value()) {
+    const std::uint64_t total_delta = *current_total - *previous_total_ticks_;
+    if (total_delta != 0) {
+      ticks_to_percent =
+          static_cast<double>(num_cpus) * 100.0 / static_cast<double>(total_delta);
+    }
+  }
+
+  // Enumerate /proc and read every numeric directory as a process.
+  try {
+    const fs::directory_options options =
+        fs::directory_options::skip_permission_denied;
+    for (const fs::directory_entry &entry :
+         fs::directory_iterator("/proc", options)) {
+      const std::string filename = entry.path().filename().string();
+      if (!isAllDigits(filename)) {
+        continue;
+      }
+      const int pid = parseInt(filename);
+      if (pid <= 0) {
+        continue;
+      }
+
+      // /proc/<pid> may disappear right here; readProcess() returns nullopt
+      // and the process is silently skipped.
+      std::optional<Process> process =
+          readProcess(entry.path().string(), pid, system_total_kib);
+      if (!process.has_value()) {
+        continue;
+      }
+
+      // Per-process CPU usage is the tick delta since the previous scan,
+      // scaled so that a full core reads as 100%.
+      if (ticks_to_percent.has_value()) {
+        const auto previous = previous_ticks_.find(process->pid);
+        if (previous != previous_ticks_.end() &&
+            process->cpu_ticks >= previous->second) {
+          process->cpu_percent =
+              static_cast<double>(process->cpu_ticks - previous->second) *
+              *ticks_to_percent;
+        }
+      }
+
+      snapshot.processes.push_back(std::move(*process));
+    }
+  } catch (const std::exception &) {
+    // The /proc scan itself failed (path removed, etc.): return whatever has
+    // been collected so far instead of crashing.
+  }
+
+  // Record samples for the next read to diff against.
+  previous_ticks_.clear();
+  previous_ticks_.reserve(snapshot.processes.size());
+  for (const Process &process : snapshot.processes) {
+    previous_ticks_.emplace(process.pid, process.cpu_ticks);
+  }
+  if (current_total.has_value()) {
+    previous_total_ticks_ = current_total;
+  } else {
+    // /proc/stat was unreadable; drop the baseline so the next successful
+    // scan starts clean instead of reporting a huge spurious delta.
+    previous_total_ticks_.reset();
+  }
+
+  snapshot.stats = computeStats(snapshot.processes);
+  return snapshot;
+}
+
+}  // namespace atm
