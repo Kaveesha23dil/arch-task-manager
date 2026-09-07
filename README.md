@@ -5,10 +5,11 @@ Linux. It reads system information **directly from Linux interfaces** such as
 `/proc/stat`, `/proc/meminfo`, and `/proc/<pid>/` — no shelling out to `ps`,
 `free`, `top`, `htop`, or other external tools.
 
-> Stage: **Step 5** — CPU, RAM, swap, process monitoring, process actions, and
-> the process tree. Everything else on the roadmap is intentionally **not**
-> implemented yet, but the code is structured so future modules (disk,
-> network, etc.) can be added without rewriting the existing ones.
+> Stage: **Step 7** — CPU, RAM, swap, process monitoring, process actions, the
+> process tree, disk/storage monitoring, and network monitoring. Everything
+> else on the roadmap is intentionally **not** implemented yet, but the code
+> is structured so future modules (GPU, temperature, etc.) can be added without
+> rewriting the existing ones.
 
 ## Why is this being built?
 
@@ -38,12 +39,21 @@ feature per milestone, hosted on GitHub.
       population built from the PPID field of the existing `/proc/<pid>/stat`
       scan, with box-drawing connectors (├──, └──, │), orphan handling and
       dynamic tree statistics.
+- [x] **Disk / storage monitoring** — physical filesystem capacities via
+      `statvfs(2)` over the mounts listed in `/proc/mounts`, real-time
+      read/write throughput from two samples of `/proc/diskstats`, and whole
+      physical disks (sizes shown) enumerated from `/sys/block`. Virtual,
+      temporary and network filesystems are filtered out so `/proc`, `/sys`,
+      tmpfs, overlay, NFS etc. are never presented as disk capacity.
+- [x] **Network monitoring** — per-interface RX/TX speeds computed from two
+      samples of `/proc/net/dev`, cumulative RX/TX bytes, packet/error/dropped
+      counters, physical link state from `/sys/class/net/<name>/operstate`,
+      plus a per-interface detail screen (press `i`). Loopback is shown last
+      and excluded from the aggregate totals.
 
 ### Planned
 
 - [ ] Process tree — interactive expand/collapse (deferred to the GUI)
-- [ ] Disk monitoring
-- [ ] Network monitoring
 - [ ] GPU monitoring
 - [ ] Temperature monitoring
 - [ ] Systemd service management
@@ -58,7 +68,8 @@ feature per milestone, hosted on GitHub.
 - Language: **C++20** (ISO standard, no GNU extensions)
 - Build system: **CMake** (works for both Debug and Release)
 - Compiler: **g++** (`GCC`)
-- OS interfaces: the `/proc` filesystem, `sysconf(3)`
+- OS interfaces: the `/proc` and `/sys` filesystems, `statvfs(2)`,
+  `sysconf(3)`
 - Standard library only (`std::thread`, `std::chrono`, `<fstream>`, …)
 - No third-party dependencies
 
@@ -113,6 +124,44 @@ Memory Usage:    52.4%
 
 Total:           15.5 GB
 ...
+## SWAP
+
+Total:               3.8 GB
+...
+
+## STORAGE
+
+FILESYSTEMS
+
+## Mount Point                   Total      Used      Free   Type
+/                               127 GB   51.4 GB   75.5 GB   Physical
+/boot                           196 MB   97.8 MB   98.2 MB   Physical
+Excluded: 24 virtual/temporary/network mount(s)
+
+---
+
+## DISK ACTIVITY
+
+Read:                124 MB/s
+Write:               34 MB/s
+
+## DEVICES
+
+## DEVICE         SIZE        READ      WRITE
+sda             238 GB    124 MB/s    34 MB/s
+
+## NETWORK
+
+Interface         RX Speed    TX Speed        RX        TX  State
+docker0            0.0 B/s     0.0 B/s     0.0 B     0.0 B  DOWN
+enp1s0             0.0 B/s     0.0 B/s     0.0 B     0.0 B  DOWN
+wlp2s0           802 B/s     410 B/s   94.8 MB    119 MB   UP
+lo                 710 B/s     710 B/s    8.1 MB    8.1 MB   UNKNOWN (loopback)
+
+Total RX: 802 B/s
+Total TX: 410 B/s
+Loopback traffic is excluded from the totals.
+Detailed stats: press 'i' (then Enter)
 
 ## PROCESSES
 
@@ -136,6 +185,7 @@ Processes: 186
 Sort: [1] CPU  [2] Memory  [3] PID  [4] Name (current: CPU)
 View: [l] Process List  [t] Process Tree (current: List)
 Manage: press 'm' (then Enter) to control a process by PID
+Network detail: press 'i' (then Enter) to inspect an interface
 Updating every 1 second...
 ```
 
@@ -158,6 +208,7 @@ While it runs you can switch views at any time (then Enter):
 
 - `l` — Process List (flat table)
 - `t` — Process Tree (hierarchical)
+- `i` — inspect one network interface in detail (list view only)
 
 ### Sorting
 
@@ -379,15 +430,20 @@ arch-task-manager/
 │   ├── cpu_monitor.hpp         # CpuTimes, readCpuTimes(), CpuMonitor
 │   ├── memory_monitor.hpp      # MemoryInfo, readMemoryInfo(), MemoryMonitor
 │   ├── process_monitor.hpp     # Process, ProcessState, ProcessMonitor
-│   ├── process_actions.hpp    # ProcessActions, ActionResult, ActionStatus
-│   └── process_tree.hpp       # ProcessTreeNode, ProcessTree, build/render
+│   ├── process_actions.hpp     # ProcessActions, ActionResult, ActionStatus
+│   ├── process_tree.hpp        # ProcessTreeNode, ProcessTree, build/render
+│   ├── disk_monitor.hpp        # DiskUsage, BlockDevice, DiskSnapshot, DiskMonitor
+│   ├── network_monitor.hpp     # NetworkInterfaceStats, NetworkSnapshot, NetworkMonitor
+│   └── format_bytes.hpp        # shared byte-formatter (KB/MB/GB, used by disk + network)
 ├── src/
 │   ├── main.cpp                # UI loop: frame rendering + 1 s refresh + control flow
 │   ├── cpu_monitor.cpp         # /proc/stat reading + utilization math
 │   ├── memory_monitor.cpp      # /proc/meminfo reading + memory/swap math
 │   ├── process_monitor.cpp     # /proc scanning + per-process parsing
 │   ├── process_actions.cpp     # kill(2)/setpriority(2) wrappers + errno mapping
-│   └── process_tree.cpp        # PID/PPID tree build + box-drawing renderer
+│   ├── process_tree.cpp        # PID/PPID tree build + box-drawing renderer
+│   ├── disk_monitor.cpp        # statvfs(2) usage + /proc/diskstats rates + /sys/block
+│   └── network_monitor.cpp     # /proc/net/dev two-sample rates + operstate
 └── build/                      # generated; never committed to git
 ```
 
@@ -540,6 +596,182 @@ Swap usage% = Swap used ÷ SwapTotal × 100
 
 `SwapTotal` (and thus swap usage) is 0% when no swap is configured; the
 application guards that division-by-zero case instead of crashing.
+
+## How disk / storage monitoring works
+
+Disk monitoring is split into three independent parts, all reading
+kernel-provided interfaces — nothing is ever shelled out to `df`, `du`,
+`lsblk`, `iostat`, `iotop`, `stat`, `free`, or `ps`.
+
+### Filesystem usage (capacities)
+
+1. **Mount discovery** — `/proc/mounts` is parsed line-by-line. The fields are
+   `device mount_point filesystem`; because literal spaces in paths are escaped
+   there as octal sequences (`\040`, `\011`, `\012`, `\134`, …), each token is
+   whitespace-split first and then unescaped, so mount points with spaces work.
+2. **Capacity** — for each mount, `statvfs(2)` is called on the mount point.
+   `statvfs(3)` returns a `struct statvfs` whose relevant fields are:
+   - `f_frsize` — fundamental block size (the unit every other count is in;
+     `f_bsize` is only a fallback when it is zero);
+   - `f_blocks` — total blocks;
+   - `f_bavail` — blocks available to *unprivileged* users (excludes
+     root-reserved space; this is what `df` reports under **Avail**).
+
+   Capacity is then:
+
+   ```text
+   total     = f_blocks × f_frsize
+   available = f_bavail × f_frsize
+   used      = total − available          # clamped to zero
+   usage %   = used ÷ total × 100          # 0 when total is zero
+   ```
+
+   A filesystem whose capacity is zero, or a mount that vanished between the
+   scan and the `statvfs` call, is skipped silently — never a crash and never
+   terminal spam.
+
+### Read/write speed
+
+`/proc/diskstats` prints one line per block device with the three classic
+counters:
+
+```text
+major minor name  reads  reads_merged  sectors_read  time_reading  writes  writes_merged  sectors_written  ...
+   8     0   sda   68316      24338       5562359         32297     50580       57294        2966812     ...
+  ^---  family counters: reads completed, reads merged, sectors read -------^                    ^---- sectors written
+```
+
+Newer kernels append discard/flush counters after these; the parser reads only
+the first ten fields and ignores the rest. The `diskstats` ABI historically
+counts **sectors as 512-byte units**, which is why the default sector size is
+512.
+
+Throughput is the classic two-sample-delta technique used by CPU monitoring:
+
+1. Record the current `sectors_read`/`sectors_written` for every device,
+   together with a `steady_clock` timestamp.
+2. After the ~1 s refresh interval, re-read `/proc/diskstats`.
+3. `bytes = Δsectors × sector_size`; `rate = bytes ÷ elapsed_seconds`,
+   using the *real* elapsed time, never an assumed 1 s.
+4. If a counter is smaller than the previous sample (rollover, or a device was
+   torn down and reused), the baseline is silently reset to the new value
+   instead of reporting a bogus negative delta.
+
+The sector size prefers the device's advertised logical block size
+(`/sys/class/block/<name>/queue/logical_block_size`, falling back to
+`hw_sector_size`) and only falls back to the 512-byte ABI default when neither
+is readable. The aggregate **Read / Write** figures are the sum over whole
+disk devices. A brand-new device gets a baseline and shows a rate from the
+next tick onward.
+
+### Physical block devices
+
+Whole disks are discovered by enumerating `/sys/block` (each entry is a whole
+disk: `sda`, `nvme0n1`, `mmcblk0`, `sr0`, … — partitions like `sda1` live
+under `/sys/class/block` and are not listed as disks). Obvious virtual devices
+are filtered by name prefix (`loop*`, `ram*`, `zram*`, `dm-*`, `md*`, `fd*`,
+`drbd`, `rbd`) so they are not shown as physical storage. The capacity shown
+is the device's size since boot, read from `/sys/class/block/<name>/size`
+(a count of 512-byte sectors, multiplied by 512 → bytes). Names are sorted,
+device types are not assumed — SATA/SCSI (`sd`), NVMe (`nvme0n1`), USB,
+MMC, and optical (`sr`) all work generically.
+
+### How virtual filesystems are handled
+
+Every filesystem type is classified:
+
+| Category    | Types (examples)                                     | In the UI                       |
+| ----------- | ---------------------------------------------------- | ------------------------------- |
+| Physical    | `ext2` `ext3` `ext4` `btrfs` `xfs` `vfat` `ntfs` `iso9660` `zfs` … | shown with capacity |
+| Temporary   | `tmpfs` `ramfs`                                       | excluded (counted)              |
+| Network     | `nfs` `nfs4` `cifs` `smbfs` `9p` `ceph` `sshfs` `fuse.sshfs` … | excluded (counted)     |
+| Virtual     | `proc` `sysfs` `devpts` `devtmpfs` `cgroup`/`cgroup2` `pstore` `bpf` `autofs` `overlay` generic `fuse` … | excluded (counted) |
+
+Only **Physical** mounts appear in the FILESYSTEMS table. `/proc`, `/sys`,
+`/dev`, `/run`, tmpfs, overlay and network mounts are filtered out and counted
+on a single footer line (`Excluded: N virtual/temporary/network mount(s)`), so
+they can never be mistaken for physical disk capacity. Everything not in a
+known physical/network/temporary set is conservatively treated as Virtual.
+
+The tree view deliberately does not embed the storage sections: it stays
+focused on the process hierarchy, and the storage section belongs to the table
+view.
+
+### A safe way to test
+
+On an idle machine the rates read near 0. A small, short-lived write to a real
+disk filesystem makes the numbers move — for example (not on a tmpfs mount!):
+
+```bash
+dd if=/dev/zero of=~/burst.bin bs=32M count=2 conv=fdatasync && rm ~/burst.bin
+```
+
+The write rate column should jump during the flush window.
+
+## How network monitoring works
+
+Network monitoring reads `/proc/net/dev` directly — nothing is ever shelled
+out to `ip`, `ifconfig`, `ss`, `bmon`, or `nload`.
+
+### `/proc/net/dev`
+
+Each non-bridge interface contributes one line:
+
+```text
+Inter-|   Receive                                                |  Transmit
+ face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed
+    lo: 8485632    19841    0    0    0     0          0         0  8485632    19841    0    0    0     0          0         0
+wlp2s0: 99496400   269910    0    0    0     0          0         0 124783716   108928    0    0    0     0          0         0
+```
+
+Per interface the parser reads 16 numeric, whitespace-separated columns
+(`bytes packets errs drop` × receive/transmit) and ignores everything after
+them, so the file keeps working if the kernel appends more columns in the
+future. The name column ends before a `:`. Lines may be indented (`lo:`) or
+flush-left (`wlp2s0:`), and the header and blank line are skipped.
+
+### RX / TX speed
+
+Speeds use the same two-sample-delta technique as CPU and disk monitoring:
+
+1. Record each interface's `rx_bytes`/`tx_bytes` plus a `steady_clock`
+   timestamp (the startup read only establishes a baseline, so no speeds on
+   the first frame).
+2. After the ~1 s refresh interval, re-read `/proc/net/dev`.
+3. `rate = Δbytes ÷ real_elapsed_seconds`, using the real elapsed time, never
+   an assumed 1 s.
+4. A counter that is *smaller* than the previous sample means the counters
+   were reset (interface recreated, driver reload); the interface's baseline
+   is silently re-seeded that tick instead of reporting a negative rate.
+
+### Link state, loopback, totals
+
+- The physical link state is read from `/sys/class/net/<name>/operstate`
+  (`up`, `down`, `unknown`, `dormant`, …); a missing file (an interface that
+  vanished mid-scan) defaults to `unknown`.
+- **Loopback** (`lo`) is drawn last and flagged `(loopback)` so it is never
+  mistaken for a real connection; the **Total RX / Total TX** figures sum
+  non-loopback interfaces only.
+- Non-loopback interfaces are sorted by name; the aggregate is the sum over
+  the interfaces shown, matching what `ss`/`nload` would report for the
+  machine's real uplink.
+
+### The `i` detail screen
+
+`i` (list view) freezes the network table and asks for an interface name:
+
+```text
+Enter interface name to inspect (blank to cancel):
+>
+```
+
+It then prints the full breakdown — RX/TX speed, cumulative bytes, packets
+(with thousands separators), errors, dropped, and link state, plus a
+`Loopback: yes` note where applicable. The snapshot used is the most recent
+one (at most ~1 s old); a blank name cancels and an unknown name is rejected,
+so the detail screen never sleeps on a vanished interface. Like the tree view,
+the `i` screen is available from list view; the tree view deliberately stays a
+pure process hierarchy.
 
 ## License
 
