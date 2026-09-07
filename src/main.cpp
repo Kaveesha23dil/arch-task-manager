@@ -15,6 +15,7 @@
 #include <string>
 #include <thread>
 #include <unistd.h>
+#include <unordered_map>
 #include <vector>
 
 #include "cpu_monitor.hpp"
@@ -26,6 +27,8 @@
 #include "process_actions.hpp"
 #include "process_monitor.hpp"
 #include "process_tree.hpp"
+#include "sensor_monitor.hpp"
+#include "systemd_manager.hpp"
 
 namespace {
 
@@ -54,6 +57,13 @@ constexpr std::size_t kGpuNameWidth = 20;
 constexpr std::size_t kGpuUsageWidth = 7;
 constexpr std::size_t kGpuVramWidth = 18;
 constexpr std::size_t kGpuClockWidth = 11;
+constexpr std::size_t kSensorLabelWidth = 18;
+constexpr std::size_t kSensorValueWidth = 9;
+constexpr std::size_t kSensorDetailRuleWidth = 32;
+constexpr std::size_t kServiceNameWidth = 28;
+constexpr std::size_t kServiceStatusWidth = 12;
+constexpr std::size_t kServiceEnabledWidth = 12;
+constexpr std::size_t kServiceDetailRuleWidth = 32;
 constexpr int kMinNice = -20;
 constexpr int kMaxNice = 19;
 
@@ -79,6 +89,15 @@ std::string toUpperAscii(std::string text) {
   std::transform(text.begin(), text.end(), text.begin(),
                  [](unsigned char c) {
                    return static_cast<char>(std::toupper(c));
+                 });
+  return text;
+}
+
+/// Lowercases ASCII characters (for case-insensitive service search).
+std::string toLowerAscii(std::string text) {
+  std::transform(text.begin(), text.end(), text.begin(),
+                 [](unsigned char c) {
+                   return static_cast<char>(std::tolower(c));
                  });
   return text;
 }
@@ -324,6 +343,322 @@ void renderGpuSections(std::ostringstream &out, const atm::GpuSnapshot &gpu) {
       << "Detailed GPU info: press 'g' (then Enter)\n";
 }
 
+/// Formats a temperature with one decimal place, e.g. "51.4 °C".
+std::string formatCelsius(double celsius) {
+  std::ostringstream out;
+  out << std::fixed << std::setprecision(1) << celsius << " °C";
+  return out.str();
+}
+
+/// Best display name for a GPU temperature sensor: resolves the hwmon device
+/// name (e.g. "amdgpu") against the GPU monitor's detected devices so the GPU
+/// model is shown instead of the generic driver name. Falls back to the
+/// driver name when no GPU is known to be bound to it.
+std::string gpuSensorDisplayName(const std::string &hwmon_device,
+                                 const atm::GpuSnapshot &gpu) {
+  for (const atm::GpuStats &stats : gpu.devices) {
+    if (stats.driver == hwmon_device) {
+      return stats.name;
+    }
+  }
+  return hwmon_device;
+}
+
+/// Renders the SENSORS section of the live view: temperatures grouped by
+/// category (CPU / GPU / Storage / Motherboard+Other) followed by fan speeds
+/// when any are exposed. A machine with no temperature/fan channels at all
+/// gets a single "no sensors" line — never a crash and never fake values.
+void renderSensorSections(std::ostringstream &out,
+                          const atm::SensorSnapshot &sensors,
+                          const atm::GpuSnapshot &gpu) {
+  out << "\n## SENSORS\n\n";
+  if (sensors.temperatures.empty() && sensors.fans.empty()) {
+    out << "No hardware temperature sensors available.\n"
+        << "Detailed sensor info: press 's' (then Enter)\n";
+    return;
+  }
+
+  // The display label of one sensor: the GPU model for GPU sensors, the
+  // sensor label (or its "Temperature N" fallback) otherwise.
+  const auto displayLabel = [&](const atm::TemperatureSensor &sensor,
+                                bool gpu_group) {
+    return gpu_group ? gpuSensorDisplayName(sensor.device, gpu)
+                     : sensor.label;
+  };
+
+  // One temperature group: title + one aligned row per matching sensor. When
+  // two sensors in the group share the same label (e.g. label-less acpitz and
+  // PCH devices both fall back to "Temperature 1"), the owning device name is
+  // shown instead so rows stay unambiguous.
+  const auto renderTemperatureGroup = [&](const char *title,
+                                          atm::SensorType type,
+                                          bool gpu_group) {
+    std::vector<const atm::TemperatureSensor *> rows;
+    for (const atm::TemperatureSensor &sensor : sensors.temperatures) {
+      if (sensor.type == type) {
+        rows.push_back(&sensor);
+      }
+    }
+    if (rows.empty()) {
+      return;
+    }
+    std::unordered_map<std::string, std::size_t> label_count;
+    for (const atm::TemperatureSensor *sensor : rows) {
+      ++label_count[displayLabel(*sensor, gpu_group)];
+    }
+    out << title << "\n";
+    for (const atm::TemperatureSensor *sensor : rows) {
+      const std::string base = displayLabel(*sensor, gpu_group);
+      const std::string label =
+          !gpu_group && label_count[base] > 1 ? sensor->device : base;
+      out << std::left << std::setw(kSensorLabelWidth)
+          << fitTo(label, kSensorLabelWidth) << std::right
+          << std::setw(kSensorValueWidth)
+          << formatCelsius(sensor->temperature_celsius) << '\n';
+    }
+    out << '\n';
+  };
+
+  renderTemperatureGroup("CPU", atm::SensorType::CPU, false);
+  renderTemperatureGroup("GPU", atm::SensorType::GPU, true);
+  renderTemperatureGroup("Storage", atm::SensorType::Storage, false);
+
+  // Motherboard and unclassified sensors share the last temperature group,
+  // titled by what is actually present.
+  std::vector<const atm::TemperatureSensor *> board_rows;
+  bool any_motherboard = false;
+  for (const atm::TemperatureSensor &sensor : sensors.temperatures) {
+    if (sensor.type == atm::SensorType::Motherboard) {
+      board_rows.push_back(&sensor);
+      any_motherboard = true;
+    } else if (sensor.type == atm::SensorType::Other) {
+      board_rows.push_back(&sensor);
+    }
+  }
+  if (!board_rows.empty()) {
+    std::unordered_map<std::string, std::size_t> label_count;
+    for (const atm::TemperatureSensor *sensor : board_rows) {
+      ++label_count[sensor->label];
+    }
+    out << (any_motherboard ? "Motherboard" : "Other") << "\n";
+    for (const atm::TemperatureSensor *sensor : board_rows) {
+      const std::string &base = sensor->label;
+      const std::string label =
+          label_count[base] > 1 ? sensor->device : base;
+      out << std::left << std::setw(kSensorLabelWidth)
+          << fitTo(label, kSensorLabelWidth) << std::right
+          << std::setw(kSensorValueWidth)
+          << formatCelsius(sensor->temperature_celsius) << '\n';
+    }
+    out << '\n';
+  }
+
+  if (!sensors.fans.empty()) {
+    std::unordered_map<std::string, std::size_t> label_count;
+    for (const atm::FanSensor &fan : sensors.fans) {
+      ++label_count[fan.label];
+    }
+    out << "FANS\n";
+    for (const atm::FanSensor &fan : sensors.fans) {
+      const std::string label =
+          label_count[fan.label] > 1 ? fan.device : fan.label;
+      out << std::left << std::setw(kSensorLabelWidth)
+          << fitTo(label, kSensorLabelWidth) << std::right
+          << std::setw(kSensorValueWidth)
+          << (std::to_string(fan.rpm) + " RPM") << '\n';
+    }
+    out << '\n';
+  }
+
+  out << "Detailed sensor info: press 's' (then Enter)\n";
+}
+
+/// Full per-sensor breakdown used by the sensor-detail screen: every
+/// temperature with its limits and derived status, then every fan. Sensors
+/// are grouped under a header per hwmon device so multi-device machines stay
+/// readable.
+std::string renderSensorDetails(const atm::SensorSnapshot &sensors,
+                                const atm::GpuSnapshot &gpu) {
+  std::ostringstream out;
+  if (sensors.temperatures.empty() && sensors.fans.empty()) {
+    out << "No hardware temperature sensors available.\n";
+    return out.str();
+  }
+
+  std::string current_device;
+  for (const atm::TemperatureSensor &sensor : sensors.temperatures) {
+    if (sensor.device != current_device) {
+      if (!current_device.empty()) {
+        out << '\n';
+      }
+      current_device = sensor.device;
+      out << "## " << sensor.device << "\n\n";
+    }
+    const std::string label =
+        sensor.type == atm::SensorType::GPU
+            ? gpuSensorDisplayName(sensor.device, gpu)
+            : sensor.label;
+    out << label << "\n"
+        << std::string(kSensorDetailRuleWidth, '-') << "\n";
+    appendLabeled(out, "Current:", formatCelsius(sensor.temperature_celsius));
+    appendLabeled(out, "Maximum:",
+                  sensor.max_temperature_celsius.has_value()
+                      ? formatCelsius(*sensor.max_temperature_celsius)
+                      : "N/A");
+    appendLabeled(out, "Critical:",
+                  sensor.critical_temperature_celsius.has_value()
+                      ? formatCelsius(*sensor.critical_temperature_celsius)
+                      : "N/A");
+    appendLabeled(out, "Status:", atm::sensorStatusName(sensor.status));
+    out << '\n';
+  }
+
+  if (!sensors.fans.empty()) {
+    out << "## FANS\n\n";
+    for (const atm::FanSensor &fan : sensors.fans) {
+      out << fan.label << "\n"
+          << std::string(kSensorDetailRuleWidth, '-') << "\n";
+      appendLabeled(out, "Speed:", std::to_string(fan.rpm) + " RPM");
+      out << '\n';
+    }
+  }
+  return out.str();
+}
+
+/// Renders the SYSTEMD SERVICES section of the live view: a table of
+/// service names, status, enabled state and description. Failed services
+/// are highlighted in their status column.
+/// Case-insensitive search match against a service's name and description.
+bool serviceMatchesQuery(const atm::SystemdService &svc,
+                         const std::string &lower_query) {
+  if (lower_query.empty()) {
+    return true;
+  }
+  return toLowerAscii(svc.name).find(lower_query) != std::string::npos ||
+         toLowerAscii(svc.description).find(lower_query) != std::string::npos;
+}
+
+/// Returns the services sorted by the requested field; the input vector is
+/// copied and re-sorted so callers keep ownership of their own snapshot.
+std::vector<atm::SystemdService> sortServices(
+    const std::vector<atm::SystemdService> &services, atm::ServiceSort sort) {
+  std::vector<atm::SystemdService> sorted = services;
+  switch (sort) {
+    case atm::ServiceSort::Name:
+      std::stable_sort(
+          sorted.begin(), sorted.end(),
+          [](const atm::SystemdService &a, const atm::SystemdService &b) {
+            return toLowerAscii(a.name) < toLowerAscii(b.name);
+          });
+      break;
+    case atm::ServiceSort::Status:
+      std::stable_sort(
+          sorted.begin(), sorted.end(),
+          [](const atm::SystemdService &a, const atm::SystemdService &b) {
+            return a.state < b.state;
+          });
+      break;
+    case atm::ServiceSort::Enabled:
+      std::stable_sort(
+          sorted.begin(), sorted.end(),
+          [](const atm::SystemdService &a, const atm::SystemdService &b) {
+            return a.file_state < b.file_state;
+          });
+      break;
+    case atm::ServiceSort::Description:
+      std::stable_sort(
+          sorted.begin(), sorted.end(),
+          [](const atm::SystemdService &a, const atm::SystemdService &b) {
+            return toLowerAscii(a.description) < toLowerAscii(b.description);
+          });
+      break;
+  }
+  return sorted;
+}
+
+/// Filters a service list by a case-insensitive query on name/description,
+/// then sorts it by the requested field.
+std::vector<atm::SystemdService> filterAndSortServices(
+    const std::vector<atm::SystemdService> &services,
+    const std::string &query, atm::ServiceSort sort) {
+  const std::string lower_query = toLowerAscii(query);
+  std::vector<atm::SystemdService> filtered;
+  filtered.reserve(services.size());
+  for (const atm::SystemdService &svc : services) {
+    if (serviceMatchesQuery(svc, lower_query)) {
+      filtered.push_back(svc);
+    }
+  }
+  return sortServices(filtered, sort);
+}
+
+/// Renders the SYSTEMD SERVICES table for a list of services.
+std::string renderSystemdTableText(
+    const std::vector<atm::SystemdService> &services, bool available) {
+  std::ostringstream out;
+  out << std::left << std::setw(kServiceNameWidth) << "Service"
+      << std::right << std::setw(kServiceStatusWidth) << "Status"
+      << std::setw(kServiceEnabledWidth) << "Enabled"
+      << "  Description\n";
+  if (!available) {
+    out << "Unable to connect to systemd.\n"
+        << "Service management unavailable.\n";
+    return out.str();
+  }
+  if (services.empty()) {
+    out << "No services found.\n";
+    return out.str();
+  }
+  for (const atm::SystemdService &svc : services) {
+    const std::string status_str = atm::serviceStateName(svc.state);
+    const std::string enabled_str = atm::unitFileStateName(svc.file_state);
+    out << std::left << std::setw(kServiceNameWidth)
+        << fitTo(svc.name, kServiceNameWidth) << std::right
+        << std::setw(kServiceStatusWidth)
+        << fitTo(status_str, kServiceStatusWidth)
+        << std::setw(kServiceEnabledWidth)
+        << fitTo(enabled_str, kServiceEnabledWidth)
+        << "  " << fitTo(svc.description, 40) << '\n';
+  }
+  return out.str();
+}
+
+/// Renders the SYSTEMD section of the live view.
+void renderSystemdSections(std::ostringstream &out,
+                           const atm::SystemdSnapshot &systemd,
+                           const std::string &service_search,
+                           atm::ServiceSort service_sort) {
+  const std::vector<atm::SystemdService> services =
+      filterAndSortServices(systemd.services, service_search, service_sort);
+  out << "\n## SYSTEMD SERVICES\n\n"
+      << renderSystemdTableText(services, systemd.available);
+  if (systemd.available && !service_search.empty()) {
+    out << "Showing " << services.size() << " of " << systemd.services.size()
+        << " services (search: \"" << service_search << "\")\n";
+  }
+  out << "Service detail: press 'u' (then Enter)\n";
+}
+
+/// Full per-service breakdown used by the systemd service detail screen.
+std::string renderSystemdServiceDetails(const atm::SystemdService &svc) {
+  std::ostringstream out;
+  out << svc.name << "\n"
+      << std::string(kServiceDetailRuleWidth, '-') << "\n";
+  appendLabeled(out, "Description:", svc.description);
+  appendLabeled(out, "Load State:", svc.load_state);
+  appendLabeled(out, "Active State:", svc.active_state);
+  appendLabeled(out, "Sub State:", svc.sub_state);
+  appendLabeled(out, "Enabled:",
+                atm::unitFileStateName(svc.file_state));
+  if (svc.main_pid > 0) {
+    appendLabeled(out, "Main PID:", std::to_string(svc.main_pid));
+  }
+  if (!svc.unit_file_path.empty()) {
+    appendLabeled(out, "Unit Path:", svc.unit_file_path);
+  }
+  return out.str();
+}
+
 /// Full per-GPU breakdown used by the GPU-detail screen. Multiple GPUs are
 /// shown one after another with the index and card node on each header.
 std::string renderGpuDetails(const atm::GpuSnapshot &gpu) {
@@ -427,7 +762,7 @@ std::string renderTreeFrame(double cpu_usage, const atm::MemoryInfo &memory,
 }
 
 /// Renders the full text view (banner + summary + memory + swap + storage +
-/// network + GPU + processes + statistics + footer). Each frame is a
+/// network + GPU + sensors + processes + statistics + footer). Each frame is a
 /// self-contained 1 s snapshot.
 std::string renderFrame(double cpu_usage, const atm::MemoryInfo &memory,
                         const std::vector<atm::Process> &processes,
@@ -435,7 +770,11 @@ std::string renderFrame(double cpu_usage, const atm::MemoryInfo &memory,
                         ViewMode view, const atm::ProcessTree &tree,
                         const atm::DiskSnapshot &disk,
                         const atm::NetworkSnapshot &network,
-                        const atm::GpuSnapshot &gpu) {
+                        const atm::GpuSnapshot &gpu,
+                        const atm::SensorSnapshot &sensors,
+                        const atm::SystemdSnapshot &systemd,
+                        const std::string &service_search,
+                        atm::ServiceSort service_sort) {
   if (view == ViewMode::Tree) {
     // The tree view stays deliberately focused on the hierarchy; the storage
     // and network sections are part of the table view.
@@ -448,6 +787,8 @@ std::string renderFrame(double cpu_usage, const atm::MemoryInfo &memory,
   renderStorageSections(out, disk);
   renderNetworkSections(out, network);
   renderGpuSections(out, gpu);
+  renderSensorSections(out, sensors, gpu);
+  renderSystemdSections(out, systemd, service_search, service_sort);
   renderProcessTable(out, processes);
   renderProcessStats(out, stats);
   out << "\n---\n\n"
@@ -460,6 +801,8 @@ std::string renderFrame(double cpu_usage, const atm::MemoryInfo &memory,
       << "Manage: press 'm' (then Enter) to control a process by PID\n"
       << "Network detail: press 'i' (then Enter) to inspect an interface\n"
       << "GPU detail: press 'g' (then Enter) to inspect a GPU\n"
+      << "Sensor detail: press 's' (then Enter) to inspect a sensor\n"
+      << "Systemd services: press 'u' (then Enter) to manage services\n"
       << "Updating every " << kRefreshInterval.count() << " second...\n";
   return out.str();
 }
@@ -471,12 +814,17 @@ void renderView(double cpu_usage, const atm::MemoryInfo &memory,
                 ViewMode view, const atm::ProcessTree &tree,
                 const atm::DiskSnapshot &disk,
                 const atm::NetworkSnapshot &network,
-                const atm::GpuSnapshot &gpu) {
+                const atm::GpuSnapshot &gpu,
+                const atm::SensorSnapshot &sensors,
+                const atm::SystemdSnapshot &systemd,
+                const std::string &service_search,
+                atm::ServiceSort service_sort) {
   // ANSI "clear entire screen" + "cursor to home" so the multi-line frame
   // refreshes in place instead of scrolling the terminal.
   std::cout << "\033[2J\033[H";
   std::cout << renderFrame(cpu_usage, memory, processes, stats, sort, view, tree,
-                           disk, network, gpu)
+                           disk, network, gpu, sensors, systemd, service_search,
+                           service_sort)
             << std::flush;
 }
 
@@ -534,6 +882,8 @@ class ConsoleInput {
     Manage,
     InspectNetwork,
     InspectGpu,
+    InspectSensors,
+    InspectSystemd,
   };
 
   /// Non-blocking: drains whatever stdin currently has, then returns the next
@@ -629,6 +979,8 @@ class ConsoleInput {
     if (token == "m" || token == "M") return Command::Manage;
     if (token == "i" || token == "I") return Command::InspectNetwork;
     if (token == "g" || token == "G") return Command::InspectGpu;
+    if (token == "s" || token == "S") return Command::InspectSensors;
+    if (token == "u" || token == "U") return Command::InspectSystemd;
     return Command::None;
   }
 };
@@ -972,6 +1324,224 @@ void interactGpuDetail(const atm::GpuSnapshot &gpu, ConsoleInput &input) {
   static_cast<void>(input.readLine());  // wait for the user, EOF cancels
 }
 
+/// "s": shows the full sensor breakdown (current/maximum/critical/status for
+/// every temperature, RPM for every fan). The snapshot is at most ~1 s old;
+/// the SensorMonitor owns all cached channel state.
+void interactSensorDetail(const atm::SensorSnapshot &sensors,
+                          const atm::GpuSnapshot &gpu, ConsoleInput &input) {
+  std::cout << "\033[2J\033[H";
+  std::cout << "========================================\n"
+               "ARCH TASK MANAGER — Sensor Detail\n"
+               "========================================\n\n"
+            << renderSensorDetails(sensors, gpu)
+            << "\n\nPress Enter to return to the live view.\n" << std::flush;
+  static_cast<void>(input.readLine());  // wait for the user, EOF cancels
+}
+
+/// "u": shows the systemd services list frozen and provides management options.
+/// Shows a choose-a-sort prompt for systemd services; updates `service_sort`.
+void chooseServiceSort(ConsoleInput &input, atm::ServiceSort &service_sort) {
+  std::cout << "\nSort services by:\n"
+               "[1] Name\n"
+               "[2] Status\n"
+               "[3] Enabled state\n"
+               "[4] Description\n\n"
+               "Enter a number (default: Name):\n> "
+            << std::flush;
+  const std::optional<std::string> line = input.readLine();
+  if (!line) {
+    std::cout << "\nInput cancelled.\n";
+    return;
+  }
+  const std::string choice = trimWhitespace(*line);
+  if (choice == "1") service_sort = atm::ServiceSort::Name;
+  else if (choice == "2") service_sort = atm::ServiceSort::Status;
+  else if (choice == "3") service_sort = atm::ServiceSort::Enabled;
+  else if (choice == "4") service_sort = atm::ServiceSort::Description;
+  else std::cout << "Invalid choice; keeping the current sort.\n";
+}
+
+/// "u": shows the systemd services list frozen and provides management options.
+void interactSystemdDetail(atm::SystemdManager &systemd_mgr,
+                           const atm::SystemdSnapshot &systemd,
+                           ConsoleInput &input, std::string &service_search,
+                           atm::ServiceSort &service_sort) {
+  const std::vector<atm::SystemdService> services =
+      filterAndSortServices(systemd.services, service_search, service_sort);
+
+  std::cout << "\033[2J\033[H";
+  std::cout << "========================================\n"
+               "ARCH TASK MANAGER — Systemd Service Management\n"
+               "========================================\n\n"
+            << renderSystemdTableText(services, systemd.available);
+  if (systemd.available && !service_search.empty()) {
+    std::cout << "Showing " << services.size() << " of "
+              << systemd.services.size() << " services (search: \""
+              << service_search << "\")\n";
+  }
+  std::cout << "Sort: " << atm::serviceSortName(service_sort) << "\n\n"
+            << "Management:\n"
+               "[1] Start Service\n"
+               "[2] Stop Service\n"
+               "[3] Restart Service\n"
+               "[4] Enable Service\n"
+               "[5] Disable Service\n"
+               "[6] View Service Details\n"
+               "[7] Search/Filter Services\n"
+               "[8] Sort Services\n"
+               "[9] Refresh Services\n"
+               "[0] Cancel\n\n"
+               "Select action:\n> "
+            << std::flush;
+
+  const std::optional<std::string> action_line = input.readLine();
+  if (!action_line) {
+    std::cout << "\nInput cancelled.\n";
+    return;
+  }
+  const std::string action_text = trimWhitespace(*action_line);
+  if (action_text == "0" || action_text.empty()) {
+    std::cout << "Cancelled.\n";
+    return;
+  }
+  if (action_text != "1" && action_text != "2" && action_text != "3" &&
+      action_text != "4" && action_text != "5" && action_text != "6" &&
+      action_text != "7" && action_text != "8" && action_text != "9") {
+    std::cout << "Invalid action.\n";
+    return;
+  }
+
+  // Search, sort and refresh do not require a service name.
+  if (action_text == "7" || action_text == "8" || action_text == "9") {
+    if (action_text == "7") {
+      std::cout << "\nSearch services (name/description, case-insensitive;\n"
+                   "blank to clear):\n> "
+                << std::flush;
+      const std::optional<std::string> search_line = input.readLine();
+      if (!search_line) {
+        std::cout << "\nInput cancelled.\n";
+        return;
+      }
+      service_search = trimWhitespace(*search_line);
+      if (service_search.empty()) {
+        std::cout << "Search cleared.\n";
+      } else {
+        std::cout << "Filtering services by: \"" << service_search << "\"\n";
+      }
+    } else if (action_text == "8") {
+      chooseServiceSort(input, service_sort);
+    } else {
+      std::cout << "\nRefreshing services...\n";
+      std::this_thread::sleep_for(500ms);
+    }
+    return;
+  }
+
+  if (action_text == "6") {
+    std::cout << "\nEnter service name (e.g. sshd.service):\n> " << std::flush;
+    const std::optional<std::string> name_line = input.readLine();
+    if (!name_line) {
+      std::cout << "\nInput cancelled.\n";
+      return;
+    }
+    std::string service_name = trimWhitespace(*name_line);
+    if (service_name.empty()) {
+      std::cout << "Cancelled.\n";
+      return;
+    }
+    const auto found =
+        std::find_if(systemd.services.begin(), systemd.services.end(),
+                     [&](const atm::SystemdService &svc) {
+                       return svc.name == service_name;
+                     });
+    if (found == systemd.services.end()) {
+      std::cout << "Service not found: " << service_name << "\n";
+      return;
+    }
+    std::cout << '\n' << renderSystemdServiceDetails(*found)
+              << "\n\nPress Enter to return to the live view.\n"
+              << std::flush;
+    static_cast<void>(input.readLine());
+    return;
+  }
+
+  // Ask for the service name.
+  std::cout << "\nEnter service name (e.g. sshd.service):\n> " << std::flush;
+  const std::optional<std::string> name_line = input.readLine();
+  if (!name_line) {
+    std::cout << "\nInput cancelled.\n";
+    return;
+  }
+  std::string service_name = trimWhitespace(*name_line);
+  if (service_name.empty()) {
+    std::cout << "Cancelled.\n";
+    return;
+  }
+  // Auto-append .service suffix if the user only typed the base name.
+  if (service_name.size() < 8 ||
+      service_name.compare(service_name.size() - 8, 8, ".service") != 0) {
+    service_name += ".service";
+  }
+
+  atm::ServiceOperationResult result;
+  std::string prompt;
+  if (action_text == "1") {
+    prompt = "Start " + service_name + "?";
+  } else if (action_text == "2") {
+    prompt = "Stop " + service_name + "?";
+  } else if (action_text == "3") {
+    prompt = "Restart " + service_name + "?";
+  } else if (action_text == "4") {
+    prompt = "Enable " + service_name + " at boot?";
+  } else if (action_text == "5") {
+    prompt = "Disable " + service_name + " at boot?";
+  }
+
+  if (!confirm(prompt, input)) {
+    std::cout << "Cancelled.\n";
+    std::this_thread::sleep_for(500ms);
+    return;
+  }
+
+  if (action_text == "1") {
+    result = systemd_mgr.startService(service_name);
+  } else if (action_text == "2") {
+    result = systemd_mgr.stopService(service_name);
+  } else if (action_text == "3") {
+    result = systemd_mgr.restartService(service_name);
+  } else if (action_text == "4") {
+    result = systemd_mgr.enableService(service_name);
+  } else if (action_text == "5") {
+    result = systemd_mgr.disableService(service_name);
+  }
+
+  if (result.success()) {
+    std::cout << "Operation completed successfully.\n";
+  } else {
+    switch (result.status) {
+      case atm::ServiceOperationStatus::PermissionDenied:
+        std::cout << "Permission denied.\n";
+        break;
+      case atm::ServiceOperationStatus::UnitNotFound:
+        std::cout << "Service not found: " << service_name << '\n';
+        break;
+      case atm::ServiceOperationStatus::BusError:
+      case atm::ServiceOperationStatus::Failed:
+        std::cout << "Failed: "
+                  << (result.error_message.empty()
+                          ? "unknown error"
+                          : result.error_message)
+                  << '\n';
+        break;
+      case atm::ServiceOperationStatus::Success:
+        break;
+    }
+  }
+
+  std::cout << "\nRefreshing services...\n";
+  std::this_thread::sleep_for(1000ms);
+}
+
 }  // namespace
 
 int main() {
@@ -981,11 +1551,15 @@ int main() {
   atm::DiskMonitor disk_monitor;
   atm::NetworkMonitor network_monitor;
   atm::GpuMonitor gpu_monitor;
+  atm::SensorMonitor sensor_monitor;
+  atm::SystemdManager systemd_manager;
   atm::ProcessActions actions;
   ConsoleInput input;
 
   atm::ProcessSort sort = atm::ProcessSort::Cpu;
   ViewMode view = ViewMode::List;
+  atm::ServiceSort service_sort = atm::ServiceSort::Name;
+  std::string service_search;
 
   // Choose the starting view. EOF (e.g. /dev/null stdin) defaults to List.
   std::cout << "Select view:\n"
@@ -1006,6 +1580,9 @@ int main() {
   static_cast<void>(disk_monitor.read());
   static_cast<void>(network_monitor.read());
   static_cast<void>(gpu_monitor.read());
+  sensor_monitor.discover();
+  static_cast<void>(sensor_monitor.read());
+  systemd_manager.discover();
   std::this_thread::sleep_for(kRefreshInterval);
 
   const auto first_cpu = cpu_monitor.readUsage();
@@ -1023,14 +1600,19 @@ int main() {
   const atm::DiskSnapshot first_disk = disk_monitor.read();
   const atm::NetworkSnapshot first_network = network_monitor.read();
   const atm::GpuSnapshot first_gpu = gpu_monitor.read();
+  const atm::SensorSnapshot first_sensors = sensor_monitor.read();
+  const atm::SystemdSnapshot first_systemd = systemd_manager.read();
   auto snapshot = process_monitor.read(first_memory->total);
   atm::sortProcesses(snapshot.processes, sort);
   atm::ProcessTree tree = atm::buildProcessTree(snapshot.processes);
   renderView(*first_cpu, *first_memory, snapshot.processes, snapshot.stats,
-             sort, view, tree, first_disk, first_network, first_gpu);
+             sort, view, tree, first_disk, first_network, first_gpu,
+             first_sensors, first_systemd, service_search, service_sort);
 
   atm::NetworkSnapshot network = first_network;
   atm::GpuSnapshot gpu = first_gpu;
+  atm::SensorSnapshot sensors = first_sensors;
+  atm::SystemdSnapshot systemd = first_systemd;
 
   for (;;) {
     std::this_thread::sleep_for(kRefreshInterval);
@@ -1069,11 +1651,14 @@ int main() {
             const atm::DiskSnapshot disk = disk_monitor.read();
             const atm::NetworkSnapshot network = network_monitor.read();
             gpu = gpu_monitor.read();
+            sensors = sensor_monitor.read();
+            systemd = systemd_manager.read();
             snapshot = process_monitor.read(memory->total);
             atm::sortProcesses(snapshot.processes, sort);
             tree = atm::buildProcessTree(snapshot.processes);
             renderView(*cpu, *memory, snapshot.processes, snapshot.stats,
-                       sort, view, tree, disk, network, gpu);
+                       sort, view, tree, disk, network, gpu, sensors,
+                       systemd, service_search, service_sort);
           }
         }
         continue;
@@ -1085,6 +1670,17 @@ int main() {
       case ConsoleInput::Command::InspectGpu:
         if (view == ViewMode::List) {
           interactGpuDetail(gpu, input);
+        }
+        break;
+      case ConsoleInput::Command::InspectSensors:
+        if (view == ViewMode::List) {
+          interactSensorDetail(sensors, gpu, input);
+        }
+        break;
+      case ConsoleInput::Command::InspectSystemd:
+        if (view == ViewMode::List) {
+          interactSystemdDetail(systemd_manager, systemd, input, service_search,
+                              service_sort);
         }
         break;
       case ConsoleInput::Command::None:
@@ -1109,7 +1705,10 @@ int main() {
     const atm::DiskSnapshot disk = disk_monitor.read();
     network = network_monitor.read();
     gpu = gpu_monitor.read();
+    sensors = sensor_monitor.read();
+    systemd = systemd_manager.read();
     renderView(*cpu, *memory, snapshot.processes, snapshot.stats, sort, view,
-               tree, disk, network, gpu);
+               tree, disk, network, gpu, sensors, systemd, service_search,
+               service_sort);
   }
 }

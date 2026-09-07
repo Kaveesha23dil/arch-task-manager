@@ -25,6 +25,10 @@ endif()
 # std::thread support.
 find_package(Threads REQUIRED)
 
+# systemd D-Bus API (sd-bus / libsystemd) for service management.
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(SYSTEMD REQUIRED libsystemd)
+
 add_executable(arch-task-manager
   src/main.cpp
   src/cpu_monitor.cpp
@@ -35,8 +39,12 @@ add_executable(arch-task-manager
   src/disk_monitor.cpp
   src/network_monitor.cpp
   src/gpu_monitor.cpp
+  src/sensor_monitor.cpp
+  src/systemd_manager.cpp
 )
 
 target_include_directories(arch-task-manager PRIVATE include)
 
-target_link_libraries(arch-task-manager PRIVATE Threads::Threads)
+target_link_libraries(arch-task-manager PRIVATE Threads::Threads ${SYSTEMD_LIBRARIES})
+target_include_directories(arch-task-manager PRIVATE ${SYSTEMD_INCLUDE_DIRS})
+target_link_directories(arch-task-manager PRIVATE ${SYSTEMD_LIBRARY_DIRS})
