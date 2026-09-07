@@ -30,6 +30,7 @@ add_executable(arch-task-manager
   src/cpu_monitor.cpp
   src/memory_monitor.cpp
   src/process_monitor.cpp
+  src/process_actions.cpp
 )
 
 target_include_directories(arch-task-manager PRIVATE include)
