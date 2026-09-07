@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "cpu_monitor.hpp"
+#include "disk_monitor.hpp"
 #include "memory_monitor.hpp"
 #include "process_actions.hpp"
 #include "process_monitor.hpp"
@@ -38,6 +39,8 @@ constexpr int kLabelWidth = 21;
 constexpr double kBytesPerKilobyte = 1024.0;
 constexpr std::size_t kNameColumnWidth = 18;
 constexpr std::size_t kMaxNameWidth = 16;
+constexpr std::size_t kStorageMountWidth = 28;
+constexpr std::size_t kDeviceNameWidth = 14;
 constexpr int kMinNice = -20;
 constexpr int kMaxNice = 19;
 
@@ -122,6 +125,64 @@ void renderMemorySections(std::ostringstream &out,
   appendLabeled(out, "Usage:", formatPercent(memory.swapUsagePercent()) + "%");
 }
 
+/// Renders the STORAGE (physical filesystem capacities), DISK ACTIVITY
+/// (aggregate read/write rates) and DEVICES (whole physical disks) sections.
+/// Only physical mounts are shown; virtual/temporary/network mounts are
+/// counted on one summary line so /proc, /sys, tmpfs etc. are never mistaken
+/// for disk capacity (Step 6).
+void renderStorageSections(std::ostringstream &out,
+                           const atm::DiskSnapshot &disk) {
+  out << "\n## STORAGE\n\n"
+      << "FILESYSTEMS\n\n"
+      << std::left << std::setw(kStorageMountWidth) << "## Mount Point"
+      << std::right << std::setw(10) << "Total" << std::setw(10) << "Used"
+      << std::setw(10) << "Free" << "   Type\n";
+  if (disk.filesystems.empty()) {
+    out << "No filesystems available.\n";
+  } else {
+    for (const atm::DiskUsage &fs : disk.filesystems) {
+      const std::string mount =
+          fs.mount_point.size() <= kStorageMountWidth
+              ? fs.mount_point
+              : fs.mount_point.substr(0, kStorageMountWidth);
+      out << std::left << std::setw(kStorageMountWidth) << mount << std::right
+          << std::setw(10) << atm::formatBytes(fs.total_bytes) << std::setw(10)
+          << atm::formatBytes(fs.used_bytes) << std::setw(10)
+          << atm::formatBytes(fs.available_bytes) << "   "
+          << atm::diskFsTypeName(fs.type) << '\n';
+    }
+  }
+  out << "Excluded: " << disk.excluded_mounts
+      << " virtual/temporary/network mount(s)\n";
+
+  out << "\n---\n\n## DISK ACTIVITY\n\n";
+  appendLabeled(out, "Read:",
+                atm::formatBytes(disk.total_read_bytes_per_second) + "/s");
+  appendLabeled(out, "Write:",
+                atm::formatBytes(disk.total_write_bytes_per_second) + "/s");
+
+  out << "\n## DEVICES\n\n"
+      << std::left << std::setw(kDeviceNameWidth) << "## DEVICE" << std::right
+      << std::setw(8) << "SIZE" << std::setw(12) << "READ" << std::setw(12)
+      << "WRITE\n";
+  if (disk.devices.empty()) {
+    out << "No block devices found.\n";
+  } else {
+    for (const atm::BlockDevice &device : disk.devices) {
+      const std::string name =
+          device.name.size() <= kDeviceNameWidth
+              ? device.name
+              : device.name.substr(0, kDeviceNameWidth);
+      out << std::left << std::setw(kDeviceNameWidth) << name << std::right
+          << std::setw(8) << atm::formatBytes(device.size_bytes) << std::setw(12)
+          << (atm::formatBytes(device.activity.read_bytes_per_second) + "/s")
+          << std::setw(12)
+          << (atm::formatBytes(device.activity.write_bytes_per_second) + "/s")
+          << '\n';
+    }
+  }
+}
+
 /// Renders the process table, sorted by `sort`.
 void renderProcessTable(std::ostringstream &out,
                         const std::vector<atm::Process> &processes) {
@@ -162,19 +223,24 @@ std::string renderTreeFrame(double cpu_usage, const atm::MemoryInfo &memory,
   return out.str();
 }
 
-/// Renders the full text view (banner + summary + memory + swap + processes +
-/// statistics + footer). Each frame is a self-contained 1 s snapshot.
+/// Renders the full text view (banner + summary + memory + swap + storage +
+/// processes + statistics + footer). Each frame is a self-contained
+/// 1 s snapshot.
 std::string renderFrame(double cpu_usage, const atm::MemoryInfo &memory,
                         const std::vector<atm::Process> &processes,
                         const atm::ProcessStats &stats, atm::ProcessSort sort,
-                        ViewMode view, const atm::ProcessTree &tree) {
+                        ViewMode view, const atm::ProcessTree &tree,
+                        const atm::DiskSnapshot &disk) {
   if (view == ViewMode::Tree) {
+    // The tree view stays deliberately focused on the hierarchy; the storage
+    // sections are part of the table view.
     return renderTreeFrame(cpu_usage, memory, tree);
   }
 
   std::ostringstream out;
   renderHeader(out, cpu_usage, memory);
   renderMemorySections(out, memory);
+  renderStorageSections(out, disk);
   renderProcessTable(out, processes);
   renderProcessStats(out, stats);
   out << "\n---\n\n"
@@ -193,12 +259,13 @@ std::string renderFrame(double cpu_usage, const atm::MemoryInfo &memory,
 void renderView(double cpu_usage, const atm::MemoryInfo &memory,
                 const std::vector<atm::Process> &processes,
                 const atm::ProcessStats &stats, atm::ProcessSort sort,
-                ViewMode view, const atm::ProcessTree &tree) {
+                ViewMode view, const atm::ProcessTree &tree,
+                const atm::DiskSnapshot &disk) {
   // ANSI "clear entire screen" + "cursor to home" so the multi-line frame
   // refreshes in place instead of scrolling the terminal.
   std::cout << "\033[2J\033[H";
-  std::cout << renderFrame(cpu_usage, memory, processes, stats, sort, view,
-                           tree)
+  std::cout << renderFrame(cpu_usage, memory, processes, stats, sort, view, tree,
+                           disk)
             << std::flush;
 }
 
@@ -642,6 +709,7 @@ int main() {
   atm::CpuMonitor cpu_monitor;
   atm::MemoryMonitor memory_monitor;
   atm::ProcessMonitor process_monitor;
+  atm::DiskMonitor disk_monitor;
   atm::ProcessActions actions;
   ConsoleInput input;
 
@@ -660,9 +728,11 @@ int main() {
   }
 
   // Baseline samples so the first printed frame already shows real deltas:
-  // CPU usage over the sleep below, and per-process CPU over the same window.
+  // CPU usage over the sleep below, per-process CPU over the same window, and
+  // disk read/write rates over the same window.
   static_cast<void>(cpu_monitor.readUsage());
   static_cast<void>(process_monitor.read(0));
+  static_cast<void>(disk_monitor.read());
   std::this_thread::sleep_for(kRefreshInterval);
 
   const auto first_cpu = cpu_monitor.readUsage();
@@ -677,11 +747,12 @@ int main() {
     return EXIT_FAILURE;
   }
 
+  const atm::DiskSnapshot first_disk = disk_monitor.read();
   auto snapshot = process_monitor.read(first_memory->total);
   atm::sortProcesses(snapshot.processes, sort);
   atm::ProcessTree tree = atm::buildProcessTree(snapshot.processes);
   renderView(*first_cpu, *first_memory, snapshot.processes, snapshot.stats,
-             sort, view, tree);
+             sort, view, tree, first_disk);
 
   for (;;) {
     std::this_thread::sleep_for(kRefreshInterval);
@@ -717,11 +788,12 @@ int main() {
           const auto cpu = cpu_monitor.readUsage();
           const auto memory = memory_monitor.read();
           if (cpu.has_value() && memory.has_value()) {
+            const atm::DiskSnapshot disk = disk_monitor.read();
             snapshot = process_monitor.read(memory->total);
             atm::sortProcesses(snapshot.processes, sort);
             tree = atm::buildProcessTree(snapshot.processes);
             renderView(*cpu, *memory, snapshot.processes, snapshot.stats,
-                       sort, view, tree);
+                       sort, view, tree, disk);
           }
         }
         continue;
@@ -744,7 +816,8 @@ int main() {
     snapshot = process_monitor.read(memory->total);
     atm::sortProcesses(snapshot.processes, sort);
     tree = atm::buildProcessTree(snapshot.processes);
+    const atm::DiskSnapshot disk = disk_monitor.read();
     renderView(*cpu, *memory, snapshot.processes, snapshot.stats, sort, view,
-               tree);
+               tree, disk);
   }
 }
