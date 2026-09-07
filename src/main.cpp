@@ -19,10 +19,17 @@
 #include "memory_monitor.hpp"
 #include "process_actions.hpp"
 #include "process_monitor.hpp"
+#include "process_tree.hpp"
 
 namespace {
 
 using namespace std::chrono_literals;
+
+/// Which full-screen view the live loop renders each second.
+enum class ViewMode {
+  List,  // the flat process table (default)
+  Tree,  // the parent/child process tree
+};
 
 constexpr std::chrono::seconds kRefreshInterval{1};
 constexpr int kPercentPrecision = 1;
@@ -136,12 +143,35 @@ void renderProcessStats(std::ostringstream &out,
   appendLabeled(out, "Zombie:", std::to_string(stats.zombie));
 }
 
+/// Renders the process-tree view (banner + summary + tree + tree stats +
+/// footer). Each frame is a self-contained 1 s snapshot.
+std::string renderTreeFrame(double cpu_usage, const atm::MemoryInfo &memory,
+                            const atm::ProcessTree &tree) {
+  std::ostringstream out;
+  renderHeader(out, cpu_usage, memory);
+  out << "\n## PROCESS TREE\n\n"
+      << atm::renderProcessTree(tree) << "\n\n"
+      << "Total processes: " << tree.stats.total << "\n"
+      << "Root processes: " << tree.stats.root_count << "\n"
+      << "Maximum tree depth: " << tree.stats.max_depth << "\n"
+      << "\n---\n\n"
+      << "View: [l] Process List  [t] Process Tree (current: Tree)\n"
+      << "Tree order: PID ascending\n"
+      << "Manage: press 'm' (then Enter) to control a process by PID\n"
+      << "Updating every " << kRefreshInterval.count() << " second...\n";
+  return out.str();
+}
+
 /// Renders the full text view (banner + summary + memory + swap + processes +
 /// statistics + footer). Each frame is a self-contained 1 s snapshot.
 std::string renderFrame(double cpu_usage, const atm::MemoryInfo &memory,
                         const std::vector<atm::Process> &processes,
-                        const atm::ProcessStats &stats,
-                        atm::ProcessSort sort) {
+                        const atm::ProcessStats &stats, atm::ProcessSort sort,
+                        ViewMode view, const atm::ProcessTree &tree) {
+  if (view == ViewMode::Tree) {
+    return renderTreeFrame(cpu_usage, memory, tree);
+  }
+
   std::ostringstream out;
   renderHeader(out, cpu_usage, memory);
   renderMemorySections(out, memory);
@@ -153,6 +183,7 @@ std::string renderFrame(double cpu_usage, const atm::MemoryInfo &memory,
       << "Sort: [1] CPU  [2] Memory  [3] PID  [4] Name"
          " (current: "
       << atm::processSortName(sort) << ")\n"
+      << "View: [l] Process List  [t] Process Tree (current: List)\n"
       << "Manage: press 'm' (then Enter) to control a process by PID\n"
       << "Updating every " << kRefreshInterval.count() << " second...\n";
   return out.str();
@@ -161,11 +192,13 @@ std::string renderFrame(double cpu_usage, const atm::MemoryInfo &memory,
 /// Clears the terminal and redraws the whole view in place.
 void renderView(double cpu_usage, const atm::MemoryInfo &memory,
                 const std::vector<atm::Process> &processes,
-                const atm::ProcessStats &stats, atm::ProcessSort sort) {
+                const atm::ProcessStats &stats, atm::ProcessSort sort,
+                ViewMode view, const atm::ProcessTree &tree) {
   // ANSI "clear entire screen" + "cursor to home" so the multi-line frame
   // refreshes in place instead of scrolling the terminal.
   std::cout << "\033[2J\033[H";
-  std::cout << renderFrame(cpu_usage, memory, processes, stats, sort)
+  std::cout << renderFrame(cpu_usage, memory, processes, stats, sort, view,
+                           tree)
             << std::flush;
 }
 
@@ -217,6 +250,8 @@ class ConsoleInput {
     SortMemory,
     SortPid,
     SortName,
+    ViewList,
+    ViewTree,
     Manage,
   };
 
@@ -308,6 +343,8 @@ class ConsoleInput {
     if (token == "2") return Command::SortMemory;
     if (token == "3") return Command::SortPid;
     if (token == "4") return Command::SortName;
+    if (token == "l" || token == "L") return Command::ViewList;
+    if (token == "t" || token == "T") return Command::ViewTree;
     if (token == "m" || token == "M") return Command::Manage;
     return Command::None;
   }
@@ -371,56 +408,64 @@ void showProcessSelection(const std::vector<atm::Process> &processes,
   std::cout << std::flush;
 }
 
-/// Runs one complete "select a process, choose an action" interaction.
-void runProcessControl(atm::ProcessActions &actions, ConsoleInput &input,
-                       const std::vector<atm::Process> &listed,
-                       atm::ProcessSort sort) {
-  showProcessSelection(listed, sort);
-  std::cout << "\nSelect PID (blank to cancel):\n> " << std::flush;
+/// Result of a successful PID selection for the action menu.
+struct SelectedProcess {
+  int pid = 0;
+  std::string name;
+};
+
+/// Asks for a PID with the given prompt and validates it: non-numeric / ≤ 0
+/// is "Invalid PID.", PID 1 and the monitor's own PID are protected, and a
+/// PID absent from `listed` is rejected. Prints each rejection message itself
+/// and returns std::nullopt.
+std::optional<SelectedProcess> selectPid(ConsoleInput &input,
+                                         const std::vector<atm::Process> &listed,
+                                         const char *prompt) {
+  std::cout << "\n" << prompt << ":\n> " << std::flush;
 
   const std::optional<std::string> pid_line = input.readLine();
   if (!pid_line) {
     std::cout << "\nInput cancelled.\n";
-    return;
+    return std::nullopt;
   }
   const std::string pid_text = trimWhitespace(*pid_line);
   if (pid_text.empty()) {
     std::cout << "Cancelled.\n";
-    return;
+    return std::nullopt;
   }
 
   int pid = 0;
   if (!parseSignedInteger(pid_text, pid) || pid <= 0) {
     std::cout << "Invalid PID.\n";
-    return;
+    return std::nullopt;
   }
   if (pid == 1) {
     std::cout << "PID 1 is protected by the application and cannot be managed "
                  "from this interface.\n";
-    return;
+    return std::nullopt;
   }
   if (pid == static_cast<int>(::getpid())) {
     std::cout << "You cannot manage the Task Manager process.\n";
-    return;
+    return std::nullopt;
   }
 
   // The list is at most one second old; a process absent from it is treated
   // as gone rather than guessing at a pid that might now be a different one.
-  std::string name;
-  bool found = false;
   for (const atm::Process &process : listed) {
     if (process.pid == pid) {
-      name = process.name;
-      found = true;
-      break;
+      return SelectedProcess{pid, process.name};
     }
   }
-  if (!found) {
-    std::cout << "Process does not exist (not found in the current process "
-                 "list).\n";
-    return;
-  }
+  std::cout << "Process does not exist (not found in the current process "
+               "list).\n";
+  return std::nullopt;
+}
 
+/// Runs the shared action menu for one selected process (terminate, kill,
+/// pause, resume, change priority). ProcessActions performs every syscall —
+/// this UI code never re-implements kill(2)/setpriority(2).
+void runActionMenu(atm::ProcessActions &actions, ConsoleInput &input, int pid,
+                   const std::string &name) {
   std::cout << "\nProcess:\n"
             << name << "\nPID: " << pid << "\n\n"
             << "Actions:\n"
@@ -560,6 +605,37 @@ void runProcessControl(atm::ProcessActions &actions, ConsoleInput &input,
   std::this_thread::sleep_for(1500ms);
 }
 
+/// Runs one complete "select a process, choose an action" interaction from the
+/// flat process-list view.
+void runProcessControl(atm::ProcessActions &actions, ConsoleInput &input,
+                       const std::vector<atm::Process> &listed,
+                       atm::ProcessSort sort) {
+  showProcessSelection(listed, sort);
+  const auto selected =
+      selectPid(input, listed, "Select PID (blank to cancel)");
+  if (selected.has_value()) {
+    runActionMenu(actions, input, selected->pid, selected->name);
+  }
+}
+
+/// Manages a process chosen from the tree view. The tree only identifies the
+/// selected PID; validation and the action menu are the same shared flow used
+/// by the flat table, and ProcessActions performs the actual syscalls.
+void manageFromTree(atm::ProcessActions &actions, ConsoleInput &input,
+                    const atm::ProcessTree &tree,
+                    const std::vector<atm::Process> &listed) {
+  std::cout << "\033[2J\033[H";
+  std::cout << "========================================\n"
+               "ARCH TASK MANAGER — Process Tree Control\n"
+               "========================================\n\n"
+            << atm::renderProcessTree(tree) << "\n\n";
+
+  const auto selected = selectPid(input, listed, "Enter PID to manage (blank to cancel)");
+  if (selected.has_value()) {
+    runActionMenu(actions, input, selected->pid, selected->name);
+  }
+}
+
 }  // namespace
 
 int main() {
@@ -570,6 +646,18 @@ int main() {
   ConsoleInput input;
 
   atm::ProcessSort sort = atm::ProcessSort::Cpu;
+  ViewMode view = ViewMode::List;
+
+  // Choose the starting view. EOF (e.g. /dev/null stdin) defaults to List.
+  std::cout << "Select view:\n"
+               "[1] Process List\n"
+               "[2] Process Tree\n\n"
+               "Enter a number, or press Enter for the default (Process List):\n> "
+            << std::flush;
+  const std::optional<std::string> view_choice = input.readLine();
+  if (view_choice && trimWhitespace(*view_choice) == "2") {
+    view = ViewMode::Tree;
+  }
 
   // Baseline samples so the first printed frame already shows real deltas:
   // CPU usage over the sleep below, and per-process CPU over the same window.
@@ -591,8 +679,9 @@ int main() {
 
   auto snapshot = process_monitor.read(first_memory->total);
   atm::sortProcesses(snapshot.processes, sort);
+  atm::ProcessTree tree = atm::buildProcessTree(snapshot.processes);
   renderView(*first_cpu, *first_memory, snapshot.processes, snapshot.stats,
-             sort);
+             sort, view, tree);
 
   for (;;) {
     std::this_thread::sleep_for(kRefreshInterval);
@@ -610,8 +699,18 @@ int main() {
       case ConsoleInput::Command::SortName:
         sort = atm::ProcessSort::Name;
         break;
+      case ConsoleInput::Command::ViewList:
+        view = ViewMode::List;
+        break;
+      case ConsoleInput::Command::ViewTree:
+        view = ViewMode::Tree;
+        break;
       case ConsoleInput::Command::Manage:
-        runProcessControl(actions, input, snapshot.processes, sort);
+        if (view == ViewMode::Tree) {
+          manageFromTree(actions, input, tree, snapshot.processes);
+        } else {
+          runProcessControl(actions, input, snapshot.processes, sort);
+        }
         // Refresh immediately so the effect of the action is visible without
         // waiting for the next 1 s tick.
         {
@@ -620,8 +719,9 @@ int main() {
           if (cpu.has_value() && memory.has_value()) {
             snapshot = process_monitor.read(memory->total);
             atm::sortProcesses(snapshot.processes, sort);
+            tree = atm::buildProcessTree(snapshot.processes);
             renderView(*cpu, *memory, snapshot.processes, snapshot.stats,
-                       sort);
+                       sort, view, tree);
           }
         }
         continue;
@@ -643,6 +743,8 @@ int main() {
 
     snapshot = process_monitor.read(memory->total);
     atm::sortProcesses(snapshot.processes, sort);
-    renderView(*cpu, *memory, snapshot.processes, snapshot.stats, sort);
+    tree = atm::buildProcessTree(snapshot.processes);
+    renderView(*cpu, *memory, snapshot.processes, snapshot.stats, sort, view,
+               tree);
   }
 }
