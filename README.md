@@ -5,11 +5,12 @@ Linux. It reads system information **directly from Linux interfaces** such as
 `/proc/stat`, `/proc/meminfo`, and `/proc/<pid>/` — no shelling out to `ps`,
 `free`, `top`, `htop`, or other external tools.
 
-> Stage: **Step 15** — CPU, RAM, swap, process monitoring, process actions, the
+> Stage: **Step 16** — CPU, RAM, swap, process monitoring, process actions, the
 > process tree, disk/storage monitoring, network monitoring, GPU monitoring,
 > temperature & hardware sensor monitoring, systemd service management,
 > startup application management, system information / hardware overview,
-> real-time resource history & graphs, and resource alerts & threshold monitoring.
+> real-time resource history & graphs, resource alerts & threshold monitoring,
+> and desktop notifications via D-Bus.
 > Everything else on the roadmap is intentionally **not** implemented yet, but
 > the code is structured so future modules can be added without rewriting the
 > existing ones.
@@ -171,8 +172,26 @@ feature per milestone, hosted on GitHub.
       list with timestamps. Alert history can be **filtered** by pressing `f`
       to cycle: All / Warning / Critical / Recovery. Each alert type can be
       independently enabled or disabled via the threshold configuration.
-      All alerts are currently displayed **inside the application only** — no
-      desktop notifications, email, or cloud monitoring are implemented.
+
+- [x] **Desktop notifications via D-Bus** — a `NotificationManager` that
+      delivers alert events as native Linux desktop notifications through the
+      `org.freedesktop.Notifications` D-Bus interface (via systemd's `sd-bus`
+      client, the same library already used for systemd service management —
+      no `notify-send` or other spawned helper). It is wired into the
+      `AlertManager` through a simple notification sink: the alert manager
+      emits an event on every state transition and the notification manager
+      decides whether and how to show it. Delivery is **disabled by default**;
+      press `n` to toggle it. Only **Critical** alerts notify by default;
+      Warning and recovery messages are off until enabled in the in-memory
+      settings. Urgency is mapped per severity (Normal→low, Warning→normal,
+      Critical→critical), and each source's popup is **replaced** by its
+      notifications id while a **per-source cooldown** (60 s by default)
+      prevents spam even if the underlying metric keeps transitioning. If the
+      D-Bus notification service is unavailable the call is a no-op and the
+      in-app alert dashboard keeps working — the process never crashes over a
+      missing notification daemon. Settings are held in memory only (no
+      persistent configuration yet); no sound, email, SMS, cloud, or
+      persistent-storage features are implemented.
 
 ### Planned
 
@@ -189,7 +208,8 @@ feature per milestone, hosted on GitHub.
   `sysconf(3)`, the standard `std::filesystem` API, and systemd's D-Bus API
   (`sd-bus`/`libsystemd`)
 - Standard library plus `libsystemd` (the only third-party dependency; it
-  provides the `sd-bus` D-Bus client used for systemd service management)
+  provides the `sd-bus` D-Bus client used for both systemd service management
+  **and** `org.freedesktop.Notifications` desktop notifications)
 - No shelling out to external tools
 
 ## Build on Arch Linux
@@ -414,6 +434,8 @@ While it runs you can switch views at any time (then Enter):
 - `g` — read the full per-GPU breakdown (list view only)
 - `s` — read the full sensor breakdown with limits and status (list view only)
 - `r` — toggle the `## RESOURCE HISTORY` graphs on/off (list view only)
+- `f` — cycle the recent-alerts filter (list view only)
+- `n` — toggle desktop notifications on/off (list view only)
 
 ### Sorting
 
@@ -1825,10 +1847,25 @@ generate no events.
 
 ### Where alerts are displayed
 
-All alerts are currently displayed **inside the application only**. No
-desktop notifications (D-Bus `org.freedesktop.Notifications`), email
-alerts, cloud monitoring, or persistent configuration files are implemented
+Alerts are always shown **inside the application**. They can also be pushed to
+**native desktop notifications** via the D-Bus `org.freedesktop.Notifications`
+interface (see [Desktop notifications](#desktop-notifications)). Email alerts,
+cloud monitoring, and persistent configuration files are **not** implemented
 in this step.
+
+### Desktop notifications
+
+Press `n` (then Enter) in the list view to toggle desktop notifications. They
+are **off by default**. The `NotificationManager` pushes each alert event as a
+native popup, subject to the in-memory `NotificationSettings`:
+
+- Critical events notify by default; Warning and recovery events are `false`
+  until enabled.
+- Urgency maps per severity: Normal→low, Warning→normal, Critical→critical.
+- Each source's popup replaces its previous one (per-source notification id).
+- A **per-source cooldown** (60 s by default) suppresses repeat popups.
+- If no notification daemon is running, notifications are silently skipped and
+  the in-app alert dashboard keeps working.
 
 ## License
 
