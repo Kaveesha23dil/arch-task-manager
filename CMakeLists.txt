@@ -46,6 +46,7 @@ add_executable(arch-task-manager
   src/system_info.cpp
   src/resource_history.cpp
   src/history_manager.cpp
+  src/alert_manager.cpp
 )
 
 target_include_directories(arch-task-manager PRIVATE include)
