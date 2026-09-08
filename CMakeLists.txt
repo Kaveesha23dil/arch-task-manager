@@ -29,6 +29,9 @@ find_package(Threads REQUIRED)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(SYSTEMD REQUIRED libsystemd)
 
+# libalpm for Arch package management (official repository update detection).
+pkg_check_modules(ALPM REQUIRED libalpm)
+
 add_executable(arch-task-manager
   src/main.cpp
   src/cpu_monitor.cpp
@@ -48,10 +51,11 @@ add_executable(arch-task-manager
   src/history_manager.cpp
   src/alert_manager.cpp
   src/notification_manager.cpp
+  src/package_manager.cpp
 )
 
 target_include_directories(arch-task-manager PRIVATE include)
 
-target_link_libraries(arch-task-manager PRIVATE Threads::Threads ${SYSTEMD_LIBRARIES})
-target_include_directories(arch-task-manager PRIVATE ${SYSTEMD_INCLUDE_DIRS})
-target_link_directories(arch-task-manager PRIVATE ${SYSTEMD_LIBRARY_DIRS})
+target_link_libraries(arch-task-manager PRIVATE Threads::Threads ${SYSTEMD_LIBRARIES} ${ALPM_LIBRARIES})
+target_include_directories(arch-task-manager PRIVATE ${SYSTEMD_INCLUDE_DIRS} ${ALPM_INCLUDE_DIRS})
+target_link_directories(arch-task-manager PRIVATE ${SYSTEMD_LIBRARY_DIRS} ${ALPM_LIBRARY_DIRS})
