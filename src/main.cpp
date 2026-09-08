@@ -30,6 +30,7 @@
 #include "history_manager.hpp"
 #include "memory_monitor.hpp"
 #include "network_monitor.hpp"
+#include "notification_manager.hpp"
 #include "process_actions.hpp"
 #include "process_details.hpp"
 #include "process_monitor.hpp"
@@ -774,6 +775,20 @@ void updateAlerts(atm::AlertManager &alerts, double cpu_usage,
             : -1.0;
     alerts.updateTemperature(label, sensor.temperature_celsius,
                              hardware_critical);
+  }
+}
+
+/// Owned by main() and referenced by the notification sink; null by default so
+/// the sink is inert until main() installs it.
+atm::NotificationManager *g_notification_manager = nullptr;
+
+/// Notification sink (see AlertManager::setNotificationSink). Forwards each
+/// new alert event to the desktop notification manager, which applies its own
+/// settings and cooldown and swallows any D-Bus failures.
+void onAlertEvent(const atm::AlertManager & /*alerts*/,
+                  const atm::AlertEvent &event) {
+  if (g_notification_manager != nullptr) {
+    g_notification_manager->notify(event);
   }
 }
 
@@ -1709,6 +1724,7 @@ class ConsoleInput {
     InspectSystemInfo,
     ToggleHistory,
     ToggleAlertFilter,
+    ToggleNotifications,
   };
 
   /// Non-blocking: drains whatever stdin currently has, then returns the next
@@ -1811,6 +1827,7 @@ class ConsoleInput {
     if (token == "y" || token == "Y") return Command::InspectSystemInfo;
     if (token == "r" || token == "R") return Command::ToggleHistory;
     if (token == "f" || token == "F") return Command::ToggleAlertFilter;
+    if (token == "n" || token == "N") return Command::ToggleNotifications;
     return Command::None;
   }
 };
@@ -2807,7 +2824,12 @@ int main() {
   atm::ProcessDetails process_details;
   atm::HistoryManager history;
   atm::AlertManager alerts;
+  atm::NotificationManager notifications;
   ConsoleInput input;
+
+  // Forward alert state transitions to desktop notifications.
+  g_notification_manager = &notifications;
+  alerts.setNotificationSink(&onAlertEvent);
 
   atm::ProcessSort sort = atm::ProcessSort::Cpu;
   ViewMode view = ViewMode::List;
@@ -3014,6 +3036,9 @@ int main() {
         break;
       case ConsoleInput::Command::ToggleAlertFilter:
         alert_filter = nextAlertFilter(alert_filter);
+        break;
+      case ConsoleInput::Command::ToggleNotifications:
+        notifications.settings().enabled = !notifications.settings().enabled;
         break;
       case ConsoleInput::Command::None:
         break;

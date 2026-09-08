@@ -197,6 +197,9 @@ std::optional<AlertEvent> AlertManager::evaluate(
   state.severity = next;
   state.threshold = event.threshold;
   pushEvent(event);
+  if (notification_sink_ != nullptr) {
+    notification_sink_(*this, event);
+  }
   return event;
 }
 
@@ -231,6 +234,10 @@ AlertSeverity AlertManager::currentSeverity(AlertType type,
 void AlertManager::reset() {
   history_.clear();
   subjects_.clear();
+}
+
+void AlertManager::setNotificationSink(NotificationSink sink) {
+  notification_sink_ = sink;
 }
 
 void AlertManager::updateCpu(double usage_percent) {

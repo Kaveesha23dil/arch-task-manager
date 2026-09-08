@@ -137,6 +137,14 @@ class AlertManager {
   void updateTemperature(const std::string& label, double celsius,
                          double hardware_critical_celsius = -1.0);
 
+  /// Registers a callback that is invoked (with the owning manager untouched,
+  /// a const reference, and a copy of the event) for every new alert event
+  /// emitted by a state transition. Used to feed desktop notifications without
+  /// coupling alert detection to any delivery mechanism. May be set to nullptr
+  /// to disable.
+  using NotificationSink = void (*)(const AlertManager&, const AlertEvent&);
+  void setNotificationSink(NotificationSink sink);
+
  private:
   struct SubjectState {
     AlertSeverity severity = AlertSeverity::Normal;
@@ -148,6 +156,7 @@ class AlertManager {
   std::deque<AlertEvent> history_;
   std::unordered_map<AlertType, AlertThreshold> thresholds_;
   std::unordered_map<std::string, SubjectState> subjects_;  // key = type|source
+  NotificationSink notification_sink_ = nullptr;
 
   void pushEvent(const AlertEvent& event);
   static std::string subjectKey(AlertType type, const std::string& source);
