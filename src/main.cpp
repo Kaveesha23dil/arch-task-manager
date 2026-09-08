@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <iomanip>
 #include <iostream>
 #include <optional>
@@ -25,6 +26,7 @@
 #include "memory_monitor.hpp"
 #include "network_monitor.hpp"
 #include "process_actions.hpp"
+#include "process_details.hpp"
 #include "process_monitor.hpp"
 #include "process_tree.hpp"
 #include "sensor_monitor.hpp"
@@ -970,6 +972,177 @@ void renderProcessStats(std::ostringstream &out,
   appendLabeled(out, "Zombie:", std::to_string(stats.zombie));
 }
 
+/// Renders a time_point as a "YYYY-MM-DD HH:MM:SS" local-time string.
+std::string formatTimestamp(std::chrono::system_clock::time_point timestamp) {
+  const std::time_t time = std::chrono::system_clock::to_time_t(timestamp);
+  std::tm local{};
+  if (::localtime_r(&time, &local) == nullptr) {
+    return "N/A";
+  }
+  char buffer[32];
+  std::strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", &local);
+  return buffer;
+}
+
+/// Formats a duration in seconds as "Xd Xh Xm Xs" (omitting empty leading
+/// units).
+std::string formatDuration(std::uint64_t seconds) {
+  if (seconds == 0) {
+    return "0s";
+  }
+  const std::uint64_t days = seconds / 86400;
+  const std::uint64_t hours = (seconds % 86400) / 3600;
+  const std::uint64_t minutes = (seconds % 3600) / 60;
+  const std::uint64_t secs = seconds % 60;
+  std::ostringstream out;
+  if (days > 0) {
+    out << days << "d ";
+  }
+  if (hours > 0) {
+    out << hours << "h ";
+  }
+  if (minutes > 0) {
+    out << minutes << "m ";
+  }
+  out << secs << "s";
+  return out.str();
+}
+
+/// Human-readable label for the <value> or the `<optional>` value, showing
+/// "N/A" when absent.
+std::string orNa(const std::string &value) {
+  return value.empty() ? std::string("N/A") : value;
+}
+
+/// Renders the full detailed breakdown for one process (Step 13). Every
+/// field degrades to "N/A" when it could not be read; nothing here re-reads
+/// /proc — the data was already collected by ProcessDetails.
+std::string renderProcessDetails(const atm::ProcessDetailsInfo &info) {
+  std::ostringstream out;
+  out << "Process Details\n"
+         "────────────────────────────────\n\n";
+  appendLabeled(out, "Name:", info.name);
+  appendLabeled(out, "PID:", std::to_string(info.pid));
+  appendLabeled(out, "State:", atm::processStateName(info.state));
+  appendLabeled(out, "User:", orNa(info.user));
+  appendLabeled(out, "UID:", info.uid.has_value()
+                               ? std::to_string(*info.uid)
+                               : std::string("N/A"));
+  appendLabeled(out, "GID:", info.gid.has_value()
+                               ? std::to_string(*info.gid)
+                               : std::string("N/A"));
+  appendLabeled(out, "Parent PID:", std::to_string(info.parent_pid));
+  appendLabeled(out, "Threads:", info.thread_count.has_value()
+                                     ? std::to_string(*info.thread_count)
+                                     : std::string("N/A"));
+  appendLabeled(out, "Priority:", info.priority.has_value()
+                                      ? std::to_string(*info.priority)
+                                      : std::string("N/A"));
+  if (info.nice_priority.has_value()) {
+    appendLabeled(out, "Nice:", std::to_string(*info.nice_priority));
+  } else {
+    appendLabeled(out, "Nice:", info.nice_value.has_value()
+                                    ? std::to_string(*info.nice_value)
+                                    : std::string("N/A"));
+  }
+  if (info.start_time.has_value()) {
+    appendLabeled(out, "Started:", formatTimestamp(*info.start_time));
+  } else {
+    appendLabeled(out, "Started:", "N/A");
+  }
+  if (info.process_uptime_seconds.has_value()) {
+    appendLabeled(out, "Running For:",
+                  formatDuration(*info.process_uptime_seconds));
+  } else {
+    appendLabeled(out, "Running For:", "N/A");
+  }
+
+  out << "\nExecutable:\n" << orNa(info.executable_path) << "\n\n"
+      << "Working Directory:\n" << orNa(info.working_directory) << "\n\n"
+      << "Command Line:\n"
+      << (info.command_line.empty() ? std::string("N/A")
+                                    : info.command_line)
+      << "\n";
+
+  out << "\nState code: " << info.state_char << " ("
+      << atm::processStateName(info.state) << ")\n";
+
+  out << "\n## Memory\n\n";
+  appendLabeled(out, "Virtual:", atm::formatBytes(info.virtual_memory_bytes));
+  appendLabeled(out, "Resident:", atm::formatBytes(info.resident_memory_bytes));
+  appendLabeled(out, "Shared:",
+                info.shared_memory_bytes.has_value()
+                    ? atm::formatBytes(*info.shared_memory_bytes)
+                    : std::string("N/A"));
+  appendLabeled(out, "Text:",
+                info.text_memory_bytes.has_value()
+                    ? atm::formatBytes(*info.text_memory_bytes)
+                    : std::string("N/A"));
+  appendLabeled(out, "Data:",
+                info.data_memory_bytes.has_value()
+                    ? atm::formatBytes(*info.data_memory_bytes)
+                    : std::string("N/A"));
+  appendLabeled(out, "Stack:",
+                info.stack_memory_bytes.has_value()
+                    ? atm::formatBytes(*info.stack_memory_bytes)
+                    : std::string("N/A"));
+  appendLabeled(out, "Memory %:",
+                info.memory_percent.has_value()
+                    ? formatPercent(*info.memory_percent) + "%"
+                    : std::string("N/A"));
+
+  out << "\n## CPU\n\n";
+  appendLabeled(out, "User time:",
+                formatDuration(info.user_cpu_time /
+                               static_cast<std::uint64_t>(
+                                   std::max(1L, ::sysconf(_SC_CLK_TCK)))));
+  appendLabeled(out, "System time:",
+                formatDuration(info.system_cpu_time /
+                               static_cast<std::uint64_t>(
+                                   std::max(1L, ::sysconf(_SC_CLK_TCK)))));
+  appendLabeled(out, "CPU %:",
+                info.cpu_usage_percent.has_value()
+                    ? formatPercent(*info.cpu_usage_percent) + "%"
+                    : std::string("N/A"));
+  appendLabeled(out, "Threads:", info.thread_count.has_value()
+                                     ? std::to_string(*info.thread_count)
+                                     : std::string("N/A"));
+
+  out << "\n## Context Switches\n\n";
+  appendLabeled(out, "Voluntary:",
+                info.voluntary_context_switches.has_value()
+                    ? formatThousands(*info.voluntary_context_switches)
+                    : std::string("N/A"));
+  appendLabeled(out, "Non-voluntary:",
+                info.nonvoluntary_context_switches.has_value()
+                    ? formatThousands(*info.nonvoluntary_context_switches)
+                    : std::string("N/A"));
+
+  out << "\n## I/O Statistics\n\n";
+  appendLabeled(out, "Read:",
+                info.read_bytes.has_value()
+                    ? atm::formatBytes(*info.read_bytes)
+                    : std::string("N/A"));
+  appendLabeled(out, "Written:",
+                info.write_bytes.has_value()
+                    ? atm::formatBytes(*info.write_bytes)
+                    : std::string("N/A"));
+  appendLabeled(out, "Read Calls:",
+                info.read_syscalls.has_value()
+                    ? formatThousands(*info.read_syscalls)
+                    : std::string("N/A"));
+  appendLabeled(out, "Write Calls:",
+                info.write_syscalls.has_value()
+                    ? formatThousands(*info.write_syscalls)
+                    : std::string("N/A"));
+  appendLabeled(out, "Cancelled Write:",
+                info.cancelled_write_bytes.has_value()
+                    ? atm::formatBytes(*info.cancelled_write_bytes)
+                    : std::string("N/A"));
+
+  return out.str();
+}
+
 /// Renders the process-tree view (banner + summary + tree + tree stats +
 /// footer). Each frame is a self-contained 1 s snapshot.
 std::string renderTreeFrame(double cpu_usage, const atm::MemoryInfo &memory,
@@ -1033,6 +1206,7 @@ std::string renderFrame(double cpu_usage, const atm::MemoryInfo &memory,
       << atm::processSortName(sort) << ")\n"
       << "View: [l] Process List  [t] Process Tree (current: List)\n"
       << "Manage: press 'm' (then Enter) to control a process by PID\n"
+      << "Details: press 'd' (then Enter) to inspect a process in detail\n"
       << "Network detail: press 'i' (then Enter) to inspect an interface\n"
       << "GPU detail: press 'g' (then Enter) to inspect a GPU\n"
       << "Sensor detail: press 's' (then Enter) to inspect a sensor\n"
@@ -1122,6 +1296,7 @@ class ConsoleInput {
     ViewList,
     ViewTree,
     Manage,
+    InspectProcess,
     InspectNetwork,
     InspectGpu,
     InspectSensors,
@@ -1221,6 +1396,7 @@ class ConsoleInput {
     if (token == "l" || token == "L") return Command::ViewList;
     if (token == "t" || token == "T") return Command::ViewTree;
     if (token == "m" || token == "M") return Command::Manage;
+    if (token == "d" || token == "D") return Command::InspectProcess;
     if (token == "i" || token == "I") return Command::InspectNetwork;
     if (token == "g" || token == "G") return Command::InspectGpu;
     if (token == "s" || token == "S") return Command::InspectSensors;
@@ -1514,6 +1690,184 @@ void manageFromTree(atm::ProcessActions &actions, ConsoleInput &input,
   const auto selected = selectPid(input, listed, "Enter PID to manage (blank to cancel)");
   if (selected.has_value()) {
     runActionMenu(actions, input, selected->pid, selected->name);
+  }
+}
+
+/// Asks for a PID to inspect, validating it only against the current process
+/// list. Unlike selectPid() this deliberately permits PID 1 and the Task
+/// Manager's own PID, because details (unlike control) are safe to view.
+/// Returns std::nullopt when the user cancels or the PID is invalid/gone.
+std::optional<SelectedProcess> selectPidForDetails(
+    ConsoleInput &input, const std::vector<atm::Process> &listed,
+    const char *prompt) {
+  std::cout << "\n" << prompt << ":\n> " << std::flush;
+
+  const std::optional<std::string> pid_line = input.readLine();
+  if (!pid_line) {
+    std::cout << "\nInput cancelled.\n";
+    return std::nullopt;
+  }
+  const std::string pid_text = trimWhitespace(*pid_line);
+  if (pid_text.empty()) {
+    std::cout << "Cancelled.\n";
+    return std::nullopt;
+  }
+
+  int pid = 0;
+  if (!parseSignedInteger(pid_text, pid) || pid <= 0) {
+    std::cout << "Invalid PID.\n";
+    return std::nullopt;
+  }
+
+  for (const atm::Process &process : listed) {
+    if (process.pid == pid) {
+      return SelectedProcess{pid, process.name};
+    }
+  }
+  std::cout << "Process does not exist (not found in the current process "
+               "list).\n";
+  return std::nullopt;
+}
+
+/// Runs one of the control actions from within the details view. It reuses the
+/// existing ProcessActions wrappers — no signal logic is re-implemented here —
+/// and gates PID 1 / the monitor's own PID behind isProtectedPid().
+void runProcessDetailAction(atm::ProcessActions &actions, ConsoleInput &input,
+                            int pid, const std::string &name, int action) {
+  if (atm::isProtectedPid(pid)) {
+    std::cout << "PID " << pid
+              << " is protected by the application and cannot be controlled "
+                 "from this interface.\n";
+    return;
+  }
+
+  std::string prompt;
+  const char *verb = "operate on";
+  switch (action) {
+    case 2:
+      prompt = "Terminate process " + std::to_string(pid) + "?";
+      verb = "terminate";
+      break;
+    case 3:
+      prompt = "\nWARNING:\nYou are about to forcefully kill process:\n\n"
+               "PID: " + std::to_string(pid) + "\nName: " + name +
+               "\n\nContinue?";
+      verb = "kill";
+      break;
+    case 4:
+      prompt = "Pause process " + std::to_string(pid) + "?";
+      verb = "pause";
+      break;
+    case 5:
+      prompt = "Resume process " + std::to_string(pid) + "?";
+      verb = "resume";
+      break;
+    default:
+      return;
+  }
+
+  if (!confirm(prompt, input)) {
+    std::cout << "Cancelled.\n";
+    return;
+  }
+
+  atm::ActionResult result;
+  switch (action) {
+    case 2:
+      result = actions.terminate(pid);
+      break;
+    case 3:
+      result = actions.kill(pid);
+      break;
+    case 4:
+      result = actions.pause(pid);
+      break;
+    case 5:
+      result = actions.resume(pid);
+      break;
+  }
+
+  if (result.success()) {
+    std::cout << "Process " << pid << " " << verb << " request sent.\n";
+  } else {
+    printActionFailure(verb, pid, result);
+  }
+}
+
+/// "d": interactively inspect one process in detail. The process list is shown
+/// frozen; a PID is chosen and its /proc/<pid> entries are parsed by
+/// ProcessDetails — this UI never reads /proc directly. The screen loops so
+/// the user can refresh (re-inspect the same PID), apply an existing process
+/// action, or go back to the live view.
+void interactProcessDetail(atm::ProcessDetails &details,
+                           atm::ProcessActions &actions, ConsoleInput &input,
+                           const std::vector<atm::Process> &listed,
+                           atm::ProcessSort sort,
+                           std::uint64_t system_total_kib) {
+  showProcessSelection(listed, sort);
+  const auto selected =
+      selectPidForDetails(input, listed, "Select PID to inspect (blank to cancel)");
+  if (!selected.has_value()) {
+    return;
+  }
+  const int pid = selected->pid;
+  const std::string name = selected->name;
+
+  for (;;) {
+    // Reuse the Process Monitor's CPU figure for this PID (the snapshot is at
+    // most ~1 s old) rather than building a second CPU tracker.
+    std::optional<double> cpu_percent;
+    for (const atm::Process &process : listed) {
+      if (process.pid == pid) {
+        cpu_percent = process.cpu_percent;
+        break;
+      }
+    }
+
+    const std::optional<atm::ProcessDetailsInfo> info =
+        details.getProcessDetails(pid, system_total_kib, cpu_percent);
+
+    if (!info.has_value()) {
+      std::cout << "\nProcess no longer exists.\n"
+                << "\nPress Enter to return to the process list.\n"
+                << std::flush;
+      static_cast<void>(input.readLine());
+      return;
+    }
+
+    std::cout << "\033[2J\033[H";
+    std::cout << "========================================\n"
+                 "ARCH TASK MANAGER — Process Details\n"
+                 "========================================\n\n"
+              << renderProcessDetails(*info) << "\n\n"
+              << "[1] Refresh\n"
+                 "[2] Terminate\n"
+                 "[3] Kill\n"
+                 "[4] Stop (Pause)\n"
+                 "[5] Continue (Resume)\n"
+                 "[0] Back\n\n"
+                 "Select action:\n> "
+              << std::flush;
+
+    const std::optional<std::string> action_line = input.readLine();
+    if (!action_line) {
+      std::cout << "\nInput cancelled.\n";
+      return;
+    }
+    const std::string action_text = trimWhitespace(*action_line);
+    if (action_text == "0" || action_text.empty()) {
+      return;  // Back to the live view
+    }
+    if (action_text == "1") {
+      continue;  // refresh: re-inspect the same PID on the next loop
+    }
+    if (action_text == "2" || action_text == "3" || action_text == "4" ||
+        action_text == "5") {
+      const int action = std::atoi(action_text.c_str());
+      runProcessDetailAction(actions, input, pid, name, action);
+      continue;  // redraw details after the action
+    }
+    std::cout << "Invalid action.\n";
   }
 }
 
@@ -2042,6 +2396,7 @@ int main() {
   atm::StartupManager startup_manager;
   atm::SystemInfoProvider system_info;
   atm::ProcessActions actions;
+  atm::ProcessDetails process_details;
   ConsoleInput input;
 
   atm::ProcessSort sort = atm::ProcessSort::Cpu;
@@ -2159,6 +2514,15 @@ int main() {
           }
         }
         continue;
+      case ConsoleInput::Command::InspectProcess:
+        if (view == ViewMode::List) {
+          const std::optional<atm::MemoryInfo> mem = memory_monitor.read();
+          const std::uint64_t total_kib =
+              mem.has_value() ? mem->total : 0;
+          interactProcessDetail(process_details, actions, input,
+                                snapshot.processes, sort, total_kib);
+        }
+        break;
       case ConsoleInput::Command::InspectNetwork:
         if (view == ViewMode::List) {
           interactNetworkDetail(network, input);
