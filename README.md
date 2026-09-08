@@ -5,11 +5,11 @@ Linux. It reads system information **directly from Linux interfaces** such as
 `/proc/stat`, `/proc/meminfo`, and `/proc/<pid>/` — no shelling out to `ps`,
 `free`, `top`, `htop`, or other external tools.
 
-> Stage: **Step 14** — CPU, RAM, swap, process monitoring, process actions, the
+> Stage: **Step 15** — CPU, RAM, swap, process monitoring, process actions, the
 > process tree, disk/storage monitoring, network monitoring, GPU monitoring,
 > temperature & hardware sensor monitoring, systemd service management,
 > startup application management, system information / hardware overview,
-> and real-time resource history & graphs.
+> real-time resource history & graphs, and resource alerts & threshold monitoring.
 > Everything else on the roadmap is intentionally **not** implemented yet, but
 > the code is structured so future modules can be added without rewriting the
 > existing ones.
@@ -141,11 +141,43 @@ feature per milestone, hosted on GitHub.
       sensor, or any device) is unavailable or disappears, and the whole
       history can be reset with `clearAll()`. (`r` — see the key list below.)
 
+- [x] **Resource alerts & threshold monitoring** — a reusable alert subsystem
+      (`AlertManager`) that monitors existing metrics against configurable
+      thresholds and warns the user when limits are exceeded. Supported alert
+      types: CPU usage, RAM usage, swap usage, disk capacity (per mount point),
+      disk read/write throughput, network RX/TX throughput, GPU utilization,
+      GPU VRAM usage, and temperature (per sensor). Each alert type has
+      independently configurable warning, critical and recovery thresholds
+      with sensible defaults (e.g. CPU warning 80%, critical 95%; temperature
+      warning 75°C, critical 90%). Disk activity and network throughput alerts
+      are **disabled by default** since high throughput is not necessarily an
+      error. The manager uses a **state machine** (Normal → Warning → Critical)
+      with **hysteresis** — a metric must drop below the recovery threshold
+      (not just below the warning threshold) before returning to Normal, which
+      prevents rapid oscillation when a value hovers near a boundary. Only
+      **one event is produced per state transition**, so keeping a metric above
+      the threshold for many update cycles never floods the history. Recovery
+      events are generated when a metric drops back below the recovery threshold
+      (e.g. "✓ CPU usage returned to normal: 62%"). CPU values are **smoothed**
+      with a short rolling average of recent history so brief spikes do not
+      instantly trip a critical alert. Temperature alerts prefer the hardware's
+      own critical limit from sysfs when available. GPU and temperature alerts
+      are only generated when the metric is actually available (N/A values are
+      silently skipped). Alert history is **bounded** (100 events by default,
+      stored in a `std::deque` with a fixed maximum). The `## SYSTEM ALERTS`
+      dashboard in the live view shows a per-category status line (CPU, RAM,
+      Swap, Disk, GPU, Temperature, Network) with ● Normal / ⚠ Warning /
+      🔴 Critical indicators, an **active alerts** list, and a **recent alerts**
+      list with timestamps. Alert history can be **filtered** by pressing `f`
+      to cycle: All / Warning / Critical / Recovery. Each alert type can be
+      independently enabled or disabled via the threshold configuration.
+      All alerts are currently displayed **inside the application only** — no
+      desktop notifications, email, or cloud monitoring are implemented.
+
 ### Planned
 
 - [ ] Process tree — interactive expand/collapse (deferred to the GUI)
 - [ ] Arch Linux package/update information
-- [ ] System alerts
 - [ ] GUI
 
 ## Technology
@@ -684,6 +716,7 @@ arch-task-manager/
 │   ├── system_info.hpp         # SystemInfo, SystemInfoProvider (OS/kernel/CPU/DMI), formatUptime()
 │   ├── resource_history.hpp    # TimedSample + ResourceHistory<T> ring buffer + GraphRenderer
 │   ├── history_manager.hpp     # HistoryManager (owns all bounded history series)
+│   ├── alert_manager.hpp       # AlertManager, AlertType, AlertSeverity, AlertThreshold
 │   └── format_bytes.hpp        # shared byte-formatter (KB/MB/GB, used by disk + network)
 ├── src/
 │   ├── main.cpp                # UI loop: frame rendering + 1 s refresh + control flow
@@ -701,7 +734,8 @@ arch-task-manager/
 │   ├── startup_manager.cpp     # XDG autostart scan, .desktop parse, enable/disable
 │   ├── system_info.cpp         # gethostname/uname, os-release, cpuinfo, DMI read + caching
 │   ├── resource_history.cpp    # GraphRenderer: ASCII graph rendering + rate formatting
-│   └── history_manager.cpp     # HistoryManager::update() feeds every ring buffer each refresh
+│   ├── history_manager.cpp     # HistoryManager::update() feeds every ring buffer each refresh
+│   └── alert_manager.cpp       # AlertManager: threshold evaluation, state machine, history
 └── build/                      # generated; never committed to git
 ```
 
@@ -1218,7 +1252,9 @@ shown and a simple status is derived:
 | `CRITICAL`| at/above `tempN_crit`                               |
 | `N/A`     | no `max`/`crit` exposed — the application never invents limits |
 
-This is display-only; there is no alerting or notification in this step.
+Temperature alerts use these thresholds (and the hardware critical limit)
+to generate Warning/Critical events via the AlertManager (see the
+"Resource Alerts & Threshold Monitoring" section).
 
 ### The `s` detail screen
 
@@ -1649,6 +1685,150 @@ handled without division-by-zero or rendering crashes. The renderer (`GraphRende
 receives data from the `ResourceHistory` buffers only — it never collects metrics.
 
 Press `r` (then Enter) in the list view to toggle the graph section on and off.
+
+## Resource Alerts & Threshold Monitoring
+
+The `AlertManager` module monitors existing metrics against configurable
+thresholds and warns the user when limits are exceeded. It is a reusable
+subsystem that sits on top of the existing CPU, memory, disk, network, GPU
+and sensor monitors — **it never reads `/proc` or `/sys` itself**.
+
+### Supported alert types
+
+| Alert type           | What it monitors                         | Default warning | Default critical | Default recovery |
+| -------------------- | ---------------------------------------- | --------------- | ---------------- | ---------------- |
+| CPU usage            | overall CPU utilization (%)              | 80%             | 95%              | 75%              |
+| RAM usage            | memory usage (%)                         | 80%             | 95%              | 75%              |
+| Swap usage           | swap usage (%)                           | 70%             | 90%              | 65%              |
+| Disk usage           | per-mount capacity (%)                   | 85%             | 95%              | 80%              |
+| Disk read activity   | aggregate read throughput (B/s)          | 500 MB/s        | 1000 MB/s        | 400 MB/s         |
+| Disk write activity  | aggregate write throughput (B/s)         | 500 MB/s        | 1000 MB/s        | 400 MB/s         |
+| Network receive      | aggregate RX throughput (B/s)            | 125 MB/s        | 250 MB/s         | 100 MB/s         |
+| Network transmit     | aggregate TX throughput (B/s)            | 125 MB/s        | 250 MB/s         | 100 MB/s         |
+| GPU usage            | per-GPU utilization (%)                  | 85%             | 95%              | 80%              |
+| GPU memory usage     | per-GPU VRAM usage (%)                   | 85%             | 95%              | 80%              |
+| Temperature          | per-sensor temperature (°C)              | 75°C            | 90°C             | 70°C             |
+
+Disk activity and network throughput alerts are **disabled by default** since
+high throughput is not necessarily an error. All thresholds are configurable
+in memory; a future step will add persistent configuration files.
+
+### State machine and hysteresis
+
+Each metric follows a state machine:
+
+```text
+Normal  →  Warning  →  Critical
+              ↑            │
+              └────────────┘  (recovery)
+```
+
+A metric transitions:
+
+- **Normal → Warning** when the value reaches the warning threshold.
+- **Warning → Critical** when the value reaches the critical threshold.
+- **Critical → Warning** when the value drops below the critical threshold.
+- **Warning → Normal** when the value drops below the **recovery threshold**.
+
+The recovery threshold is deliberately **lower** than the warning threshold.
+For example, with CPU warning at 80%, critical at 95%, and recovery at 75%:
+
+- 82% triggers a Warning.
+- 96% triggers a Critical.
+- 78% (below recovery 75%? no — 78% > 75%) stays in Warning.
+- 74% (below recovery) transitions to Normal.
+
+This **hysteresis** prevents rapid oscillation when a value hovers near a
+threshold boundary — the metric must drop meaningfully below the warning
+level before the alert clears.
+
+### Alert spam prevention
+
+Only **one event is produced per state transition**. Keeping a metric above
+the threshold for many update cycles generates a single Warning or Critical
+event at the moment the state changes — never one alert per second.
+
+### Recovery events
+
+When a metric drops back below the recovery threshold, a **recovery event**
+is recorded:
+
+```text
+12:42  🔴 CPU usage critical: 97%
+12:35  ✓ CPU usage returned to normal: 62%
+```
+
+Only one recovery event is produced per transition back to Normal.
+
+### CPU smoothing
+
+Short CPU spikes should not instantly trigger a critical alert. The alert
+manager smooths the CPU value using a short rolling average of the last 5
+history samples before evaluating thresholds, so brief transient load is
+filtered out.
+
+### Temperature alerts and hardware limits
+
+Temperature alerts prefer the **hardware's own critical limit** from sysfs
+(`tempN_crit`) when it is available and lower than the configured default.
+If no hardware critical limit is exposed, the default threshold is used.
+Sensors with unavailable readings are silently skipped — no alerts are
+generated for N/A values.
+
+### GPU alerts
+
+GPU utilization and VRAM alerts are generated per-GPU. Only GPUs whose
+drivers expose the relevant metric produce alerts; N/A values are skipped.
+Multiple GPUs are supported — each gets its own alert subject (e.g.
+"GPU 0", "GPU 1").
+
+### Alert history
+
+Alert history is **bounded** (100 events by default). It uses a
+`std::deque` with a fixed maximum — when the limit is reached, the oldest
+event is discarded. The history never grows unboundedly no matter how long
+the application runs.
+
+### Alert dashboard
+
+The `## SYSTEM ALERTS` section in the live list view shows:
+
+1. A per-category status line:
+
+   ```text
+   CPU         ● Normal
+   RAM         ⚠ Warning
+   Swap        ● Normal
+   Disk        🔴 Critical
+   GPU         ● Normal
+   Temperature ● Normal
+   Network     ● Normal
+   ```
+
+2. **Active alerts** — subjects currently in a Warning or Critical state.
+3. **Recent alerts** — bounded history with timestamps, most recent first.
+
+### Alert filtering
+
+Press `f` (then Enter) in the list view to cycle the recent-alerts filter:
+
+- **All** — shows all events (default)
+- **Warning** — only Warning transitions
+- **Critical** — only Critical transitions
+- **Recovery** — only recovery events
+
+### Alert enable/disable
+
+Each alert type can be independently enabled or disabled via the threshold
+configuration's `enabled` field. Disabled alert types are not evaluated and
+generate no events.
+
+### Where alerts are displayed
+
+All alerts are currently displayed **inside the application only**. No
+desktop notifications (D-Bus `org.freedesktop.Notifications`), email
+alerts, cloud monitoring, or persistent configuration files are implemented
+in this step.
 
 ## License
 

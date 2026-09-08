@@ -9,6 +9,7 @@
 #include <cstring>
 #include <ctime>
 #include <iomanip>
+#include <initializer_list>
 #include <iostream>
 #include <limits>
 #include <optional>
@@ -21,6 +22,7 @@
 #include <utility>
 #include <vector>
 
+#include "alert_manager.hpp"
 #include "cpu_monitor.hpp"
 #include "disk_monitor.hpp"
 #include "format_bytes.hpp"
@@ -47,6 +49,36 @@ enum class ViewMode {
   List,  // the flat process table (default)
   Tree,  // the parent/child process tree
 };
+
+/// Simple filter for the recent-alerts list. Cycled by pressing 'f' (Enter).
+enum class AlertFilter {
+  All,
+  Warning,
+  Critical,
+  Recovery,
+};
+
+/// Human-readable name of an AlertFilter ("All", "Warning", ...).
+const char *alertFilterName(AlertFilter filter) {
+  switch (filter) {
+    case AlertFilter::All:      return "All";
+    case AlertFilter::Warning:  return "Warning";
+    case AlertFilter::Critical: return "Critical";
+    case AlertFilter::Recovery: return "Recovery";
+  }
+  return "All";
+}
+
+/// Returns the next AlertFilter when the cycling filter key is pressed.
+AlertFilter nextAlertFilter(AlertFilter filter) {
+  switch (filter) {
+    case AlertFilter::All:      return AlertFilter::Warning;
+    case AlertFilter::Warning:  return AlertFilter::Critical;
+    case AlertFilter::Critical: return AlertFilter::Recovery;
+    case AlertFilter::Recovery: return AlertFilter::All;
+  }
+  return AlertFilter::All;
+}
 
 constexpr std::chrono::seconds kRefreshInterval{1};
 constexpr int kPercentPrecision = 1;
@@ -471,6 +503,176 @@ void renderResourceHistorySection(std::ostringstream &out,
       << history.maxSamples() << " samples.\n";
 }
 
+/// Symbol shown for an AlertSeverity in the dashboard and alert lists.
+const char *severitySymbol(atm::AlertSeverity severity) {
+  switch (severity) {
+    case atm::AlertSeverity::Normal:   return "\u25cf";             // ●
+    case atm::AlertSeverity::Warning:  return "\u26a0";             // ⚠
+    case atm::AlertSeverity::Critical: return "\U0001f534";         // 🔴
+  }
+  return "?";
+}
+
+/// Formats a metric value with its unit for alert messages.
+std::string formatAlertValue(atm::AlertType type, double value) {
+  std::ostringstream out;
+  if (type == atm::AlertType::Temperature) {
+    out << std::fixed << std::setprecision(0) << value << "\u00b0C";
+    return out.str();
+  }
+  if (type == atm::AlertType::DiskReadActivity ||
+      type == atm::AlertType::DiskWriteActivity ||
+      type == atm::AlertType::NetworkReceive ||
+      type == atm::AlertType::NetworkTransmit) {
+    return atm::GraphRenderer::formatRate(value);  // bytes/sec -> B/s
+  }
+  out << std::fixed << std::setprecision(0) << value << '%';
+  return out.str();
+}
+
+/// Builds a short human message describing an active alert subject.
+std::string describeAlertSubject(atm::AlertType type, const std::string &source,
+                                 double value) {
+  const std::string v = formatAlertValue(type, value);
+  switch (type) {
+    case atm::AlertType::CpuUsage:
+      return "CPU usage: " + v;
+    case atm::AlertType::MemoryUsage:
+      return "Memory usage: " + v;
+    case atm::AlertType::SwapUsage:
+      return "Swap usage: " + v;
+    case atm::AlertType::DiskUsage:
+      return source + " is " + v + " full";
+    case atm::AlertType::DiskReadActivity:
+      return "High disk read activity: " + v;
+    case atm::AlertType::DiskWriteActivity:
+      return "High disk write activity: " + v;
+    case atm::AlertType::NetworkReceive:
+      return "High network receive rate: " + v;
+    case atm::AlertType::NetworkTransmit:
+      return "High network transmit rate: " + v;
+    case atm::AlertType::GpuUsage:
+      return source + " usage: " + v;
+    case atm::AlertType::GpuMemoryUsage:
+      return source + " VRAM usage: " + v;
+    case atm::AlertType::Temperature:
+      return source + " temperature: " + v;
+  }
+  return source + ": " + v;
+}
+
+/// Worst currently-active severity across a set of alert types.
+atm::AlertSeverity dashboardSeverity(const atm::AlertManager &alerts,
+                                     const std::vector<atm::AlertType> &types) {
+  atm::AlertSeverity worst = atm::AlertSeverity::Normal;
+  for (const auto &a : alerts.activeAlerts()) {
+    bool match = false;
+    for (atm::AlertType t : types) {
+      if (a.type == t) {
+        match = true;
+        break;
+      }
+    }
+    if (match && a.severity > worst) {
+      worst = a.severity;
+    }
+  }
+  return worst;
+}
+
+/// Formats an AlertEvent timestamp as HH:MM in local time.
+std::string formatAlertTimestamp(
+    const std::chrono::system_clock::time_point &timestamp) {
+  const std::time_t t = std::chrono::system_clock::to_time_t(timestamp);
+  const std::tm *tm = std::localtime(&t);
+  char buf[6];
+  std::strftime(buf, sizeof(buf), "%H:%M", tm);
+  return std::string(buf);
+}
+
+/// Renders the SYSTEM ALERTS dashboard plus active and recent alerts. Reads
+/// only AlertManager state, which itself consumes the existing monitor
+/// snapshots; no system metrics are re-read here.
+void renderAlertsSections(std::ostringstream &out,
+                          const atm::AlertManager &alerts,
+                          AlertFilter filter) {
+  out << "\n## SYSTEM ALERTS\n\n";
+
+  const struct {
+    const char *label;
+    std::vector<atm::AlertType> types;
+  } rows[] = {
+      {"CPU",        {atm::AlertType::CpuUsage}},
+      {"RAM",        {atm::AlertType::MemoryUsage}},
+      {"Swap",       {atm::AlertType::SwapUsage}},
+      {"Disk",       {atm::AlertType::DiskUsage, atm::AlertType::DiskReadActivity,
+                      atm::AlertType::DiskWriteActivity}},
+      {"GPU",        {atm::AlertType::GpuUsage, atm::AlertType::GpuMemoryUsage}},
+      {"Temperature", {atm::AlertType::Temperature}},
+      {"Network",    {atm::AlertType::NetworkReceive,
+                      atm::AlertType::NetworkTransmit}},
+  };
+  for (const auto &row : rows) {
+    const atm::AlertSeverity sev = dashboardSeverity(alerts, row.types);
+    out << std::left << std::setw(13) << row.label << severitySymbol(sev) << ' '
+        << atm::alertSeverityName(sev) << '\n';
+  }
+  out << "Severity: \u25cf Normal  \u26a0 Warning  \U0001f534 Critical\n";
+
+  // Active alerts: subjects currently in a Warning or Critical state.
+  out << "\n### ACTIVE ALERTS\n";
+  const auto active = alerts.activeAlerts();
+  if (active.empty()) {
+    out << "\u2713 No active alerts\n";
+  } else {
+    for (const auto &a : active) {
+      out << severitySymbol(a.severity) << ' '
+          << describeAlertSubject(a.type, a.source, a.value) << '\n';
+    }
+  }
+
+  // Recent alerts (bounded history), filtered and shown most-recent-first.
+  out << "\n### RECENT ALERTS (filter: " << alertFilterName(filter) << ")\n";
+  std::vector<const atm::AlertEvent *> matching;
+  for (auto it = alerts.history().rbegin();
+       it != alerts.history().rend() && matching.size() < 8; ++it) {
+    const atm::AlertEvent &e = *it;
+    bool show = false;
+    switch (filter) {
+      case AlertFilter::All:
+        show = true;
+        break;
+      case AlertFilter::Warning:
+        show = !e.is_recovery && e.severity == atm::AlertSeverity::Warning;
+        break;
+      case AlertFilter::Critical:
+        show = !e.is_recovery && e.severity == atm::AlertSeverity::Critical;
+        break;
+      case AlertFilter::Recovery:
+        show = e.is_recovery;
+        break;
+    }
+    if (show) {
+      matching.push_back(&e);
+    }
+  }
+  if (matching.empty()) {
+    out << "(none)\n";
+  } else {
+    for (const atm::AlertEvent *e : matching) {
+      out << formatAlertTimestamp(e->timestamp) << "  "
+          << (e->is_recovery ? std::string("\u2713 ")
+                             : std::string(severitySymbol(e->severity)) + " ")
+          << e->message << '\n';
+    }
+  }
+  out << "Alert filter: press 'f' (then Enter) to cycle "
+         "All / Warning / Critical / Recovery.\n";
+}
+
+/// Evaluates the AlertManager from the already-computed monitor snapshots.
+/// Called once per refresh, immediately after history.update(). It never reads
+/// /proc or /sys itself.
 /// Builds the name/value pairs for GPU utilization and VRAM usage from a
 /// GpuSnapshot, using NaN to mark an unavailable metric so the history layer
 /// skips it.
@@ -510,6 +712,68 @@ void buildTemperatureVector(const atm::SensorSnapshot &sensors,
       label += " (" + sensor.device + ")";
     }
     temps.emplace_back(label, sensor.temperature_celsius);
+  }
+}
+
+/// Evaluates the AlertManager from the already-computed monitor snapshots.
+/// Called once per refresh, immediately after history.update(). It never reads
+/// /proc or /sys itself.
+void updateAlerts(atm::AlertManager &alerts, double cpu_usage,
+                  const atm::MemoryInfo &memory,
+                  const atm::DiskSnapshot &disk,
+                  const atm::NetworkSnapshot &network,
+                  const atm::GpuSnapshot &gpu,
+                  const atm::SensorSnapshot &sensors,
+                  const atm::HistoryManager &history) {
+  // Smooth CPU with a short rolling average of recent history so a brief spike
+  // does not instantly trip a Warning/Critical alert.
+  double smoothed_cpu = cpu_usage;
+  const auto &cpu_samples = history.cpuHistory().samples();
+  if (!cpu_samples.empty()) {
+    double sum = 0.0;
+    std::size_t count = 0;
+    for (auto it = cpu_samples.rbegin();
+         it != cpu_samples.rend() && count < 5; ++it, ++count) {
+      sum += it->value;
+    }
+    smoothed_cpu = count > 0 ? sum / static_cast<double>(count) : cpu_usage;
+  }
+  alerts.updateCpu(smoothed_cpu);
+
+  alerts.updateMemory(memory.usagePercent(), memory.swapUsagePercent());
+
+  for (const atm::DiskUsage &fs : disk.filesystems) {
+    alerts.updateDiskUsage(fs.mount_point, fs.usage_percentage);
+  }
+
+  alerts.updateDiskActivity(
+      static_cast<double>(disk.total_read_bytes_per_second),
+      static_cast<double>(disk.total_write_bytes_per_second));
+
+  alerts.updateNetwork(static_cast<double>(network.total_rx_bytes_per_second),
+                       static_cast<double>(network.total_tx_bytes_per_second));
+
+  std::vector<std::pair<std::string, double>> gpu_utils;
+  std::vector<std::pair<std::string, double>> gpu_vrams;
+  buildGpuMetricVectors(gpu, gpu_utils, gpu_vrams);
+  for (std::size_t i = 0; i < gpu_utils.size(); ++i) {
+    const std::string id =
+        "GPU " + std::to_string(i) + " " + gpu_utils[i].first;
+    alerts.updateGpu(id, gpu_utils[i].second, gpu_vrams[i].second);
+  }
+
+  for (const atm::TemperatureSensor &sensor : sensors.temperatures) {
+    std::string label = atm::sensorTypeName(sensor.type);
+    label += " " + sensor.label;
+    if (!sensor.device.empty()) {
+      label += " (" + sensor.device + ")";
+    }
+    const double hardware_critical =
+        sensor.critical_temperature_celsius.has_value()
+            ? *sensor.critical_temperature_celsius
+            : -1.0;
+    alerts.updateTemperature(label, sensor.temperature_celsius,
+                             hardware_critical);
   }
 }
 
@@ -1298,13 +1562,15 @@ std::string renderFrame(double cpu_usage, const atm::MemoryInfo &memory,
                         const atm::SensorSnapshot &sensors,
                         const atm::SystemdSnapshot &systemd,
                         const atm::StartupSnapshot &startup,
-                        const atm::SystemInfo &sysinfo,
-                        const atm::HistoryManager &history,
-                        bool show_history,
-                        const std::string &service_search,
-                        atm::ServiceSort service_sort,
-                        const std::string &startup_search,
-                        atm::StartupSort startup_sort) {
+                         const atm::SystemInfo &sysinfo,
+                         const atm::HistoryManager &history,
+                         bool show_history,
+                         const atm::AlertManager &alerts,
+                         AlertFilter alert_filter,
+                         const std::string &service_search,
+                         atm::ServiceSort service_sort,
+                         const std::string &startup_search,
+                         atm::StartupSort startup_sort) {
   if (view == ViewMode::Tree) {
     // The tree view stays deliberately focused on the hierarchy; the storage
     // and network sections are part of the table view.
@@ -1322,6 +1588,7 @@ std::string renderFrame(double cpu_usage, const atm::MemoryInfo &memory,
   renderNetworkSections(out, network);
   renderGpuSections(out, gpu);
   renderSensorSections(out, sensors, gpu);
+  renderAlertsSections(out, alerts, alert_filter);
   renderSystemdSections(out, systemd, service_search, service_sort);
   renderStartupSections(out, startup, startup_search, startup_sort);
   renderProcessTable(out, processes);
@@ -1335,6 +1602,8 @@ std::string renderFrame(double cpu_usage, const atm::MemoryInfo &memory,
       << "View: [l] Process List  [t] Process Tree (current: List)\n"
       << "Resource history: press 'r' (then Enter) to toggle graphs (current: "
       << (show_history ? "shown" : "hidden") << ")\n"
+      << "Alert filter: press 'f' (then Enter) to cycle recent alerts (current: "
+      << alertFilterName(alert_filter) << ")\n"
       << "Manage: press 'm' (then Enter) to control a process by PID\n"
       << "Details: press 'd' (then Enter) to inspect a process in detail\n"
       << "Network detail: press 'i' (then Enter) to inspect an interface\n"
@@ -1358,20 +1627,23 @@ void renderView(double cpu_usage, const atm::MemoryInfo &memory,
                 const atm::SensorSnapshot &sensors,
                 const atm::SystemdSnapshot &systemd,
                 const atm::StartupSnapshot &startup,
-                const atm::SystemInfo &sysinfo,
-                const atm::HistoryManager &history,
-                bool show_history,
-                const std::string &service_search,
-                atm::ServiceSort service_sort,
-                const std::string &startup_search,
-                atm::StartupSort startup_sort) {
+                 const atm::SystemInfo &sysinfo,
+                 const atm::HistoryManager &history,
+                 bool show_history,
+                 const atm::AlertManager &alerts,
+                 AlertFilter alert_filter,
+                 const std::string &service_search,
+                 atm::ServiceSort service_sort,
+                 const std::string &startup_search,
+                 atm::StartupSort startup_sort) {
   // ANSI "clear entire screen" + "cursor to home" so the multi-line frame
   // refreshes in place instead of scrolling the terminal.
   std::cout << "\033[2J\033[H";
   std::cout << renderFrame(cpu_usage, memory, processes, stats, sort, view, tree,
                            disk, network, gpu, sensors, systemd, startup,
-                           sysinfo, history, show_history, service_search,
-                           service_sort, startup_search,                            startup_sort)
+                           sysinfo, history, show_history, alerts, alert_filter,
+                           service_search, service_sort, startup_search,
+                           startup_sort)
             << std::flush;
 }
 
@@ -1436,6 +1708,7 @@ class ConsoleInput {
     InspectStartup,
     InspectSystemInfo,
     ToggleHistory,
+    ToggleAlertFilter,
   };
 
   /// Non-blocking: drains whatever stdin currently has, then returns the next
@@ -1537,6 +1810,7 @@ class ConsoleInput {
     if (token == "a" || token == "A") return Command::InspectStartup;
     if (token == "y" || token == "Y") return Command::InspectSystemInfo;
     if (token == "r" || token == "R") return Command::ToggleHistory;
+    if (token == "f" || token == "F") return Command::ToggleAlertFilter;
     return Command::None;
   }
 };
@@ -2532,6 +2806,7 @@ int main() {
   atm::ProcessActions actions;
   atm::ProcessDetails process_details;
   atm::HistoryManager history;
+  atm::AlertManager alerts;
   ConsoleInput input;
 
   atm::ProcessSort sort = atm::ProcessSort::Cpu;
@@ -2541,6 +2816,7 @@ int main() {
   atm::StartupSort startup_sort = atm::StartupSort::Name;
   std::string startup_search;
   bool show_history = true;
+  AlertFilter alert_filter = AlertFilter::All;
 
   // Choose the starting view. EOF (e.g. /dev/null stdin) defaults to List.
   std::cout << "Select view:\n"
@@ -2607,13 +2883,15 @@ int main() {
                    static_cast<double>(first_network.total_rx_bytes_per_second),
                    static_cast<double>(first_network.total_tx_bytes_per_second),
                    gpu_utils, gpu_vrams, temps);
+    updateAlerts(alerts, *first_cpu, *first_memory, first_disk, first_network,
+                 first_gpu, first_sensors, history);
   }
 
   renderView(*first_cpu, *first_memory, snapshot.processes, snapshot.stats,
              sort, view, tree, first_disk, first_network, first_gpu,
              first_sensors, first_systemd, first_startup, sysinfo, history,
-             show_history, service_search, service_sort, startup_search,
-             startup_sort);
+             show_history, alerts, alert_filter, service_search, service_sort,
+             startup_search, startup_sort);
 
   atm::NetworkSnapshot network = first_network;
   atm::GpuSnapshot gpu = first_gpu;
@@ -2679,12 +2957,14 @@ int main() {
                              static_cast<double>(network.total_rx_bytes_per_second),
                              static_cast<double>(network.total_tx_bytes_per_second),
                              gpu_utils, gpu_vrams, temps);
+              updateAlerts(alerts, *cpu, *memory, disk, network, gpu, sensors,
+                           history);
             }
             renderView(*cpu, *memory, snapshot.processes, snapshot.stats,
                        sort, view, tree, disk, network, gpu, sensors,
                        systemd, startup, sysinfo, history, show_history,
-                       service_search, service_sort, startup_search,
-                       startup_sort);
+                       alerts, alert_filter, service_search, service_sort,
+                       startup_search, startup_sort);
           }
         }
         continue;
@@ -2732,6 +3012,9 @@ int main() {
       case ConsoleInput::Command::ToggleHistory:
         show_history = !show_history;
         break;
+      case ConsoleInput::Command::ToggleAlertFilter:
+        alert_filter = nextAlertFilter(alert_filter);
+        break;
       case ConsoleInput::Command::None:
         break;
     }
@@ -2773,11 +3056,12 @@ int main() {
                      static_cast<double>(network.total_rx_bytes_per_second),
                      static_cast<double>(network.total_tx_bytes_per_second),
                      gpu_utils, gpu_vrams, temps);
+      updateAlerts(alerts, *cpu, *memory, disk, network, gpu, sensors, history);
     }
 
     renderView(*cpu, *memory, snapshot.processes, snapshot.stats, sort, view,
                tree, disk, network, gpu, sensors, systemd, startup, sysinfo,
-               history, show_history, service_search, service_sort,
-               startup_search, startup_sort);
+               history, show_history, alerts, alert_filter, service_search,
+               service_sort, startup_search, startup_sort);
   }
 }
