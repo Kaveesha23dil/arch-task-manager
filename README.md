@@ -5,10 +5,11 @@ Linux. It reads system information **directly from Linux interfaces** such as
 `/proc/stat`, `/proc/meminfo`, and `/proc/<pid>/` — no shelling out to `ps`,
 `free`, `top`, `htop`, or other external tools.
 
-> Stage: **Step 12** — CPU, RAM, swap, process monitoring, process actions, the
+> Stage: **Step 14** — CPU, RAM, swap, process monitoring, process actions, the
 > process tree, disk/storage monitoring, network monitoring, GPU monitoring,
 > temperature & hardware sensor monitoring, systemd service management,
-> startup application management, and system information / hardware overview.
+> startup application management, system information / hardware overview,
+> and real-time resource history & graphs.
 > Everything else on the roadmap is intentionally **not** implemented yet, but
 > the code is structured so future modules can be added without rewriting the
 > existing ones.
@@ -122,12 +123,28 @@ feature per milestone, hosted on GitHub.
       breakdown, which also offers an on-demand **refresh** — the static files
       are read once and cached, never rescanned every second. Everything is
       strictly read-only and missing fields always degrade to "N/A".
+- [x] **Real-time resource history & graphs** — a lightweight time-series
+      history layer (`ResourceHistory` ring buffer + `HistoryManager`) that
+      records how system resources change over time, rendered as live ASCII
+      graphs in the `## RESOURCE HISTORY` section of the list view. It tracks
+      overall CPU usage, RAM usage, swap usage, disk read/write throughput,
+      network RX/TX throughput, per-GPU utilization and (where the driver
+      exposes it) VRAM usage, and one graph per discovered temperature sensor.
+      History is a **fixed-size ring buffer** (120 samples at the default
+      1-second refresh ≈ 2 minutes), so memory use stays strictly bounded and
+      the oldest sample is dropped once full. Every module feeds the central
+      update loop — the history layer only stores already-collected values and
+      never re-reads `/proc` or `/sys`. Graphs are fixed-width/height with a
+      current-value header, a time-range footer, automatic Y-axis scaling for
+      throughput metrics and a fixed 0–100% scale for percentages; they degrade
+      gracefully to "N/A" when a metric (GPU utilization, VRAM, a temperature
+      sensor, or any device) is unavailable or disappears, and the whole
+      history can be reset with `clearAll()`. (`r` — see the key list below.)
 
 ### Planned
 
 - [ ] Process tree — interactive expand/collapse (deferred to the GUI)
 - [ ] Arch Linux package/update information
-- [ ] Historical graphs
 - [ ] System alerts
 - [ ] GUI
 
@@ -208,6 +225,30 @@ Total:           15.5 GB
 
 Total:               3.8 GB
 ...
+
+## RESOURCE HISTORY
+
+[CPU Usage]
+24.2 %
+100 % |                                        
+      |~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  0 % |........................................
+      +----------------------------------------
+       1s        Now
+
+[MEMORY Usage]
+52.4 %
+100 % |~~~~~~~~~~
+...
+[DISK READ]
+124.0 MB/s
+...
+[TEMPERATURES]
+Package id 0     52.0 °C
+ 60 °C |        ~~
+  0 °C |~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+      +----------------------------------------
+       1s        Now
 
 ## STORAGE
 
@@ -340,6 +381,7 @@ While it runs you can switch views at any time (then Enter):
 - `i` — inspect one network interface in detail (list view only)
 - `g` — read the full per-GPU breakdown (list view only)
 - `s` — read the full sensor breakdown with limits and status (list view only)
+- `r` — toggle the `## RESOURCE HISTORY` graphs on/off (list view only)
 
 ### Sorting
 
@@ -640,6 +682,8 @@ arch-task-manager/
 │   ├── systemd_manager.hpp     # SystemdService, SystemdSnapshot, SystemdManager (D-Bus)
 │   ├── startup_manager.hpp     # StartupApplication, StartupSnapshot, StartupManager (XDG)
 │   ├── system_info.hpp         # SystemInfo, SystemInfoProvider (OS/kernel/CPU/DMI), formatUptime()
+│   ├── resource_history.hpp    # TimedSample + ResourceHistory<T> ring buffer + GraphRenderer
+│   ├── history_manager.hpp     # HistoryManager (owns all bounded history series)
 │   └── format_bytes.hpp        # shared byte-formatter (KB/MB/GB, used by disk + network)
 ├── src/
 │   ├── main.cpp                # UI loop: frame rendering + 1 s refresh + control flow
@@ -655,7 +699,9 @@ arch-task-manager/
 │   ├── sensor_monitor.cpp      # /sys/class/hwmon temperature/fan discovery + readings
 │   ├── systemd_manager.cpp     # sd-bus / org.freedesktop.systemd1 discovery + management
 │   ├── startup_manager.cpp     # XDG autostart scan, .desktop parse, enable/disable
-│   └── system_info.cpp         # gethostname/uname, os-release, cpuinfo, DMI read + caching
+│   ├── system_info.cpp         # gethostname/uname, os-release, cpuinfo, DMI read + caching
+│   ├── resource_history.cpp    # GraphRenderer: ASCII graph rendering + rate formatting
+│   └── history_manager.cpp     # HistoryManager::update() feeds every ring buffer each refresh
 └── build/                      # generated; never committed to git
 ```
 
@@ -1542,6 +1588,67 @@ absent.
 This feature is strictly **read-only**: it never modifies `/sys`, `/proc`,
 `/etc/os-release` or any DMI data, never changes the hostname, kernel or
 firmware settings, and never executes external commands.
+
+## Real-time resource history & graphs
+
+The `## RESOURCE HISTORY` section (list view) tracks how resources change over
+time and renders lightweight ASCII graphs. It is built on two small modules:
+
+### Supported metrics
+
+| Metric            | History series                    | Y-axis scale            |
+| ----------------- | --------------------------------- | ----------------------- |
+| CPU usage         | overall usage (%)                 | fixed 0–100%            |
+| RAM usage         | usage (%)                          | fixed 0–100%            |
+| Swap usage        | usage (%)                          | fixed 0–100%            |
+| Disk              | read + write throughput (B/s)      | auto-scaling            |
+| Network           | RX + TX throughput (B/s)           | auto-scaling            |
+| GPU*              | per-GPU utilization (%), VRAM (%)  | fixed / per-GPU         |
+| Temperature*      | per-sensor temperature (°C)        | auto-scaling            |
+
+`*` Hardware-dependent: GPU utilization/VRAM and temperature graphs only
+appear when the local GPU driver / hwmon sensor exposes the value. A missing,
+unavailable or disappeared metric simply stops adding samples and the graph
+renders "N/A" — the application never crashes and never fakes a value.
+
+### Ring-buffer architecture
+
+History is stored in `ResourceHistory<T>` (`include/resource_history.hpp`), a
+**fixed-size circular/ring buffer** implemented on a `std::deque`. When the
+buffer is full the oldest sample is popped before the newest is pushed, so
+memory usage stays **strictly bounded** no matter how long the application
+runs. `HistoryManager` (`history_manager.hpp/.cpp`) owns one such buffer per
+series and rebuilds the per-GPU / per-sensor buffers automatically when the set
+of detected GPUs or sensors changes.
+
+### Sampling and the central loop
+
+Every series is sampled **once per refresh** by `HistoryManager::update()` in
+the application's existing central update loop — there are no separate timers
+per metric. The history layer only **stores already-calculated values** that the
+existing CPU / memory / disk / network / GPU / sensor monitors produced; it
+never reads `/proc` or `/sys` itself and never re-reads the same counter twice.
+When the history is paused (see `setPaused`), no samples are collected and no
+fake samples are inserted to fill the gap.
+
+### Default history duration
+
+The default buffer holds **120 samples**. At the default 1-second refresh this
+is ~2 minutes of history. The capacity is a single constructor/constant
+(`kDefaultHistorySamples`) and can be grown later to 1 / 5 / 15 / 30 minutes or
+1 hour without a new architecture.
+
+### Graph behavior
+
+Each graph has a fixed width and height, a header showing the **latest value**,
+and a footer showing the **time range** (`...s        Now`). Percentage metrics
+use a fixed 0–100% scale; throughput and temperature metrics **auto-scale** their
+Y-axis with rounded, sensible tick values (1/2/5/10 steps) to avoid jitter. Empty
+history, a single sample, constant values, and rapidly changing values are all
+handled without division-by-zero or rendering crashes. The renderer (`GraphRenderer`)
+receives data from the `ResourceHistory` buffers only — it never collects metrics.
+
+Press `r` (then Enter) in the list view to toggle the graph section on and off.
 
 ## License
 

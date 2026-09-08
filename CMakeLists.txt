@@ -44,6 +44,8 @@ add_executable(arch-task-manager
   src/systemd_manager.cpp
   src/startup_manager.cpp
   src/system_info.cpp
+  src/resource_history.cpp
+  src/history_manager.cpp
 )
 
 target_include_directories(arch-task-manager PRIVATE include)
