@@ -109,6 +109,8 @@ void applyEntry(AppSettings &s, const std::string &section,
              kMaxRefreshIntervalMs);
     else if (key == "default_page")
       setString(s.general.default_page);
+    else if (key == "autostart_enabled")
+      setBool(s.general.autostart_enabled);
     else
       addProblem("unrecognized setting (ignored)");
     return;
@@ -215,6 +217,7 @@ AppSettings AppSettings::defaults() {
 
   s.general.refresh_interval_ms = 1000;
   s.general.default_page = "list";
+  s.general.autostart_enabled = false;
 
   s.history.sample_interval_ms = 1000;
   s.history.history_duration_seconds = 120;
@@ -368,7 +371,9 @@ std::string serializeSettings(const AppSettings &s) {
 
   out << "[general]\n"
       << "refresh_interval_ms = " << s.general.refresh_interval_ms << '\n'
-      << "default_page = \"" << s.general.default_page << "\"\n\n";
+      << "default_page = \"" << s.general.default_page << "\"\n"
+      << "autostart_enabled = " << boolText(s.general.autostart_enabled)
+      << "\n\n";
 
   out << "[history]\n"
       << "sample_interval_ms = " << s.history.sample_interval_ms << '\n'

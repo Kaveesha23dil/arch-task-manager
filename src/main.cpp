@@ -43,6 +43,7 @@
 #include "settings.hpp"
 #include "settings_apply.hpp"
 #include "settings_manager.hpp"
+#include "app_autostart_manager.hpp"
 #include "startup_manager.hpp"
 #include "system_info.hpp"
 #include "systemd_manager.hpp"
@@ -3547,6 +3548,35 @@ void editPackages(atm::cfg::SettingsManager &settings, ConsoleInput &input) {
   settings.updateSettings(next);
 }
 
+/// Edits the XDG desktop autostart preference. The persisted setting holds the
+/// user's intent; the desktop entry on disk is applied immediately (enable or
+/// disable). When the filesystem operation fails, a clear error is shown and
+/// the setting is kept so a later startup can retry the repair automatically.
+void editStartup(atm::cfg::SettingsManager &settings,
+                 atm::AppAutostartManager &autostart, ConsoleInput &input) {
+  atm::cfg::AppSettings next = settings.settings();
+  std::cout << "\n--- Startup ---\n"
+            << "  Startup autostart: "
+            << (autostart.isEnabled() ? "Enabled" : "Disabled") << "\n";
+  bool desired = next.general.autostart_enabled;
+  if (promptBool(input,
+                 "Start Arch Task Manager automatically when you log in",
+                 desired, desired)) {
+    next.general.autostart_enabled = desired;
+    settings.updateSettings(next);
+    const atm::AutostartResult result =
+        desired ? autostart.enable() : autostart.disable();
+    if (result.ok) {
+      std::cout << "\nStartup autostart: "
+                << (autostart.isEnabled() ? "Enabled" : "Disabled") << "\n";
+    } else {
+      std::cout << "\nUnable to " << (desired ? "enable" : "disable")
+                << " startup:\n"
+                << result.message << "\n";
+    }
+  }
+}
+
 /// Blocking settings page. Editing happens in memory; changes are validated by
 /// the SettingsManager, applied to the running components, and saved when the
 /// user leaves the page. All changes apply without a restart.
@@ -3555,6 +3585,7 @@ void interactSettings(atm::cfg::SettingsManager &settings,
                       atm::HistoryManager &history,
                       atm::AlertManager &alerts,
                       atm::NotificationManager &notifications,
+                      atm::AppAutostartManager &autostart,
                       ConsoleInput &input) {
   for (;;) {
     const atm::cfg::AppSettings &s = settings.settings();
@@ -3594,6 +3625,9 @@ void interactSettings(atm::cfg::SettingsManager &settings,
               << "\nPackages:\n"
               << "  Check for updates at startup: "
               << yesNo(s.packages.check_for_updates) << "\n"
+              << "\nStartup:\n"
+              << "  Startup autostart: "
+              << (autostart.isEnabled() ? "Enabled" : "Disabled") << "\n"
               << "\nAutomatic package installation is disabled. Updates always "
                  "require\nexplicit user confirmation.\n"
               << "\nManagement:\n"
@@ -3602,7 +3636,8 @@ void interactSettings(atm::cfg::SettingsManager &settings,
               << "[3] Edit Alerts\n"
               << "[4] Edit Notifications\n"
               << "[5] Edit Packages\n"
-              << "[6] Reset to Defaults\n"
+              << "[6] Edit Startup\n"
+              << "[7] Reset to Defaults\n"
               << "[0] Back (save changes)\n\n"
               << "Changes apply immediately; settings are saved when you leave "
                  "this page.\n"
@@ -3627,8 +3662,19 @@ void interactSettings(atm::cfg::SettingsManager &settings,
     } else if (choice == "5") {
       editPackages(settings, input);
     } else if (choice == "6") {
+      editStartup(settings, autostart, input);
+    } else if (choice == "7") {
       if (confirm("Reset all settings to defaults?", input)) {
+        // The autostart preference is a setting: resetting it to false must
+        // also remove the application's desktop entry (only its own entry).
         settings.resetToDefaults();
+        if (autostart.isEnabled()) {
+          const atm::AutostartResult result = autostart.disable();
+          if (!result.ok) {
+            std::cout << "\nUnable to disable startup:\n" << result.message
+                      << "\n";
+          }
+        }
       }
     } else {
       std::cout << "Invalid action.\n";
@@ -3675,6 +3721,7 @@ int main() {
   atm::NotificationManager notifications;
   atm::PackageManager packages;
   atm::PackageTransaction package_transaction;
+  atm::AppAutostartManager autostart;
   ConsoleInput input;
 
   // Apply the loaded settings to the runtime components and to the main loop.
@@ -3684,6 +3731,13 @@ int main() {
   // Forward alert state transitions to desktop notifications.
   g_notification_manager = &notifications;
   alerts.setNotificationSink(&onAlertEvent);
+
+  // Reconcile the persisted autostart preference with the desktop entry on
+  // disk. This only repairs/removes arch-task-manager.desktop in the user's
+  // autostart directory; it never touches system-wide startup and a failure
+  // here never prevents the application from launching. The outcome is logged.
+  static_cast<void>(autostart.synchronizeWithSettings(
+      settings.settings().general.autostart_enabled));
 
   // Prepare package update detection: Arch detection + libalpm are opened at
   // startup, then one read-only local check is performed when enabled in
@@ -3923,7 +3977,7 @@ int main() {
       case ConsoleInput::Command::InspectSettings:
         if (view == ViewMode::List) {
           interactSettings(settings, refresh_interval_ms, history, alerts,
-                           notifications, input);
+                           notifications, autostart, input);
         }
         break;
       case ConsoleInput::Command::ToggleHistory:

@@ -5,13 +5,14 @@ Linux. It reads system information **directly from Linux interfaces** such as
 `/proc/stat`, `/proc/meminfo`, and `/proc/<pid>/` — no shelling out to `ps`,
 `free`, `top`, `htop`, or other external tools.
 
-> Stage: **Step 19** — CPU, RAM, swap, process monitoring, process actions, the
+> Stage: **Step 20** — CPU, RAM, swap, process monitoring, process actions, the
 > process tree, disk/storage monitoring, network monitoring, GPU monitoring,
 > temperature & hardware sensor monitoring, systemd service management,
 > startup application management, system information / hardware overview,
 > real-time resource history & graphs, resource alerts & threshold monitoring,
-> desktop notifications via D-Bus, Arch Linux package update detection, and
-> application settings with persistent configuration.
+> desktop notifications via D-Bus, Arch Linux package update detection,
+> application settings with persistent configuration, and XDG desktop
+> autostart for the application itself.
 > Everything else on the roadmap is intentionally **not** implemented yet, but
 > the code is structured so future modules can be added without rewriting the
 > existing ones.
@@ -229,8 +230,9 @@ feature per milestone, hosted on GitHub.
       (or `$XDG_CONFIG_HOME/arch-task-manager/config.toml` when set). The file
       stores the refresh interval, the default view, history depth, per-category
       alert thresholds (warning/critical, plus a recovery hysteresis),
-      notification preferences, and whether startup package-update checks are
-      performed. Values are validated on load and every edit (out-of-range
+      notification preferences, whether startup package-update checks are
+      performed, and whether to launch the application itself at login. Values
+      are validated on load and every edit (out-of-range
       values are clamped; a warning threshold at/above its critical threshold
       resets the category to its defaults), and a malformed or unwritable file
       never prevents the application from starting — it falls back to the
@@ -240,6 +242,25 @@ feature per milestone, hosted on GitHub.
       **No secrets, passwords, or credentials are ever stored**, and the
       configuration can only *reduce* package automation (it can never enable an
       automatic package installation or upgrade).
+
+- [x] **Application startup / autostart management** — an XDG desktop
+      autostart manager that launches the application itself at login by
+      writing a standard `.desktop` entry to the **user's** autostart directory
+      (`~/.config/autostart/arch-task-manager.desktop`, or
+      `$XDG_CONFIG_HOME/autostart/arch-task-manager.desktop` when
+      `XDG_CONFIG_HOME` is set). This
+      only ever touches that single file — it never modifies `/etc/xdg`,
+      never registers systemd user units, cron, or shell rc files, and never
+      runs `system()` / `popen()`. Autostart is **disabled by default** and is
+      enabled/disabled from the settings page (`o` → `[6] Edit Startup`);
+      simply opening the page never enables it. Entries created by the manager
+      carry an `X-ArchTaskManager=true` ownership marker and are written
+      **atomically** (temp file + rename) with
+      non-executable permissions; a pre-existing `arch-task-manager.desktop`
+      that the manager did not create is treated as user-owned and is **never**
+      overwritten or deleted. On every launch the persisted preference is
+      reconciled with the file on disk, and the current on-disk state is always
+      shown on the settings page.
 
 ### Planned
 
@@ -808,6 +829,7 @@ config_version = 1
 [general]
 refresh_interval_ms = 1000      # main loop / sampling interval (100 - 10000 ms)
 default_page = "list"           # "list" or "tree" startup view
+autostart_enabled = false       # launch app at login via XDG autostart
 
 [history]
 sample_interval_ms = 1000       # samples the ring buffers once per refresh (100 - 10000 ms)
@@ -882,7 +904,7 @@ machine.
 
 ### Per-preference edits from the `o` page
 
-The settings menu (`[1]`–`[6]`, `[0]` to save/back) mirrors the file:
+The settings menu (`[1]`–`[7]`, `[0]` to save/back) mirrors the file:
 
 - **`[1] General** — refresh interval (the whole frame rate of the app) and the
   default startup page.
@@ -897,8 +919,14 @@ The settings menu (`[1]`–`[6]`, `[0]` to save/back) mirrors the file:
   in-memory edits are discarded when you open the page.
 - **`[5] Packages** — whether the application performs its read-only startup
   update check.
-- **`[6] Reset** — restore every value to the factory defaults (with
-  confirmation) and write them back immediately.
+- **`[6] Edit Startup** — apply the autostart preference to disk immediately:
+  enabling writes `arch-task-manager.desktop` into the user's autostart
+  directory, disabling removes the application's own entry. The page always
+  shows the current **on-disk** state ("Startup autostart: Enabled/Disabled"),
+  which can differ from the stored preference until sync runs. If the entry
+  creation or removal fails you stay in the page and see why.
+- **`[7] Reset** — restore every value to the factory defaults (with
+  confirmation), disable autostart, and write them back immediately.
 
 Changes marked as pending are written to disk when you back out with `[0]`.
 
@@ -909,6 +937,14 @@ Changes marked as pending are written to disk when you back out with `[0]`.
 - **Privileges are never stored or remembered.** The application keeps its
   "never auto-elevate, never ask for a password" stance; the settings page only
   tunes monitoring/notification values.
+- **Autostart is user-scoped and surgical.** Enabling or disabling autostart
+  only ever creates or deletes the single file
+  `~/.config/autostart/arch-task-manager.desktop` (or the
+  `$XDG_CONFIG_HOME` equivalent). It never touches `/etc/xdg`, never runs
+  shell commands, never adds systemd units or cron jobs, and never modifies or
+  deletes any `.desktop` file that belongs to another application — a
+  pre-existing unowned `arch-task-manager.desktop` is left exactly as the
+  user wrote it.
 - **Package settings cannot increase automation.** `[packages]` contains only
   the `check_for_updates` preference, which merely gates the startup update
   *check*. There is no configuration option to auto-install, auto-upgrade,
@@ -924,6 +960,38 @@ of broken values, clamping/relationship repair, first-launch creation,
 persistence across reloads, reset, XDG path selection, migration of
 unversioned files, graceful behaviour with unwritable locations, and the live
 application of settings to the alert/history/notification subsystems.
+
+## Application startup (autostart)
+
+When enabled, the application makes sure a standard XDG Autostart entry
+launches it at login. This is deliberately a **user-scoped, single-file**
+feature:
+
+| Aspect              | Behaviour                                                                                                             |
+| ------------------- | --------------------------------------------------------------------------------------------------------------------- |
+| File managed        | `arch-task-manager.desktop` in the user's autostart directory only                                                    |
+| Directory           | `$XDG_CONFIG_HOME/autostart` when `XDG_CONFIG_HOME` is set, otherwise `~/.config/autostart` (home read from `$HOME`)  |
+| Default             | Disabled; simply opening the settings page never enables it                                                            |
+| Ownership           | Entries are marked `X-ArchTaskManager=true`; only marked entries are ever updated or removed                          |
+| Writing             | Atomic (temp file + flush + rename), non-executable `0644` permissions                                                 |
+| `Exec=`             | Absolute path to the running binary (resolved via `/proc/self/exe`), escaped per the Desktop Entry Specification      |
+| Unmanaged file      | A pre-existing `arch-task-manager.desktop` without the marker is preserved verbatim; enable/disable refuse to touch it |
+| Startup sync        | On launch the stored preference is reconciled with disk (repair/remove) without ever failing to start                 |
+
+The autostart manager never calls `system()` / `popen()`, never needs root,
+and never touches system-wide autostart (`/etc/xdg`), systemd user units,
+shell rc files, or cron. On a non-Linux platform (or anywhere `/proc/self/exe`
+is unavailable) autostart is reported as unavailable rather than guessed at.
+
+### Testing
+
+A second standalone test target `autostart-tests` (also run via `ctest`)
+covers XDG path resolution (absolute/relative `XDG_CONFIG_HOME`, fallback to
+`~/.config`), executable-path resolution, entry creation and validity, atomic
+writes (no leftover temp files), idempotency, removal that preserves other
+files, protection of unowned entries, regeneration/removal of managed entries,
+startup reconciliation (repair/remove/in-sync/leave-alone), and graceful
+failure on unwritable locations.
 
 ## Project structure
 
@@ -956,10 +1024,12 @@ arch-task-manager/
 │   ├── settings.hpp            # atm::cfg model: defaults, validation, clampAndFix, TOML-subset
 │   ├── settings_manager.hpp    # SettingsManager: XDG config.toml load/save/migrate (atomic)
 │   ├── settings_apply.hpp      # applySettingsToRuntime() → monitors/history/alerts/notifications
+│   ├── app_autostart_manager.hpp # AppAutostartManager, AutostartResult, AutostartSyncState
 │   ├── logger.hpp              # minimal thread-safe stderr logger
 │   └── format_bytes.hpp        # shared byte-formatter (KB/MB/GB, used by disk + network)
 ├── src/
 │   ├── main.cpp                # UI loop: frame rendering + N s refresh + control flow + settings page
+│   ├── app_autostart_manager.cpp # XDG autostart entry create/remove/sync (atomic, marker-guarded)
 │   ├── cpu_monitor.cpp         # /proc/stat reading + utilization math
 │   ├── memory_monitor.cpp      # /proc/meminfo reading + memory/swap math
 │   ├── process_monitor.cpp     # /proc scanning + per-process parsing
