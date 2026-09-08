@@ -31,6 +31,7 @@
 #include "memory_monitor.hpp"
 #include "network_monitor.hpp"
 #include "notification_manager.hpp"
+#include "package_manager.hpp"
 #include "process_actions.hpp"
 #include "process_details.hpp"
 #include "process_monitor.hpp"
@@ -110,6 +111,11 @@ constexpr std::size_t kStartupEnabledWidth = 10;
 constexpr std::size_t kStartupScopeWidth = 8;
 constexpr std::size_t kStartupDetailRuleWidth = 36;
 constexpr std::size_t kSysInfoDetailRuleWidth = 32;
+constexpr std::size_t kPackageNameWidth = 24;
+constexpr std::size_t kPackageVersionWidth = 16;
+constexpr std::size_t kPackageSrcWidth = 10;
+constexpr std::size_t kPackageDetailRuleWidth = 32;
+constexpr std::size_t kMaxPackageFrameRows = 15;  // main-frame table cap
 constexpr int kMinNice = -20;
 constexpr int kMaxNice = 19;
 
@@ -1291,6 +1297,129 @@ std::string renderStartupDetails(const atm::StartupApplication &app) {
   return out.str();
 }
 
+/// Filters the update list by a substring of the package name (case
+/// insensitive). An empty search passes everything through.
+std::vector<atm::PackageUpdate> filterPackageUpdates(
+    const std::vector<atm::PackageUpdate> &updates,
+    const std::string &search) {
+  if (search.empty()) {
+    return updates;
+  }
+  const std::string needle = toLowerAscii(search);
+  std::vector<atm::PackageUpdate> result;
+  for (const atm::PackageUpdate &update : updates) {
+    if (toLowerAscii(update.name).find(needle) != std::string::npos) {
+      result.push_back(update);
+    }
+  }
+  return result;
+}
+
+/// Renders the update table (used by both the live section and the detail
+/// screen). The live view caps the number of rows; the detail screen passes a
+/// very large cap so the full filtered list is shown.
+std::string renderPackageTableText(
+    const std::vector<atm::PackageUpdate> &updates, std::size_t max_rows) {
+  std::ostringstream out;
+  out << std::left << std::setw(kPackageNameWidth) << "Package"
+      << std::left << std::setw(kPackageVersionWidth) << "Installed"
+      << std::left << std::setw(kPackageVersionWidth) << "Available"
+      << std::left << std::setw(kPackageSrcWidth) << "Source"
+      << "  Repo\n";
+  if (updates.empty()) {
+    out << "No updates available.\n";
+    return out.str();
+  }
+  const std::size_t rows = std::min(max_rows, updates.size());
+  for (std::size_t i = 0; i < rows; ++i) {
+    const atm::PackageUpdate &u = updates[i];
+    out << std::left << std::setw(kPackageNameWidth)
+        << fitTo(u.name, kPackageNameWidth)
+        << std::setw(kPackageVersionWidth)
+        << fitTo(u.installed_version, kPackageVersionWidth)
+        << std::setw(kPackageVersionWidth)
+        << fitTo(u.available_version, kPackageVersionWidth)
+        << std::setw(kPackageSrcWidth)
+        << atm::packageSourceName(u.source)
+        << "  " << fitTo(u.repository, 12) << '\n';
+  }
+  if (updates.size() > rows) {
+    out << "... " << (updates.size() - rows)
+        << " more (press 'p' then Enter to view all)\n";
+  }
+  return out.str();
+}
+
+/// Renders the PACKAGE UPDATES section of the live frame. Degrades gracefully
+/// on unsupported distributions and when the databases are unavailable.
+void renderPackageSections(std::ostringstream &out,
+                           const atm::PackageManager &packages) {
+  const atm::PackageUpdateSummary &summary = packages.summary();
+  out << "\n## PACKAGE UPDATES\n\n";
+  if (!summary.supported) {
+    out << "Package update manager:\n"
+        << fitTo(summary.error_message.empty()
+                     ? "Not supported on this distribution"
+                     : summary.error_message,
+                 80)
+        << "\n";
+    return;
+  }
+  if (!summary.initialized || summary.refresh_failed) {
+    out << "Unable to check for updates.\n\nReason:\n"
+        << fitTo(summary.error_message.empty()
+                     ? "Package database is unavailable."
+                     : summary.error_message,
+                 80)
+        << "\n";
+    return;
+  }
+  if (!summary.error_message.empty()) {
+    // e.g. no sync databases configured: local info stays usable.
+    out << fitTo(summary.error_message, 80) << "\n\n";
+  }
+  out << "Total Updates:     " << summary.total_updates << '\n'
+      << "Official Repo:     " << summary.official_updates << '\n'
+      << "AUR:               " << summary.aur_updates << '\n'
+      << "Foreign Packages:  " << summary.foreign_packages << "\n\n";
+  if (!summary.aur_helper.empty()) {
+    out << "AUR helper detected: " << summary.aur_helper
+        << " (not used for detection)\n";
+  }
+  out << (summary.total_updates > 0
+              ? "⚠ " + std::to_string(summary.total_updates) +
+                    " package updates available\n\n"
+              : "System is up to date.\n\n")
+      << renderPackageTableText(packages.updates(), kMaxPackageFrameRows)
+      << "Package updates: press 'p' (then Enter) to manage\n";
+}
+
+/// Full per-package breakdown used by the package-detail screen.
+std::string renderPackageDetails(const atm::PackageUpdate &update) {
+  std::ostringstream out;
+  out << update.name << "\n"
+      << std::string(kPackageDetailRuleWidth, '-') << "\n";
+  appendLabeled(out, "Name:", update.name);
+  appendLabeled(out, "Installed:", update.installed_version);
+  appendLabeled(out, "Available:", update.available_version);
+  appendLabeled(out, "Repository:",
+                update.repository.empty() ? "N/A" : update.repository);
+  appendLabeled(out, "Source:", atm::packageSourceName(update.source));
+  appendLabeled(out, "Architecture:",
+                update.architecture.empty() ? "N/A" : update.architecture);
+  appendLabeled(out, "Installed Size:",
+                update.installed_size > 0
+                    ? atm::formatBytes(update.installed_size)
+                    : "N/A");
+  appendLabeled(out, "Install Reason:",
+                atm::packageInstallReasonName(update.install_reason));
+  appendLabeled(out, "Update Available:", "Yes");
+  if (!update.description.empty()) {
+    appendLabeled(out, "Description:", update.description);
+  }
+  return out.str();
+}
+
 /// Full per-GPU breakdown used by the GPU-detail screen. Multiple GPUs are
 /// shown one after another with the index and card node on each header.
 std::string renderGpuDetails(const atm::GpuSnapshot &gpu) {
@@ -1585,7 +1714,8 @@ std::string renderFrame(double cpu_usage, const atm::MemoryInfo &memory,
                          const std::string &service_search,
                          atm::ServiceSort service_sort,
                          const std::string &startup_search,
-                         atm::StartupSort startup_sort) {
+                         atm::StartupSort startup_sort,
+                         const atm::PackageManager &packages) {
   if (view == ViewMode::Tree) {
     // The tree view stays deliberately focused on the hierarchy; the storage
     // and network sections are part of the table view.
@@ -1606,6 +1736,7 @@ std::string renderFrame(double cpu_usage, const atm::MemoryInfo &memory,
   renderAlertsSections(out, alerts, alert_filter);
   renderSystemdSections(out, systemd, service_search, service_sort);
   renderStartupSections(out, startup, startup_search, startup_sort);
+  renderPackageSections(out, packages);
   renderProcessTable(out, processes);
   renderProcessStats(out, stats);
   out << "\n---\n\n"
@@ -1625,8 +1756,9 @@ std::string renderFrame(double cpu_usage, const atm::MemoryInfo &memory,
       << "GPU detail: press 'g' (then Enter) to inspect a GPU\n"
       << "Sensor detail: press 's' (then Enter) to inspect a sensor\n"
       << "Systemd services: press 'u' (then Enter) to manage services\n"
-      << "Startup apps: press 'a' (then Enter) to manage autostart\n"
-      << "System info: press 'y' (then Enter) for the hardware overview\n"
+<< "Startup apps: press 'a' (then Enter) to manage autostart\n"
+       << "System info: press 'y' (then Enter) for the hardware overview\n"
+       << "Package updates: press 'p' (then Enter) to manage updates\n"
       << "Updating every " << kRefreshInterval.count() << " second...\n";
   return out.str();
 }
@@ -1650,7 +1782,8 @@ void renderView(double cpu_usage, const atm::MemoryInfo &memory,
                  const std::string &service_search,
                  atm::ServiceSort service_sort,
                  const std::string &startup_search,
-                 atm::StartupSort startup_sort) {
+                 atm::StartupSort startup_sort,
+                 const atm::PackageManager &packages) {
   // ANSI "clear entire screen" + "cursor to home" so the multi-line frame
   // refreshes in place instead of scrolling the terminal.
   std::cout << "\033[2J\033[H";
@@ -1658,7 +1791,7 @@ void renderView(double cpu_usage, const atm::MemoryInfo &memory,
                            disk, network, gpu, sensors, systemd, startup,
                            sysinfo, history, show_history, alerts, alert_filter,
                            service_search, service_sort, startup_search,
-                           startup_sort)
+                           startup_sort, packages)
             << std::flush;
 }
 
@@ -1722,6 +1855,7 @@ class ConsoleInput {
     InspectSystemd,
     InspectStartup,
     InspectSystemInfo,
+    InspectPackages,
     ToggleHistory,
     ToggleAlertFilter,
     ToggleNotifications,
@@ -1825,6 +1959,7 @@ class ConsoleInput {
     if (token == "u" || token == "U") return Command::InspectSystemd;
     if (token == "a" || token == "A") return Command::InspectStartup;
     if (token == "y" || token == "Y") return Command::InspectSystemInfo;
+    if (token == "p" || token == "P") return Command::InspectPackages;
     if (token == "r" || token == "R") return Command::ToggleHistory;
     if (token == "f" || token == "F") return Command::ToggleAlertFilter;
     if (token == "n" || token == "N") return Command::ToggleNotifications;
@@ -2807,6 +2942,131 @@ void interactStartupDetail(atm::StartupManager &startup_mgr,
   std::this_thread::sleep_for(300ms);
 }
 
+/// Full-screen package update management. Accessible via 'p' (then Enter):
+/// shows the update summary and update table, and offers an explicit Refresh,
+/// a package-details view and a search/filter over the already-fetched
+/// updates. No install/remove/upgrade actions exist in this step.
+void interactPackageDetail(atm::PackageManager &packages, ConsoleInput &input,
+                           std::string &package_search) {
+  const atm::PackageUpdateSummary &summary = packages.summary();
+  std::vector<atm::PackageUpdate> filtered =
+      filterPackageUpdates(packages.updates(), package_search);
+
+  std::cout << "\033[2J\033[H";
+  std::cout << "========================================\n"
+               "ARCH TASK MANAGER — Package Updates\n"
+               "========================================\n\n";
+
+  if (!summary.supported) {
+    std::cout << "Package update manager:\n"
+                 "Not supported on this distribution\n";
+    return;
+  }
+  if (!summary.initialized || summary.refresh_failed) {
+    std::cout << "Unable to check for updates.\n\nReason:\n"
+              << (summary.error_message.empty()
+                      ? "Package database is unavailable."
+                      : summary.error_message)
+              << '\n';
+    return;
+  }
+  if (!summary.error_message.empty()) {
+    std::cout << summary.error_message << "\n\n";
+  }
+
+  std::cout << "Total Updates:     " << summary.total_updates << '\n'
+            << "Official Repo:     " << summary.official_updates << '\n'
+            << "AUR:               " << summary.aur_updates << '\n'
+            << "Foreign Packages:  " << summary.foreign_packages << "\n\n";
+  if (!summary.aur_helper.empty()) {
+    std::cout << "AUR helper detected: " << summary.aur_helper
+              << " (not used for detection)\n";
+  }
+  std::cout << renderPackageTableText(filtered, std::numeric_limits<std::size_t>::max());
+  if (!package_search.empty()) {
+    std::cout << "Showing " << filtered.size() << " of "
+              << packages.updates().size()
+              << " updates (search: \"" << package_search << "\")\n";
+  }
+  std::cout << "\nManagement:\n"
+               "[1] Refresh\n"
+               "[2] View Package Details\n"
+               "[3] Search/Filter Updates\n"
+               "[0] Cancel\n\n"
+               "Select action:\n> "
+            << std::flush;
+
+  const std::optional<std::string> action_line = input.readLine();
+  if (!action_line) {
+    std::cout << "\nInput cancelled.\n";
+    return;
+  }
+  const std::string action_text = trimWhitespace(*action_line);
+  if (action_text == "0" || action_text.empty()) {
+    std::cout << "Cancelled.\n";
+    return;
+  }
+  if (action_text != "1" && action_text != "2" && action_text != "3") {
+    std::cout << "Invalid action.\n";
+    return;
+  }
+
+  if (action_text == "1") {
+    std::cout << "\nRefreshing package databases...\n"
+              << "This reads the local package database and sync metadata only; "
+                 "no network access or database modification occurs.\n";
+    if (packages.refresh()) {
+      std::cout << "Refresh complete. " << packages.summary().total_updates
+                << " update(s) available.\n";
+    } else {
+      std::cout << "Refresh failed:\n"
+                << packages.summary().error_message << '\n';
+    }
+    std::this_thread::sleep_for(300ms);
+    return;
+  }
+
+  if (action_text == "3") {
+    std::cout << "\nSearch updates (package name; blank to clear):\n> "
+              << std::flush;
+    const std::optional<std::string> search_line = input.readLine();
+    if (!search_line) {
+      std::cout << "\nInput cancelled.\n";
+      return;
+    }
+    package_search = trimWhitespace(*search_line);
+    if (package_search.empty()) {
+      std::cout << "Search cleared.\n";
+    } else {
+      std::cout << "Filtering updates by: \"" << package_search << "\"\n";
+    }
+    std::this_thread::sleep_for(300ms);
+    return;
+  }
+
+  // Action 2: package details.
+  std::cout << "\nEnter a package name from the update list:\n> " << std::flush;
+  const std::optional<std::string> name_line = input.readLine();
+  if (!name_line) {
+    std::cout << "\nInput cancelled.\n";
+    return;
+  }
+  const std::string name = trimWhitespace(*name_line);
+  if (name.empty()) {
+    std::cout << "Cancelled.\n";
+    return;
+  }
+  const atm::PackageUpdate *update = packages.findUpdate(name);
+  if (update == nullptr) {
+    std::cout << "No update found for package: " << name << "\n";
+    return;
+  }
+  std::cout << '\n' << renderPackageDetails(*update)
+            << "\n\nPress Enter to return to the live view.\n"
+            << std::flush;
+  static_cast<void>(input.readLine());
+}
+
 }  // namespace
 
 int main() {
@@ -2825,11 +3085,19 @@ int main() {
   atm::HistoryManager history;
   atm::AlertManager alerts;
   atm::NotificationManager notifications;
+  atm::PackageManager packages;
   ConsoleInput input;
 
   // Forward alert state transitions to desktop notifications.
   g_notification_manager = &notifications;
   alerts.setNotificationSink(&onAlertEvent);
+
+  // Prepare package update detection: Arch detection + libalpm are opened at
+  // startup, then one read-only local check is performed. This only inspects
+  // the local package database and sync metadata already present on disk; it
+  // never synchronises repositories or touches the network.
+  packages.initialize();
+  packages.refresh();
 
   atm::ProcessSort sort = atm::ProcessSort::Cpu;
   ViewMode view = ViewMode::List;
@@ -2837,6 +3105,7 @@ int main() {
   std::string service_search;
   atm::StartupSort startup_sort = atm::StartupSort::Name;
   std::string startup_search;
+  std::string package_search;
   bool show_history = true;
   AlertFilter alert_filter = AlertFilter::All;
 
@@ -2913,7 +3182,7 @@ int main() {
              sort, view, tree, first_disk, first_network, first_gpu,
              first_sensors, first_systemd, first_startup, sysinfo, history,
              show_history, alerts, alert_filter, service_search, service_sort,
-             startup_search, startup_sort);
+             startup_search, startup_sort, packages);
 
   atm::NetworkSnapshot network = first_network;
   atm::GpuSnapshot gpu = first_gpu;
@@ -2986,7 +3255,7 @@ int main() {
                        sort, view, tree, disk, network, gpu, sensors,
                        systemd, startup, sysinfo, history, show_history,
                        alerts, alert_filter, service_search, service_sort,
-                       startup_search, startup_sort);
+                       startup_search, startup_sort, packages);
           }
         }
         continue;
@@ -3029,6 +3298,11 @@ int main() {
       case ConsoleInput::Command::InspectSystemInfo:
         if (view == ViewMode::List) {
           interactSystemInfoDetail(system_info, sysinfo, gpu, input);
+        }
+        break;
+      case ConsoleInput::Command::InspectPackages:
+        if (view == ViewMode::List) {
+          interactPackageDetail(packages, input, package_search);
         }
         break;
       case ConsoleInput::Command::ToggleHistory:
@@ -3087,6 +3361,6 @@ int main() {
     renderView(*cpu, *memory, snapshot.processes, snapshot.stats, sort, view,
                tree, disk, network, gpu, sensors, systemd, startup, sysinfo,
                history, show_history, alerts, alert_filter, service_search,
-               service_sort, startup_search, startup_sort);
+               service_sort, startup_search, startup_sort, packages);
   }
 }

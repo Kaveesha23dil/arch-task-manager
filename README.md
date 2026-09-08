@@ -5,12 +5,12 @@ Linux. It reads system information **directly from Linux interfaces** such as
 `/proc/stat`, `/proc/meminfo`, and `/proc/<pid>/` — no shelling out to `ps`,
 `free`, `top`, `htop`, or other external tools.
 
-> Stage: **Step 16** — CPU, RAM, swap, process monitoring, process actions, the
+> Stage: **Step 17** — CPU, RAM, swap, process monitoring, process actions, the
 > process tree, disk/storage monitoring, network monitoring, GPU monitoring,
 > temperature & hardware sensor monitoring, systemd service management,
 > startup application management, system information / hardware overview,
 > real-time resource history & graphs, resource alerts & threshold monitoring,
-> and desktop notifications via D-Bus.
+> desktop notifications via D-Bus, and Arch Linux package update detection.
 > Everything else on the roadmap is intentionally **not** implemented yet, but
 > the code is structured so future modules can be added without rewriting the
 > existing ones.
@@ -193,10 +193,38 @@ feature per milestone, hosted on GitHub.
       persistent configuration yet); no sound, email, SMS, cloud, or
       persistent-storage features are implemented.
 
+- [x] **Arch Linux package update detection** — a `PackageManager` module that
+      detects installed packages and newer versions available in the official
+      repositories using the native **libalpm** library. It reads the local
+      package database for installed packages, registers the sync repositories
+      from the `[repo]` sections of `pacman.conf` (nothing is hard-coded), and
+      uses `alpm_sync_get_new_version()` — the same libalpm call `pacman -Qu`
+      uses — so package versions are compared with libalpm's **native version
+      comparison** (epoch/version/release/pre-release), never string
+      comparison. The result is structured data (`PackageUpdate` /
+      `PackageUpdateSummary`), not parsed terminal output. The manager also
+      counts **foreign packages** (installed locally but absent from every
+      sync repository — e.g. manually built, local, or AUR packages) without
+      ever guessing their source, and detects an AUR helper (`yay`/`paru`) on
+      PATH for display only. **This step is detection and presentation only**:
+      the package manager never installs, upgrades, removes, or synchronises
+      package databases, never runs `pacman -Syu` / `yay -Syu` / `paru -Syu`,
+      never executes AUR helpers, never needs root, never requests a password,
+      and never runs `system()` / `popen()`. Recent official releases are
+      found in already-downloaded sync metadata, so the check is **offline and
+      read-only**; results are cached until the next explicit refresh. A
+      `## PACKAGE UPDATES` section appears in the live view and `p` (then
+      Enter) opens the update page with **Refresh**, **View Details** and
+      **Search/Filter** actions under the already-fetched update list (no full
+      repository search engine yet). On non-Arch distributions the section
+      reports "Not supported on this distribution" and the rest of the task
+      manager keeps working.
+
 ### Planned
 
 - [ ] Process tree — interactive expand/collapse (deferred to the GUI)
-- [ ] Arch Linux package/update information
+- [ ] Package installation / removal / upgrade actions (future step, with
+      explicit user confirmation and privilege handling)
 - [ ] GUI
 
 ## Technology
@@ -205,11 +233,14 @@ feature per milestone, hosted on GitHub.
 - Build system: **CMake** (works for both Debug and Release)
 - Compiler: **g++** (`GCC`)
 - OS interfaces: the `/proc` and `/sys` filesystems, `statvfs(2)`,
-  `sysconf(3)`, the standard `std::filesystem` API, and systemd's D-Bus API
-  (`sd-bus`/`libsystemd`)
-- Standard library plus `libsystemd` (the only third-party dependency; it
-  provides the `sd-bus` D-Bus client used for both systemd service management
-  **and** `org.freedesktop.Notifications` desktop notifications)
+  `sysconf(3)`, the standard `std::filesystem` API, systemd's D-Bus API
+  (`sd-bus`/`libsystemd`), and **libalpm** (the native Arch Linux package
+  management library)
+- Standard library plus two libraries: `libsystemd` (the `sd-bus` D-Bus client
+  used for both systemd service management **and**
+  `org.freedesktop.Notifications` desktop notifications) and `libalpm` (the
+  same library that powers `pacman`, used for official repository update
+  detection)
 - No shelling out to external tools
 
 ## Build on Arch Linux
@@ -217,13 +248,15 @@ feature per milestone, hosted on GitHub.
 Requirements:
 
 ```bash
-sudo pacman -S base-devel cmake systemd-libs
+sudo pacman -S base-devel cmake systemd-libs pacman
 ```
 
 `base-devel` provides `g++`; `cmake` provides the build tooling; `systemd-libs`
 provides the `libsystemd`/`sd-bus` D-Bus client used for systemd service
-management (it is present by default on any Arch Linux system that boots
-with systemd).
+management and desktop notifications (present by default on any Arch Linux
+system that boots with systemd); `pacman` provides **libalpm**, the native
+Arch package-management library used for official repository update detection
+(also present by default).
 
 Configure and build:
 
@@ -407,6 +440,7 @@ Sensor detail: press 's' (then Enter) to inspect a sensor
 Systemd services: press 'u' (then Enter) to manage services
 Startup apps: press 'a' (then Enter) to manage autostart
 System info: press 'y' (then Enter) for the hardware overview
+Package updates: press 'p' (then Enter) to manage updates
 Updating every 1 second...
 ```
 
@@ -436,6 +470,7 @@ While it runs you can switch views at any time (then Enter):
 - `r` — toggle the `## RESOURCE HISTORY` graphs on/off (list view only)
 - `f` — cycle the recent-alerts filter (list view only)
 - `n` — toggle desktop notifications on/off (list view only)
+- `p` — open the package update page: refresh, view details, search (list view only)
 
 ### Sorting
 
@@ -1866,6 +1901,94 @@ native popup, subject to the in-memory `NotificationSettings`:
 - A **per-source cooldown** (60 s by default) suppresses repeat popups.
 - If no notification daemon is running, notifications are silently skipped and
   the in-app alert dashboard keeps working.
+
+## Arch Linux Package Update Detection
+
+The `PackageManager` module reports which installed packages have a newer
+version available in the configured official repositories. It is a pure
+**detection and presentation** module.
+
+### Important scope
+
+> The package manager currently performs update detection only. It does not
+> automatically install or upgrade packages.
+
+It never runs `pacman -Syu` / `pacman -Su` / `yay -Syu` / `paru -Syu`, never
+installs or removes packages, never executes AUR helpers, never uses `system()` /
+`popen()`, never uses `sudo`, and never requests a password.
+
+### libalpm integration
+
+All official-repository data comes from **libalpm**, the same native C library
+that powers `pacman` itself. The local database (`/var/lib/pacman/local`) is
+read for the installed package record; the sync repositories listed in
+`pacman.conf` are registered with `alpm_register_syncdb()`. Two facts make the
+check offline and non-destructive:
+
+- `alpm_sync_get_new_version()` compares each installed package against the
+  **already-downloaded** sync metadata — exactly what `pacman -Qu` does — so
+  no network access and no repository synchronisation is required.
+- Version comparison uses libalpm's own implementation (epoch/version/
+  release/pre-release handling), never plain string comparison.
+
+No `pacman` output is parsed anywhere. The rounded result is structured data:
+`PackageUpdate` and `PackageUpdateSummary`.
+
+### Refresh behaviour
+
+- Detection is performed **once at startup** (a read-only local check that does
+  not touch or modify any package database) and then **only on demand**.
+- Press `p` (then Enter) to open the package update page and choose **Refresh**
+  to re-scan. Results are cached until the next explicit refresh; the module is
+  never polled by the monitoring loop.
+- Reading databases through libalpm does **not** hold a pacman database lock,
+  so normal `pacman` usage in other terminals keeps working while the Task
+  Manager is open.
+
+### Distribution detection
+
+`/etc/os-release` (`ID`, `ID_LIKE`, `PRETTY_NAME`) determines whether the
+system is Arch or Arch-derived. On any other distribution the update section
+shows:
+
+```text
+Package update manager:
+Not supported on this distribution
+```
+
+and the rest of the Task Manager keeps running normally. `lsb_release`,
+`hostnamectl`, `neofetch`, and `fastfetch` are never executed.
+
+### AUR and foreign packages
+
+- **AUR**: isolated behind the `AurProvider` interface (`YayProvider`/
+  `ParuProvider`/`None` are possible implementations; the default is
+  `NoneAurProvider`, which never executes a helper). If `yay` or `paru` is on
+  `PATH` it is detected for display only ("AUR helper detected: yay"). AUR
+  checking is an explicit, infrequent, read-only operation — never every
+  monitoring tick.
+- **Foreign** packages (installed locally but absent from every sync
+  repository — e.g. manually built or local packages) are counted and shown as
+  `Foreign Packages: N`. They are **not** automatically classified as AUR.
+
+### Permissions
+
+Package detection requires no root privileges and never asks for a password.
+Installation/removal/upgrade actions are intentionally left out of this step.
+
+### UI
+
+The live view shows a `## PACKAGE UPDATES` section (summary counts and a capped
+table) and the `p` page provides **Refresh**, **View Details** and
+**Search/Filter** actions. Search only filters the already-fetched update list;
+there is no full-repository search engine.
+
+### Errors
+
+Database-unavailable, sync-database-missing, corrupt metadata, unsupported
+distribution, and network-independent failures are shown inline
+(e.g. "Unable to check for updates. Reason: Package database is unavailable.")
+without crashing the Task Manager.
 
 ## License
 
