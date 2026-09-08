@@ -94,6 +94,14 @@ void HistoryManager::clearAll() {
   }
 }
 
+void HistoryManager::setMaxSamples(std::size_t max_samples) {
+  max_samples_ = max_samples;
+  clearAll();
+  // Rebuild per-device histories seeded by the next update() call.
+  gpus_.clear();
+  sensors_.clear();
+}
+
 void HistoryManager::update(
     double cpu_usage, double memory_usage, double used_ram_kib,
     double available_ram_kib, double swap_usage, double disk_read_bps,

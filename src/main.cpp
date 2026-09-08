@@ -28,6 +28,7 @@
 #include "format_bytes.hpp"
 #include "gpu_monitor.hpp"
 #include "history_manager.hpp"
+#include "logger.hpp"
 #include "memory_monitor.hpp"
 #include "network_monitor.hpp"
 #include "notification_manager.hpp"
@@ -39,6 +40,9 @@
 #include "process_tree.hpp"
 #include "resource_history.hpp"
 #include "sensor_monitor.hpp"
+#include "settings.hpp"
+#include "settings_apply.hpp"
+#include "settings_manager.hpp"
 #include "startup_manager.hpp"
 #include "system_info.hpp"
 #include "systemd_manager.hpp"
@@ -83,7 +87,6 @@ AlertFilter nextAlertFilter(AlertFilter filter) {
   return AlertFilter::All;
 }
 
-constexpr std::chrono::seconds kRefreshInterval{1};
 constexpr int kPercentPrecision = 1;
 constexpr int kPercentWidth = 5;
 constexpr int kLabelWidth = 21;
@@ -126,6 +129,14 @@ std::string formatPercent(double percent) {
   std::ostringstream out;
   out << std::fixed << std::setprecision(kPercentPrecision)
       << std::setw(kPercentWidth) << percent;
+  return out.str();
+}
+
+/// Formats the runtime refresh interval (milliseconds) as seconds ("1.0 s").
+std::string formatRefreshInterval(int refresh_interval_ms) {
+  std::ostringstream out;
+  out << std::fixed << std::setprecision(1)
+      << (refresh_interval_ms / 1000.0) << " s";
   return out.str();
 }
 
@@ -1678,7 +1689,8 @@ std::string renderProcessDetails(const atm::ProcessDetailsInfo &info) {
 /// Renders the process-tree view (banner + summary + tree + tree stats +
 /// footer). Each frame is a self-contained 1 s snapshot.
 std::string renderTreeFrame(double cpu_usage, const atm::MemoryInfo &memory,
-                            const atm::ProcessTree &tree) {
+                            const atm::ProcessTree &tree,
+                            int refresh_interval_ms) {
   std::ostringstream out;
   renderHeader(out, cpu_usage, memory);
   out << "\n## PROCESS TREE\n\n"
@@ -1690,7 +1702,8 @@ std::string renderTreeFrame(double cpu_usage, const atm::MemoryInfo &memory,
       << "View: [l] Process List  [t] Process Tree (current: Tree)\n"
       << "Tree order: PID ascending\n"
       << "Manage: press 'm' (then Enter) to control a process by PID\n"
-      << "Updating every " << kRefreshInterval.count() << " second...\n";
+      << "Updating every " << formatRefreshInterval(refresh_interval_ms)
+      << "...\n";
   return out.str();
 }
 
@@ -1716,11 +1729,12 @@ std::string renderFrame(double cpu_usage, const atm::MemoryInfo &memory,
                          atm::ServiceSort service_sort,
                          const std::string &startup_search,
                          atm::StartupSort startup_sort,
-                         const atm::PackageManager &packages) {
+                         const atm::PackageManager &packages,
+                         int refresh_interval_ms) {
   if (view == ViewMode::Tree) {
     // The tree view stays deliberately focused on the hierarchy; the storage
     // and network sections are part of the table view.
-    return renderTreeFrame(cpu_usage, memory, tree);
+    return renderTreeFrame(cpu_usage, memory, tree, refresh_interval_ms);
   }
 
   std::ostringstream out;
@@ -1756,11 +1770,13 @@ std::string renderFrame(double cpu_usage, const atm::MemoryInfo &memory,
       << "Network detail: press 'i' (then Enter) to inspect an interface\n"
       << "GPU detail: press 'g' (then Enter) to inspect a GPU\n"
       << "Sensor detail: press 's' (then Enter) to inspect a sensor\n"
-      << "Systemd services: press 'u' (then Enter) to manage services\n"
-<< "Startup apps: press 'a' (then Enter) to manage autostart\n"
+<< "Systemd services: press 'u' (then Enter) to manage services\n"
+       << "Startup apps: press 'a' (then Enter) to manage autostart\n"
        << "System info: press 'y' (then Enter) for the hardware overview\n"
        << "Package updates: press 'p' (then Enter) to manage updates\n"
-      << "Updating every " << kRefreshInterval.count() << " second...\n";
+       << "Settings: press 'o' (then Enter) to change configuration\n"
+       << "Updating every " << formatRefreshInterval(refresh_interval_ms)
+       << "...\n";
   return out.str();
 }
 
@@ -1784,7 +1800,8 @@ void renderView(double cpu_usage, const atm::MemoryInfo &memory,
                  atm::ServiceSort service_sort,
                  const std::string &startup_search,
                  atm::StartupSort startup_sort,
-                 const atm::PackageManager &packages) {
+                 const atm::PackageManager &packages,
+                 int refresh_interval_ms) {
   // ANSI "clear entire screen" + "cursor to home" so the multi-line frame
   // refreshes in place instead of scrolling the terminal.
   std::cout << "\033[2J\033[H";
@@ -1792,7 +1809,7 @@ void renderView(double cpu_usage, const atm::MemoryInfo &memory,
                            disk, network, gpu, sensors, systemd, startup,
                            sysinfo, history, show_history, alerts, alert_filter,
                            service_search, service_sort, startup_search,
-                           startup_sort, packages)
+                           startup_sort, packages, refresh_interval_ms)
             << std::flush;
 }
 
@@ -1857,6 +1874,7 @@ class ConsoleInput {
     InspectStartup,
     InspectSystemInfo,
     InspectPackages,
+    InspectSettings,
     ToggleHistory,
     ToggleAlertFilter,
     ToggleNotifications,
@@ -1961,6 +1979,7 @@ class ConsoleInput {
     if (token == "a" || token == "A") return Command::InspectStartup;
     if (token == "y" || token == "Y") return Command::InspectSystemInfo;
     if (token == "p" || token == "P") return Command::InspectPackages;
+    if (token == "o" || token == "O") return Command::InspectSettings;
     if (token == "r" || token == "R") return Command::ToggleHistory;
     if (token == "f" || token == "F") return Command::ToggleAlertFilter;
     if (token == "n" || token == "N") return Command::ToggleNotifications;
@@ -3188,6 +3207,8 @@ void interactPackageDetail(atm::PackageManager &packages,
               << packages.updates().size()
               << " updates (search: \"" << package_search << "\")\n";
   }
+  std::cout << "\nAutomatic package installation is disabled. Updates always "
+               "require explicit\nuser confirmation.\n";
   std::cout << "\nManagement:\n"
                "[1] Refresh (local check)\n"
                "[2] View Package Details\n"
@@ -3275,9 +3296,367 @@ void interactPackageDetail(atm::PackageManager &packages,
   static_cast<void>(input.readLine());
 }
 
+/// "yes"/"no" for display.
+std::string yesNo(bool value) { return value ? "yes" : "no"; }
+
+/// Prompts for a yes/no answer to `label`. Returns true when the user provided
+/// a new value (stored in `out`); false when unchanged or cancelled.
+bool promptBool(ConsoleInput &input, const std::string &label, bool current,
+                bool &out) {
+  std::cout << label << " [y/n, current: " << yesNo(current) << "]: "
+            << std::flush;
+  const std::optional<std::string> line = input.readLine();
+  if (!line) {
+    return false;
+  }
+  const std::string answer = trimWhitespace(*line);
+  if (answer.empty()) {
+    return false;
+  }
+  if (answer == "y" || answer == "Y" || answer == "yes" ||
+      answer == "Yes") {
+    out = true;
+    return true;
+  }
+  if (answer == "n" || answer == "N" || answer == "no" ||
+      answer == "No") {
+    out = false;
+    return true;
+  }
+  std::cout << "Invalid answer. ";
+  return promptBool(input, label, current, out);
+}
+
+/// Prompts for an integer in [lo, hi]. Empty input or EOF keeps the current
+/// value. Invalid values are rejected, never silently accepted.
+bool promptIntRange(ConsoleInput &input, const std::string &label, int current,
+                    int lo, int hi, int &out) {
+  for (;;) {
+    std::cout << label << " [" << lo << "-" << hi
+              << ", current: " << current << "]: " << std::flush;
+    const std::optional<std::string> line = input.readLine();
+    if (!line) {
+      return false;
+    }
+    const std::string answer = trimWhitespace(*line);
+    if (answer.empty()) {
+      return false;
+    }
+    char *end = nullptr;
+    errno = 0;
+    const long value = std::strtol(answer.c_str(), &end, 10);
+    if (errno == 0 && end != nullptr && *end == '\0' && value >= lo &&
+        value <= hi) {
+      out = static_cast<int>(value);
+      return true;
+    }
+    std::cout << "Invalid value (expected an integer in [" << lo << "-" << hi
+              << "]).\n";
+  }
+}
+
+/// Prompts for a double in [lo, hi]. Empty input or EOF keeps the current
+/// value. Invalid values are rejected, never silently accepted.
+bool promptDoubleRange(ConsoleInput &input, const std::string &label,
+                       double current, double lo, double hi, double &out) {
+  for (;;) {
+    std::cout << label << " [" << lo << "-" << hi
+              << ", current: " << current << "]: " << std::flush;
+    const std::optional<std::string> line = input.readLine();
+    if (!line) {
+      return false;
+    }
+    const std::string answer = trimWhitespace(*line);
+    if (answer.empty()) {
+      return false;
+    }
+    char *end = nullptr;
+    errno = 0;
+    const double value = std::strtod(answer.c_str(), &end);
+    if (errno == 0 && end != nullptr && *end == '\0' && value >= lo &&
+        value <= hi) {
+      out = value;
+      return true;
+    }
+    std::cout << "Invalid value (expected a number in [" << lo << "-" << hi
+              << "]).\n";
+  }
+}
+
+/// Prints one alert category's current values.
+void printAlertCategory(const char *name,
+                        const atm::cfg::AlertCategorySettings &cat) {
+  std::cout << "  " << name << ": "
+            << (cat.enabled ? "enabled" : "disabled")
+            << " (warning " << cat.warning << ", critical " << cat.critical
+            << ")\n";
+}
+
+/// Edits one alert category in-place, rejecting warning >= critical.
+void editAlertCategory(atm::cfg::AlertCategorySettings &cat,
+                       const std::string &name, double warn_max,
+                       double crit_max, ConsoleInput &input) {
+  std::cout << "\n--- " << name << " ---\n";
+  bool enabled = cat.enabled;
+  if (promptBool(input, "Alerts enabled", enabled, enabled)) {
+    cat.enabled = enabled;
+  }
+  double warning = cat.warning;
+  if (promptDoubleRange(input, "Warning threshold", warning, 0.0, warn_max,
+                        warning)) {
+    if (warning >= cat.critical) {
+      std::cout << "Warning must be lower than the critical threshold ("
+                << cat.critical << "). Not changed.\n";
+    } else {
+      cat.warning = warning;
+    }
+  }
+  double critical = cat.critical;
+  if (promptDoubleRange(input, "Critical threshold", critical, 0.0, crit_max,
+                        critical)) {
+    if (cat.warning >= critical) {
+      std::cout << "Critical must be higher than the warning threshold ("
+                << cat.warning << "). Not changed.\n";
+    } else {
+      cat.critical = critical;
+    }
+  }
+}
+
+void editGeneral(atm::cfg::SettingsManager &settings, ConsoleInput &input) {
+  atm::cfg::AppSettings next = settings.settings();
+  std::cout << "\n--- General ---\n";
+  int refresh = next.general.refresh_interval_ms;
+  if (promptIntRange(input, "Refresh interval (ms)", refresh,
+                     atm::cfg::kMinRefreshIntervalMs,
+                     atm::cfg::kMaxRefreshIntervalMs, refresh)) {
+    next.general.refresh_interval_ms = refresh;
+  }
+  std::cout << "Default page [1] Process List [2] Process Tree"
+            << " (current: " << next.general.default_page << "): "
+            << std::flush;
+  const std::optional<std::string> page_line = input.readLine();
+  if (page_line) {
+    const std::string choice = trimWhitespace(*page_line);
+    if (choice == "2" || choice == "tree" || choice == "Tree") {
+      next.general.default_page = "tree";
+    } else if (choice == "1" || choice == "list" || choice == "List") {
+      next.general.default_page = "list";
+    }
+  }
+  settings.updateSettings(next);
+}
+
+void editHistory(atm::cfg::SettingsManager &settings, ConsoleInput &input) {
+  atm::cfg::AppSettings next = settings.settings();
+  std::cout << "\n--- History ---\n";
+  int duration = next.history.history_duration_seconds;
+  if (promptIntRange(input, "History duration (seconds)", duration,
+                     atm::cfg::kMinHistoryDurationSeconds,
+                     atm::cfg::kMaxHistoryDurationSeconds, duration)) {
+    next.history.history_duration_seconds = duration;
+  }
+  int max_samples = next.history.max_samples;
+  if (promptIntRange(input, "Maximum samples (bounded)", max_samples,
+                     atm::cfg::kMinHistorySamples, atm::cfg::kMaxHistorySamples,
+                     max_samples)) {
+    next.history.max_samples = max_samples;
+  }
+  int interval = next.history.sample_interval_ms;
+  if (promptIntRange(input, "Sampling interval (ms, informational)", interval,
+                     atm::cfg::kMinSampleIntervalMs,
+                     atm::cfg::kMaxSampleIntervalMs, interval)) {
+    next.history.sample_interval_ms = interval;
+  }
+  settings.updateSettings(next);
+}
+
+void editAlerts(atm::cfg::SettingsManager &settings, ConsoleInput &input) {
+  atm::cfg::AppSettings next = settings.settings();
+  std::cout << "\n--- Alerts ---\n";
+  editAlertCategory(next.alerts.cpu, "CPU usage",
+                    atm::cfg::kMaxPercentThreshold,
+                    atm::cfg::kMaxPercentThreshold, input);
+  editAlertCategory(next.alerts.memory, "Memory usage",
+                    atm::cfg::kMaxPercentThreshold,
+                    atm::cfg::kMaxPercentThreshold, input);
+  editAlertCategory(next.alerts.swap, "Swap usage",
+                    atm::cfg::kMaxPercentThreshold,
+                    atm::cfg::kMaxPercentThreshold, input);
+  editAlertCategory(next.alerts.disk, "Disk capacity",
+                    atm::cfg::kMaxPercentThreshold,
+                    atm::cfg::kMaxPercentThreshold, input);
+  editAlertCategory(next.alerts.temperature, "Temperature (Celsius)",
+                    atm::cfg::kMaxTemperatureWarning,
+                    atm::cfg::kMaxTemperatureCritical, input);
+  int hysteresis = next.alerts.recovery_hysteresis;
+  if (promptIntRange(input,
+                     "Recovery hysteresis (recovery = warning - hysteresis)",
+                     hysteresis, atm::cfg::kMinRecoveryHysteresis,
+                     atm::cfg::kMaxRecoveryHysteresis, hysteresis)) {
+    next.alerts.recovery_hysteresis = hysteresis;
+  }
+  settings.updateSettings(next);
+}
+
+void editNotifications(atm::cfg::SettingsManager &settings,
+                       ConsoleInput &input) {
+  atm::cfg::AppSettings next = settings.settings();
+  std::cout << "\n--- Notifications ---\n";
+  bool enabled = next.notifications.enabled;
+  if (promptBool(input, "Desktop notifications", enabled, enabled)) {
+    next.notifications.enabled = enabled;
+  }
+  bool warning = next.notifications.warning_notifications;
+  if (promptBool(input, "Warning notifications", warning, warning)) {
+    next.notifications.warning_notifications = warning;
+  }
+  bool critical = next.notifications.critical_notifications;
+  if (promptBool(input, "Critical notifications", critical, critical)) {
+    next.notifications.critical_notifications = critical;
+  }
+  bool recovery = next.notifications.recovery_notifications;
+  if (promptBool(input, "Recovery notifications", recovery, recovery)) {
+    next.notifications.recovery_notifications = recovery;
+  }
+  int cooldown = next.notifications.cooldown_seconds;
+  if (promptIntRange(input, "Notification cooldown (seconds)", cooldown,
+                     atm::cfg::kMinCooldownSeconds,
+                     atm::cfg::kMaxCooldownSeconds, cooldown)) {
+    next.notifications.cooldown_seconds = cooldown;
+  }
+  int timeout = next.notifications.timeout_ms;
+  if (promptIntRange(input, "Notification timeout (ms)", timeout,
+                     atm::cfg::kMinNotificationTimeoutMs,
+                     atm::cfg::kMaxNotificationTimeoutMs, timeout)) {
+    next.notifications.timeout_ms = timeout;
+  }
+  settings.updateSettings(next);
+}
+
+void editPackages(atm::cfg::SettingsManager &settings, ConsoleInput &input) {
+  atm::cfg::AppSettings next = settings.settings();
+  std::cout << "\n--- Packages ---\n";
+  bool check = next.packages.check_for_updates;
+  if (promptBool(input, "Check for package updates at startup", check,
+                 check)) {
+    next.packages.check_for_updates = check;
+  }
+  std::cout << "\nAutomatic package installation is disabled. Updates always "
+               "require\nexplicit user confirmation in the package page.\n";
+  settings.updateSettings(next);
+}
+
+/// Blocking settings page. Editing happens in memory; changes are validated by
+/// the SettingsManager, applied to the running components, and saved when the
+/// user leaves the page. All changes apply without a restart.
+void interactSettings(atm::cfg::SettingsManager &settings,
+                      int &refresh_interval_ms,
+                      atm::HistoryManager &history,
+                      atm::AlertManager &alerts,
+                      atm::NotificationManager &notifications,
+                      ConsoleInput &input) {
+  for (;;) {
+    const atm::cfg::AppSettings &s = settings.settings();
+    std::cout << "\033[2J\033[H";
+    std::cout << "========================================\n"
+                 "ARCH TASK MANAGER — Settings\n"
+                 "========================================\n\n"
+                 "Configuration file:\n  "
+              << settings.configPath().string()
+              << "\n  (format v" << s.config_version << ")\n\n"
+              << "General:\n"
+              << "  Refresh interval: " << s.general.refresh_interval_ms
+              << " ms\n"
+              << "  Default page: " << s.general.default_page << "\n"
+              << "\nHistory:\n"
+              << "  Retention: " << s.history.history_duration_seconds
+              << " s (max " << s.history.max_samples << " samples, sampled "
+              << "every " << s.history.sample_interval_ms << " ms)\n"
+              << "\nAlerts:\n";
+    printAlertCategory("CPU", s.alerts.cpu);
+    printAlertCategory("Memory", s.alerts.memory);
+    printAlertCategory("Swap", s.alerts.swap);
+    printAlertCategory("Disk", s.alerts.disk);
+    printAlertCategory("Temperature", s.alerts.temperature);
+    std::cout << "  Recovery hysteresis: " << s.alerts.recovery_hysteresis
+              << "\n"
+              << "\nNotifications:\n"
+              << "  Enabled: " << yesNo(s.notifications.enabled) << "\n"
+              << "  Warning notifications: "
+              << yesNo(s.notifications.warning_notifications) << "\n"
+              << "  Critical notifications: "
+              << yesNo(s.notifications.critical_notifications) << "\n"
+              << "  Recovery notifications: "
+              << yesNo(s.notifications.recovery_notifications) << "\n"
+              << "  Cooldown: " << s.notifications.cooldown_seconds << " s\n"
+              << "  Timeout: " << s.notifications.timeout_ms << " ms\n"
+              << "\nPackages:\n"
+              << "  Check for updates at startup: "
+              << yesNo(s.packages.check_for_updates) << "\n"
+              << "\nAutomatic package installation is disabled. Updates always "
+                 "require\nexplicit user confirmation.\n"
+              << "\nManagement:\n"
+              << "[1] Edit General\n"
+              << "[2] Edit History\n"
+              << "[3] Edit Alerts\n"
+              << "[4] Edit Notifications\n"
+              << "[5] Edit Packages\n"
+              << "[6] Reset to Defaults\n"
+              << "[0] Back (save changes)\n\n"
+              << "Changes apply immediately; settings are saved when you leave "
+                 "this page.\n"
+              << "Select action: " << std::flush;
+
+    const std::optional<std::string> line = input.readLine();
+    if (!line) {
+      break;
+    }
+    const std::string choice = trimWhitespace(*line);
+    if (choice.empty() || choice == "0") {
+      break;
+    }
+    if (choice == "1") {
+      editGeneral(settings, input);
+    } else if (choice == "2") {
+      editHistory(settings, input);
+    } else if (choice == "3") {
+      editAlerts(settings, input);
+    } else if (choice == "4") {
+      editNotifications(settings, input);
+    } else if (choice == "5") {
+      editPackages(settings, input);
+    } else if (choice == "6") {
+      if (confirm("Reset all settings to defaults?", input)) {
+        settings.resetToDefaults();
+      }
+    } else {
+      std::cout << "Invalid action.\n";
+    }
+    std::this_thread::sleep_for(300ms);
+  }
+
+  // Leaving the page: persist any pending changes, then apply them to the
+  // running components. The monitoring loop picks up the new refresh interval
+  // on its next cycle.
+  if (settings.isDirty()) {
+    settings.save();
+  }
+  atm::cfg::applySettingsToRuntime(settings.settings(), refresh_interval_ms,
+                                   history, alerts, notifications);
+}
+
 }  // namespace
 
 int main() {
+  // --- Configuration is loaded first so every component below can be
+  // --- constructed with the user's preferences.
+  atm::cfg::SettingsManager settings;
+  if (!settings.load()) {
+    atm::Logger::warn("Continuing with default settings");
+  }
+  int refresh_interval_ms = settings.settings().general.refresh_interval_ms;
+
   atm::CpuMonitor cpu_monitor;
   atm::MemoryMonitor memory_monitor;
   atm::ProcessMonitor process_monitor;
@@ -3290,23 +3669,34 @@ int main() {
   atm::SystemInfoProvider system_info;
   atm::ProcessActions actions;
   atm::ProcessDetails process_details;
-  atm::HistoryManager history;
+  atm::HistoryManager history(
+      static_cast<std::size_t>(settings.settings().history.max_samples));
   atm::AlertManager alerts;
   atm::NotificationManager notifications;
   atm::PackageManager packages;
   atm::PackageTransaction package_transaction;
   ConsoleInput input;
 
+  // Apply the loaded settings to the runtime components and to the main loop.
+  atm::cfg::applySettingsToRuntime(settings.settings(), refresh_interval_ms,
+                                   history, alerts, notifications);
+
   // Forward alert state transitions to desktop notifications.
   g_notification_manager = &notifications;
   alerts.setNotificationSink(&onAlertEvent);
 
   // Prepare package update detection: Arch detection + libalpm are opened at
-  // startup, then one read-only local check is performed. This only inspects
-  // the local package database and sync metadata already present on disk; it
-  // never synchronises repositories or touches the network.
+  // startup, then one read-only local check is performed when enabled in
+  // settings. This only inspects the local package database and sync metadata
+  // already present on disk; it never synchronises repositories or touches the
+  // network. The check never installs or upgrades anything.
   packages.initialize();
-  packages.refresh();
+  if (settings.settings().packages.check_for_updates) {
+    packages.refresh();
+  } else {
+    atm::Logger::info("Package update checking is disabled in settings; use "
+                      "the 'p' page for a manual check");
+  }
   package_transaction.initialize();
 
   atm::ProcessSort sort = atm::ProcessSort::Cpu;
@@ -3319,15 +3709,26 @@ int main() {
   bool show_history = true;
   AlertFilter alert_filter = AlertFilter::All;
 
-  // Choose the starting view. EOF (e.g. /dev/null stdin) defaults to List.
+  // Choose the starting view. EOF (e.g. /dev/null stdin) defaults to the
+  // configured default page. "1"/"2" always win over the setting.
   std::cout << "Select view:\n"
                "[1] Process List\n"
                "[2] Process Tree\n\n"
-               "Enter a number, or press Enter for the default (Process List):\n> "
+               "Enter a number, or press Enter for the default ("
+            << (settings.settings().general.default_page == "tree"
+                    ? "Process Tree"
+                    : "Process List")
+            << "):\n> "
             << std::flush;
   const std::optional<std::string> view_choice = input.readLine();
-  if (view_choice && trimWhitespace(*view_choice) == "2") {
-    view = ViewMode::Tree;
+  if (view_choice) {
+    std::string choice = trimWhitespace(*view_choice);
+    if (choice.empty()) {
+      choice = settings.settings().general.default_page;
+    }
+    if (choice == "2" || choice == "tree" || choice == "Tree") {
+      view = ViewMode::Tree;
+    }
   }
 
   // Baseline samples so the first printed frame already shows real deltas:
@@ -3341,7 +3742,7 @@ int main() {
   sensor_monitor.discover();
   static_cast<void>(sensor_monitor.read());
   systemd_manager.discover();
-  std::this_thread::sleep_for(kRefreshInterval);
+  std::this_thread::sleep_for(std::chrono::milliseconds(refresh_interval_ms));
 
   const auto first_cpu = cpu_monitor.readUsage();
   if (!first_cpu.has_value()) {
@@ -3392,7 +3793,7 @@ int main() {
              sort, view, tree, first_disk, first_network, first_gpu,
              first_sensors, first_systemd, first_startup, sysinfo, history,
              show_history, alerts, alert_filter, service_search, service_sort,
-             startup_search, startup_sort, packages);
+             startup_search, startup_sort, packages, refresh_interval_ms);
 
   atm::NetworkSnapshot network = first_network;
   atm::GpuSnapshot gpu = first_gpu;
@@ -3401,7 +3802,9 @@ int main() {
   atm::StartupSnapshot startup = first_startup;
 
   for (;;) {
-    std::this_thread::sleep_for(kRefreshInterval);
+    // The refresh interval is re-read every cycle so a change made on the
+    // settings page takes effect on the next monitoring tick.
+    std::this_thread::sleep_for(std::chrono::milliseconds(refresh_interval_ms));
 
     switch (input.pollCommand()) {
       case ConsoleInput::Command::SortCpu:
@@ -3465,7 +3868,8 @@ int main() {
                        sort, view, tree, disk, network, gpu, sensors,
                        systemd, startup, sysinfo, history, show_history,
                        alerts, alert_filter, service_search, service_sort,
-                       startup_search, startup_sort, packages);
+                       startup_search, startup_sort, packages,
+                       refresh_interval_ms);
           }
         }
         continue;
@@ -3516,6 +3920,12 @@ int main() {
                                 package_search);
         }
         break;
+      case ConsoleInput::Command::InspectSettings:
+        if (view == ViewMode::List) {
+          interactSettings(settings, refresh_interval_ms, history, alerts,
+                           notifications, input);
+        }
+        break;
       case ConsoleInput::Command::ToggleHistory:
         show_history = !show_history;
         break;
@@ -3523,7 +3933,16 @@ int main() {
         alert_filter = nextAlertFilter(alert_filter);
         break;
       case ConsoleInput::Command::ToggleNotifications:
-        notifications.settings().enabled = !notifications.settings().enabled;
+        // Keep the settings manager (single source of truth) and the runtime
+        // notification manager in sync; the change is saved on exit.
+        {
+          atm::cfg::AppSettings next = settings.settings();
+          next.notifications.enabled = !next.notifications.enabled;
+          settings.updateSettings(next);
+          atm::cfg::applySettingsToRuntime(
+              settings.settings(), refresh_interval_ms, history, alerts,
+              notifications);
+        }
         break;
       case ConsoleInput::Command::None:
         break;
@@ -3572,6 +3991,12 @@ int main() {
     renderView(*cpu, *memory, snapshot.processes, snapshot.stats, sort, view,
                tree, disk, network, gpu, sensors, systemd, startup, sysinfo,
                history, show_history, alerts, alert_filter, service_search,
-               service_sort, startup_search, startup_sort, packages);
+               service_sort, startup_search, startup_sort, packages,
+               refresh_interval_ms);
+  }
+
+  // Clean shutdown: persist any pending settings changes.
+  if (settings.isDirty()) {
+    settings.save();
   }
 }

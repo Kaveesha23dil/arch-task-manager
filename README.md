@@ -5,12 +5,13 @@ Linux. It reads system information **directly from Linux interfaces** such as
 `/proc/stat`, `/proc/meminfo`, and `/proc/<pid>/` — no shelling out to `ps`,
 `free`, `top`, `htop`, or other external tools.
 
-> Stage: **Step 17** — CPU, RAM, swap, process monitoring, process actions, the
+> Stage: **Step 19** — CPU, RAM, swap, process monitoring, process actions, the
 > process tree, disk/storage monitoring, network monitoring, GPU monitoring,
 > temperature & hardware sensor monitoring, systemd service management,
 > startup application management, system information / hardware overview,
 > real-time resource history & graphs, resource alerts & threshold monitoring,
-> desktop notifications via D-Bus, and Arch Linux package update detection.
+> desktop notifications via D-Bus, Arch Linux package update detection, and
+> application settings with persistent configuration.
 > Everything else on the roadmap is intentionally **not** implemented yet, but
 > the code is structured so future modules can be added without rewriting the
 > existing ones.
@@ -189,8 +190,10 @@ feature per milestone, hosted on GitHub.
       prevents spam even if the underlying metric keeps transitioning. If the
       D-Bus notification service is unavailable the call is a no-op and the
       in-app alert dashboard keeps working — the process never crashes over a
-      missing notification daemon. Settings are held in memory only (no
-      persistent configuration yet); no sound, email, SMS, cloud, or
+      missing notification daemon. Notification preferences are persisted in
+      the application configuration (see
+      [Application settings](#application-settings--persistent-configuration))
+      and can be changed there; no sound, email, SMS, cloud, or
       persistent-storage features are implemented.
 
 - [x] **Arch Linux package update detection** — a `PackageManager` module that
@@ -219,6 +222,24 @@ feature per milestone, hosted on GitHub.
       repository search engine yet). On non-Arch distributions the section
       reports "Not supported on this distribution" and the rest of the task
       manager keeps working.
+
+- [x] **Application settings & persistent configuration** — a typed settings
+      model (`atm::cfg`) backed by a small, self-contained TOML-subset config
+      file written atomically to `~/.config/arch-task-manager/config.toml`
+      (or `$XDG_CONFIG_HOME/arch-task-manager/config.toml` when set). The file
+      stores the refresh interval, the default view, history depth, per-category
+      alert thresholds (warning/critical, plus a recovery hysteresis),
+      notification preferences, and whether startup package-update checks are
+      performed. Values are validated on load and every edit (out-of-range
+      values are clamped; a warning threshold at/above its critical threshold
+      resets the category to its defaults), and a malformed or unwritable file
+      never prevents the application from starting — it falls back to the
+      in-memory defaults. Simple migrations (a `config_version` key) run
+      transparently on load. Press `o` (then Enter) from the live view to change
+      the configuration; changes apply immediately and are written back to disk.
+      **No secrets, passwords, or credentials are ever stored**, and the
+      configuration can only *reduce* package automation (it can never enable an
+      automatic package installation or upgrade).
 
 ### Planned
 
@@ -471,6 +492,8 @@ While it runs you can switch views at any time (then Enter):
 - `f` — cycle the recent-alerts filter (list view only)
 - `n` — toggle desktop notifications on/off (list view only)
 - `p` — open the package update page: refresh, view details, search (list view only)
+- `o` — open the settings page: change refresh, view, history, alerts,
+  notifications and package-preference settings (list view only)
 
 ### Sorting
 
@@ -749,6 +772,159 @@ Zombie processes are reported with state `Z` / `Zombie`, malformed files are
 skipped, broken `/proc` links are shown as such, and none of these conditions
 ever crashes the application or spawns an extra thread or update loop.
 
+## Application Settings & Persistent Configuration
+
+Press `o` (then Enter) in the list view to open the settings page. It edits the
+application's persistent configuration, which is stored as a small
+**TOML-subset** file. Every section can be changed from the page, the changes
+take effect **immediately** (refresh interval, history depth, alert thresholds
+and notification preferences are re-applied on the spot), and they are written
+back to disk so they survive restarts.
+
+### Where the configuration lives
+
+The file is opened at the XDG standard location:
+
+| `$XDG_CONFIG_HOME` set | Path used                                            |
+| ---------------------- | ---------------------------------------------------- |
+| yes                    | `$XDG_CONFIG_HOME/arch-task-manager/config.toml`     |
+| no                     | `~/.config/arch-task-manager/config.toml`            |
+
+The home directory is always read from `$HOME` (never hard-coded), so the tool
+works for any user. On the very first run the file (and its parent directory)
+is created automatically with the defaults; if creation or writing fails the
+application simply keeps the in-memory defaults and continues running. Writes
+are **atomic**: the new content goes to `config.toml.tmp` in the same
+directory, is flushed and closed, then renamed over the old file (with
+permissions set to owner-only `0600` when possible), so a crash or power loss
+mid-write can never leave a half-written configuration.
+
+### Format and defaults
+
+```toml
+# Application settings for arch-task-manager
+config_version = 1
+
+[general]
+refresh_interval_ms = 1000      # main loop / sampling interval (100 - 10000 ms)
+default_page = "list"           # "list" or "tree" startup view
+
+[history]
+sample_interval_ms = 1000       # samples the ring buffers once per refresh (100 - 10000 ms)
+history_duration_seconds = 120  # target retention window (10 - 3600 s)
+max_samples = 120               # bounded ring-buffer capacity (10 - 3600 samples)
+
+[alerts]
+recovery_hysteresis = 5         # recovery = warning − hysteresis (0 - 50)
+
+[alerts.cpu]
+enabled = true
+warning = 80
+critical = 95
+
+[alerts.memory]
+enabled = true
+warning = 80
+critical = 95
+
+[alerts.swap]
+enabled = true
+warning = 70
+critical = 90
+
+[alerts.disk]
+enabled = true
+warning = 85
+critical = 95
+
+[alerts.temperature]
+enabled = true
+warning = 75
+critical = 90
+
+[notifications]
+enabled = false
+warning_notifications = false
+critical_notifications = true
+recovery_notifications = false
+cooldown_seconds = 60
+timeout_ms = 10000
+
+[packages]
+check_for_updates = true        # only gates the startup update check
+```
+
+Alert percentages use a 0–100 scale; temperature thresholds are in degrees
+Celsius. Every category's recovery threshold is derived automatically as
+`warning − recovery_hysteresis` (never stored separately), preserving the
+hysteresis behavior described in the alerts section.
+
+### Validation and repair
+
+A layered strategy keeps the running configuration valid at all times:
+
+1. **On load** every value is range-checked and type-checked. A malformed
+   `config_version` simply resets to defaults; an out-of-range value is clamped
+   to the nearest legal limit; an unknown key, section or wrong type is logged
+   and ignored. A file that yields nothing readable (or cannot be read) falls
+   back to the defaults — the application **never fails to start** because of a
+   bad configuration.
+2. **On edit** (from the `o` page) values are range-checked as they are typed
+   and again before saving. Invalid ranges are rejected at the prompt.
+3. **On writing** the whole model is re-validated and repaired before it is
+   serialized, and the `config_version` is stamped so future versions can
+   migrate format changes automatically.
+
+A warning threshold that is **at or above** its critical threshold is
+specifically repaired by resetting that category to its default values — a
+warning above a critical is meaningless and would break the alert state
+machine.
+
+### Per-preference edits from the `o` page
+
+The settings menu (`[1]`–`[6]`, `[0]` to save/back) mirrors the file:
+
+- **`[1] General** — refresh interval (the whole frame rate of the app) and the
+  default startup page.
+- **`[2] History** — how many seconds of history to retain (changes the ring
+  buffer capacity, which is bounded, so memory use stays constant regardless of
+  the chosen depth). Reducing the depth clears the graphs and they rebuild at
+  the new size.
+- **`[3] Alerts** — per-category enable/disable and warning/critical values.
+- **`[4] Notifications** — enable/disable desktop notifications, decide which
+  severities pop up (warning/critical/recovery), the per-source cooldown and
+  the popup timeout. This is the same state toggled live by `n` — pending
+  in-memory edits are discarded when you open the page.
+- **`[5] Packages** — whether the application performs its read-only startup
+  update check.
+- **`[6] Reset** — restore every value to the factory defaults (with
+  confirmation) and write them back immediately.
+
+Changes marked as pending are written to disk when you back out with `[0]`.
+
+### Security
+
+- **No secrets.** The configuration stores tuning values only — never
+  passwords, tokens, API keys, D-Bus credentials or AUR helper credentials.
+- **Privileges are never stored or remembered.** The application keeps its
+  "never auto-elevate, never ask for a password" stance; the settings page only
+  tunes monitoring/notification values.
+- **Package settings cannot increase automation.** `[packages]` contains only
+  the `check_for_updates` preference, which merely gates the startup update
+  *check*. There is no configuration option to auto-install, auto-upgrade,
+  auto-sync, run AUR helpers, or reboot — package updates always require
+  explicit user confirmation (see the package update section).
+
+### Testing
+
+The settings subsystem ships with a standalone test target
+(`settings-tests`, run via `ctest`). It covers defaults and validation
+(invalid and out-of-range values), TOML-subset round-tripping, reconciliation
+of broken values, clamping/relationship repair, first-launch creation,
+persistence across reloads, reset, XDG path selection, migration of
+unversioned files, graceful behaviour with unwritable locations, and the live
+application of settings to the alert/history/notification subsystems.
+
 ## Project structure
 
 ```text
@@ -774,9 +950,16 @@ arch-task-manager/
 │   ├── resource_history.hpp    # TimedSample + ResourceHistory<T> ring buffer + GraphRenderer
 │   ├── history_manager.hpp     # HistoryManager (owns all bounded history series)
 │   ├── alert_manager.hpp       # AlertManager, AlertType, AlertSeverity, AlertThreshold
+│   ├── notification_manager.hpp# NotificationManager + NotificationSettings (D-Bus popups)
+│   ├── package_manager.hpp     # PackageManager/PackageUpdate via libalpm (detection only)
+│   ├── package_transaction.hpp # PackageTransaction: safe download/install workflow
+│   ├── settings.hpp            # atm::cfg model: defaults, validation, clampAndFix, TOML-subset
+│   ├── settings_manager.hpp    # SettingsManager: XDG config.toml load/save/migrate (atomic)
+│   ├── settings_apply.hpp      # applySettingsToRuntime() → monitors/history/alerts/notifications
+│   ├── logger.hpp              # minimal thread-safe stderr logger
 │   └── format_bytes.hpp        # shared byte-formatter (KB/MB/GB, used by disk + network)
 ├── src/
-│   ├── main.cpp                # UI loop: frame rendering + 1 s refresh + control flow
+│   ├── main.cpp                # UI loop: frame rendering + N s refresh + control flow + settings page
 │   ├── cpu_monitor.cpp         # /proc/stat reading + utilization math
 │   ├── memory_monitor.cpp      # /proc/meminfo reading + memory/swap math
 │   ├── process_monitor.cpp     # /proc scanning + per-process parsing
@@ -792,7 +975,14 @@ arch-task-manager/
 │   ├── system_info.cpp         # gethostname/uname, os-release, cpuinfo, DMI read + caching
 │   ├── resource_history.cpp    # GraphRenderer: ASCII graph rendering + rate formatting
 │   ├── history_manager.cpp     # HistoryManager::update() feeds every ring buffer each refresh
-│   └── alert_manager.cpp       # AlertManager: threshold evaluation, state machine, history
+│   ├── alert_manager.cpp       # AlertManager: threshold evaluation, state machine, history
+│   ├── notification_manager.cpp# org.freedesktop.Notifications D-Bus delivery
+│   ├── package_manager.cpp     # libalpm local+sync DB diff, summary counts
+│   ├── package_transaction.cpp # libalpm transaction workflow (download/commit)
+│   ├── logger.cpp              # atm::Logger logging implementation
+│   ├── settings.cpp            # atm::cfg defaults/validation/serialization
+│   ├── settings_manager.cpp    # SettingsManager XDG load/save/migrate implementation
+│   └── settings_apply.cpp      # applySettingsToRuntime() implementation
 └── build/                      # generated; never committed to git
 ```
 
@@ -1768,7 +1958,8 @@ and sensor monitors — **it never reads `/proc` or `/sys` itself**.
 
 Disk activity and network throughput alerts are **disabled by default** since
 high throughput is not necessarily an error. All thresholds are configurable
-in memory; a future step will add persistent configuration files.
+in memory and are persisted to the application configuration file (see
+[Application settings](#application-settings--persistent-configuration)).
 
 ### State machine and hysteresis
 

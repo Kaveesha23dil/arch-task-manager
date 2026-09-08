@@ -48,6 +48,10 @@ class HistoryManager {
   /// Resets all history buffers.
   void clearAll();
 
+  /// Changes the number of samples kept and discards existing history (used
+  /// when the configured max_samples changes at runtime).
+  void setMaxSamples(std::size_t max_samples);
+
   /// Temporarily stops collecting samples. When resumed, no fake samples are
   /// created to fill the paused period.
   void setPaused(bool paused);
