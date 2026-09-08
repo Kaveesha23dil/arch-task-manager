@@ -72,6 +72,7 @@ int main() {
     CHECK(s.history.max_samples == 120);
     CHECK(s.alerts.cpu.warning < s.alerts.cpu.critical);
     CHECK(s.packages.check_for_updates);
+    CHECK(!s.general.autostart_enabled);  // autostart is off by default
   }
 
   run("serialize/parse round trip preserves values");
@@ -79,6 +80,7 @@ int main() {
     AppSettings s = AppSettings::defaults();
     s.general.refresh_interval_ms = 2500;
     s.general.default_page = "tree";
+    s.general.autostart_enabled = true;
     s.history.max_samples = 300;
     s.alerts.cpu.warning = 70.0;
     s.alerts.cpu.critical = 92.0;
@@ -93,6 +95,7 @@ int main() {
     CHECK(problems.empty());
     CHECK(parsed.general.refresh_interval_ms == 2500);
     CHECK(parsed.general.default_page == "tree");
+    CHECK(parsed.general.autostart_enabled);
     CHECK(parsed.history.max_samples == 300);
     CHECK_NEAR(parsed.alerts.cpu.warning, 70.0, 1e-6);
     CHECK_NEAR(parsed.alerts.cpu.critical, 92.0, 1e-6);
@@ -179,6 +182,7 @@ int main() {
       CHECK(manager.settings().validate().empty());
       AppSettings next = manager.settings();
       next.general.refresh_interval_ms = 2000;
+      next.general.autostart_enabled = true;
       manager.updateSettings(next);
       CHECK(manager.isDirty());
       CHECK(manager.save());
@@ -188,8 +192,24 @@ int main() {
       SettingsManager manager(path);
       manager.load();
       CHECK(manager.settings().general.refresh_interval_ms == 2000);
+      CHECK(manager.settings().general.autostart_enabled);  // survives reload
       CHECK(!manager.isDirty());
     }
+  }
+
+  run("reset restores the autostart preference to disabled");
+  {
+    const auto dir = makeTempDir();
+    SettingsManager manager(dir / "config.toml");
+    manager.load();
+    AppSettings next = manager.settings();
+    next.general.autostart_enabled = true;
+    manager.updateSettings(next);
+    CHECK(manager.settings().general.autostart_enabled);
+    manager.resetToDefaults();
+    CHECK(!manager.settings().general.autostart_enabled);
+    CHECK(manager.settings().validate().empty());
+    CHECK(manager.isDirty());
   }
 
   run("reset restores defaults and marks dirty");

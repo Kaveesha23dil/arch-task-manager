@@ -53,6 +53,7 @@ add_executable(arch-task-manager
   src/notification_manager.cpp
   src/package_manager.cpp
   src/package_transaction.cpp
+  src/app_autostart_manager.cpp
   src/logger.cpp
   src/settings.cpp
   src/settings_manager.cpp
@@ -87,3 +88,17 @@ target_include_directories(settings-tests PRIVATE ${SYSTEMD_INCLUDE_DIRS} ${ALPM
 target_link_directories(settings-tests PRIVATE ${SYSTEMD_LIBRARY_DIRS} ${ALPM_LIBRARY_DIRS})
 
 add_test(NAME settings COMMAND settings-tests)
+
+add_executable(autostart-tests
+  tests/autostart_tests.cpp
+  src/app_autostart_manager.cpp
+  src/logger.cpp
+  src/settings.cpp
+  src/settings_manager.cpp
+)
+
+target_include_directories(autostart-tests PRIVATE include)
+
+target_link_libraries(autostart-tests PRIVATE Threads::Threads)
+
+add_test(NAME autostart COMMAND autostart-tests)

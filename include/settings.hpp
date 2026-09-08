@@ -35,6 +35,7 @@ inline constexpr double kMaxTemperatureCritical = 150.0;
 struct GeneralSettings {
   int refresh_interval_ms = 1000;    // main loop cadence (default 1 s)
   std::string default_page = "list"; // starting page: "list" or "tree"
+  bool autostart_enabled = false;    // XDG desktop autostart (optional, off)
 };
 
 /// Resource-history settings.
