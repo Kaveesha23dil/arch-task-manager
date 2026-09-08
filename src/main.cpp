@@ -29,6 +29,7 @@
 #include "process_tree.hpp"
 #include "sensor_monitor.hpp"
 #include "startup_manager.hpp"
+#include "system_info.hpp"
 #include "systemd_manager.hpp"
 
 namespace {
@@ -69,6 +70,7 @@ constexpr std::size_t kStartupNameWidth = 26;
 constexpr std::size_t kStartupEnabledWidth = 10;
 constexpr std::size_t kStartupScopeWidth = 8;
 constexpr std::size_t kStartupDetailRuleWidth = 36;
+constexpr std::size_t kSysInfoDetailRuleWidth = 32;
 constexpr int kMinNice = -20;
 constexpr int kMaxNice = 19;
 
@@ -192,6 +194,94 @@ void renderMemorySections(std::ostringstream &out,
   appendLabeled(out, "Used:", formatKibibytes(memory.swapUsed()));
   appendLabeled(out, "Free:", formatKibibytes(memory.swap_free));
   appendLabeled(out, "Usage:", formatPercent(memory.swapUsagePercent()) + "%");
+}
+
+/// Renders the compact SYSTEM INFORMATION overview at the top of the live
+/// view (Step 12). Only the few high-level identity values are shown here
+/// every second; the full breakdown (CPU topology, memory/swap capacity, DMI
+/// hardware, BIOS) is available on the interactive 'y' screen.
+void renderSystemInfoSections(std::ostringstream &out,
+                              const atm::SystemInfo &info) {
+  const auto text = [](const std::string &value) {
+    return value.empty() ? std::string("N/A") : value;
+  };
+  out << "\n## SYSTEM INFORMATION\n\n";
+  appendLabeled(out, "Operating System:", text(info.operating_system));
+  appendLabeled(out, "Kernel:", text(info.kernel_version));
+  appendLabeled(out, "Architecture:", text(info.architecture));
+  appendLabeled(out, "Uptime:", atm::formatUptime(info.uptime_seconds));
+}
+
+/// Full system/hardware breakdown used by the interactive 'y' (System
+/// Information) screen. Groups the values under SYSTEM / CPU / MEMORY / GPU /
+/// HARDWARE headings; every unavailable field is shown as "N/A".
+std::string renderSystemInfoDetail(const atm::SystemInfo &info) {
+  const auto text = [](const std::string &value) {
+    return value.empty() ? std::string("N/A") : value;
+  };
+  const auto kib = [](std::uint64_t bytes) {
+    return formatKibibytes(bytes / kBytesPerKilobyte);
+  };
+  const auto rule = std::string(kSysInfoDetailRuleWidth, '-');
+
+  std::ostringstream out;
+  out << "SYSTEM INFORMATION\n" << rule << "\n";
+  appendLabeled(out, "Hostname:", text(info.hostname));
+  appendLabeled(out, "Operating System:", text(info.operating_system));
+  appendLabeled(out, "Distribution:", text(info.distribution));
+  if (!info.distribution_version.empty()) {
+    appendLabeled(out, "Distribution Version:", info.distribution_version);
+  }
+  appendLabeled(out, "Kernel:", text(info.kernel_version));
+  if (!info.kernel_release.empty()) {
+    appendLabeled(out, "Kernel Release:", info.kernel_release);
+  }
+  appendLabeled(out, "Architecture:", text(info.architecture));
+  appendLabeled(out, "Uptime:", atm::formatUptime(info.uptime_seconds));
+
+  out << "\nCPU\n" << rule << "\n";
+  appendLabeled(out, "Model:", text(info.cpu_model));
+  appendLabeled(out, "Architecture:", text(info.cpu_architecture));
+  appendLabeled(
+      out, "Logical CPUs:",
+      info.cpu_logical_cores > 0 ? std::to_string(info.cpu_logical_cores)
+                                 : std::string("N/A"));
+  appendLabeled(
+      out, "Physical cores:",
+      info.cpu_physical_cores > 0 ? std::to_string(info.cpu_physical_cores)
+                                  : std::string("N/A"));
+
+  out << "\nMEMORY\n" << rule << "\n";
+  appendLabeled(out, "RAM:", info.total_memory > 0 ? kib(info.total_memory)
+                                                   : std::string("N/A"));
+  appendLabeled(out, "Swap:", info.total_swap > 0 ? kib(info.total_swap)
+                                                  : std::string("N/A"));
+
+  out << "\nGPU\n" << rule << "\n";
+  if (info.gpus.empty()) {
+    appendLabeled(out, "GPU:", "N/A");
+  } else {
+    for (std::size_t index = 0; index < info.gpus.size(); ++index) {
+      appendLabeled(out, "GPU " + std::to_string(index) + ":",
+                    info.gpus[index]);
+    }
+  }
+
+  out << "\nHARDWARE\n" << rule << "\n";
+  appendLabeled(out, "Manufacturer:", text(info.manufacturer));
+  appendLabeled(out, "Model:", text(info.product_name));
+  if (!info.product_version.empty()) {
+    appendLabeled(out, "Product Version:", info.product_version);
+  }
+  appendLabeled(out, "Motherboard:", text(info.motherboard_vendor) +
+                                         (info.motherboard.empty()
+                                              ? ""
+                                              : " " + info.motherboard));
+  out << "\nFIRMWARE\n" << rule << "\n";
+  appendLabeled(out, "Vendor:", text(info.bios_vendor));
+  appendLabeled(out, "Version:", text(info.bios_version));
+  appendLabeled(out, "Date:", text(info.bios_date));
+  return out.str();
 }
 
 /// Renders the STORAGE (physical filesystem capacities), DISK ACTIVITY
@@ -912,6 +1002,7 @@ std::string renderFrame(double cpu_usage, const atm::MemoryInfo &memory,
                         const atm::SensorSnapshot &sensors,
                         const atm::SystemdSnapshot &systemd,
                         const atm::StartupSnapshot &startup,
+                        const atm::SystemInfo &sysinfo,
                         const std::string &service_search,
                         atm::ServiceSort service_sort,
                         const std::string &startup_search,
@@ -924,6 +1015,7 @@ std::string renderFrame(double cpu_usage, const atm::MemoryInfo &memory,
 
   std::ostringstream out;
   renderHeader(out, cpu_usage, memory);
+  renderSystemInfoSections(out, sysinfo);
   renderMemorySections(out, memory);
   renderStorageSections(out, disk);
   renderNetworkSections(out, network);
@@ -946,6 +1038,7 @@ std::string renderFrame(double cpu_usage, const atm::MemoryInfo &memory,
       << "Sensor detail: press 's' (then Enter) to inspect a sensor\n"
       << "Systemd services: press 'u' (then Enter) to manage services\n"
       << "Startup apps: press 'a' (then Enter) to manage autostart\n"
+      << "System info: press 'y' (then Enter) for the hardware overview\n"
       << "Updating every " << kRefreshInterval.count() << " second...\n";
   return out.str();
 }
@@ -961,6 +1054,7 @@ void renderView(double cpu_usage, const atm::MemoryInfo &memory,
                 const atm::SensorSnapshot &sensors,
                 const atm::SystemdSnapshot &systemd,
                 const atm::StartupSnapshot &startup,
+                const atm::SystemInfo &sysinfo,
                 const std::string &service_search,
                 atm::ServiceSort service_sort,
                 const std::string &startup_search,
@@ -970,7 +1064,7 @@ void renderView(double cpu_usage, const atm::MemoryInfo &memory,
   std::cout << "\033[2J\033[H";
   std::cout << renderFrame(cpu_usage, memory, processes, stats, sort, view, tree,
                            disk, network, gpu, sensors, systemd, startup,
-                           service_search, service_sort, startup_search,
+                           sysinfo, service_search, service_sort, startup_search,
                            startup_sort)
             << std::flush;
 }
@@ -1012,10 +1106,11 @@ bool parseSignedInteger(const std::string &text, int &out) {
 
 /// Reads raw terminal input without blocking. One complete line at a time is
 /// interpreted: digits 1-4 switch the sort order, 'l'/'t' switch views, 'm'
-/// enters process-control mode, 'i'/'g' open the network/GPU detail screens;
-/// anything else is ignored. Because the live loop must not lose bytes
-/// meant for the (blocking) control prompts, all input funnels through an
-/// internal buffer shared with readLine().
+/// enters process-control mode, 'i'/'g'/'s' open the network/GPU/sensor
+/// detail screens, 'u'/'a' open systemd/startup management and 'y' opens the
+/// system-information overview; anything else is ignored. Because the live
+/// loop must not lose bytes meant for the (blocking) control prompts, all
+/// input funnels through an internal buffer shared with readLine().
 class ConsoleInput {
  public:
   enum class Command {
@@ -1032,6 +1127,7 @@ class ConsoleInput {
     InspectSensors,
     InspectSystemd,
     InspectStartup,
+    InspectSystemInfo,
   };
 
   /// Non-blocking: drains whatever stdin currently has, then returns the next
@@ -1130,6 +1226,7 @@ class ConsoleInput {
     if (token == "s" || token == "S") return Command::InspectSensors;
     if (token == "u" || token == "U") return Command::InspectSystemd;
     if (token == "a" || token == "A") return Command::InspectStartup;
+    if (token == "y" || token == "Y") return Command::InspectSystemInfo;
     return Command::None;
   }
 };
@@ -1485,6 +1582,46 @@ void interactSensorDetail(const atm::SensorSnapshot &sensors,
             << renderSensorDetails(sensors, gpu)
             << "\n\nPress Enter to return to the live view.\n" << std::flush;
   static_cast<void>(input.readLine());  // wait for the user, EOF cancels
+}
+
+/// "y": full static system/hardware overview (OS, kernel, CPU, memory/swap
+/// capacity, GPU, DMI hardware and firmware). The cached SystemInfoProvider
+/// snapshot is shown frozen; action [1] re-reads all static information on
+/// demand so the DMI files, /etc/os-release and /proc/cpuinfo are never
+/// rescanned continuously (Step 12).
+void interactSystemInfoDetail(atm::SystemInfoProvider &provider,
+                              atm::SystemInfo &info,
+                              const atm::GpuSnapshot &gpu,
+                              ConsoleInput &input) {
+  for (;;) {
+    std::cout << "\033[2J\033[H";
+    std::cout << "========================================\n"
+                 "ARCH TASK MANAGER — System Information\n"
+                 "========================================\n\n"
+              << renderSystemInfoDetail(info) << "\n\n"
+              << "[1] Refresh System Information\n"
+                 "[0] Cancel\n\n"
+                 "Select action:\n> "
+              << std::flush;
+    const std::optional<std::string> action_line = input.readLine();
+    if (!action_line) {
+      std::cout << "\nInput cancelled.\n";
+      return;
+    }
+    const std::string action_text = trimWhitespace(*action_line);
+    if (action_text == "1") {
+      provider.load(gpu);
+      info = provider.read();
+      std::cout << "\nSystem information refreshed.\n" << std::flush;
+      continue;  // redraw with the fresh snapshot
+    }
+    if (!action_text.empty() && action_text != "0") {
+      std::cout << "\nInvalid action.\n";
+    }
+    std::cout << "\nPress Enter to return to the live view.\n" << std::flush;
+    static_cast<void>(input.readLine());
+    return;
+  }
 }
 
 /// "u": shows the systemd services list frozen and provides management options.
@@ -1903,6 +2040,7 @@ int main() {
   atm::SensorMonitor sensor_monitor;
   atm::SystemdManager systemd_manager;
   atm::StartupManager startup_manager;
+  atm::SystemInfoProvider system_info;
   atm::ProcessActions actions;
   ConsoleInput input;
 
@@ -1955,13 +2093,15 @@ int main() {
   const atm::SensorSnapshot first_sensors = sensor_monitor.read();
   const atm::SystemdSnapshot first_systemd = systemd_manager.read();
   const atm::StartupSnapshot first_startup = startup_manager.read();
+  system_info.load(first_gpu);
+  atm::SystemInfo sysinfo = system_info.read();
   auto snapshot = process_monitor.read(first_memory->total);
   atm::sortProcesses(snapshot.processes, sort);
   atm::ProcessTree tree = atm::buildProcessTree(snapshot.processes);
   renderView(*first_cpu, *first_memory, snapshot.processes, snapshot.stats,
              sort, view, tree, first_disk, first_network, first_gpu,
-             first_sensors, first_systemd, first_startup, service_search,
-             service_sort, startup_search, startup_sort);
+             first_sensors, first_systemd, first_startup, sysinfo,
+             service_search, service_sort, startup_search, startup_sort);
 
   atm::NetworkSnapshot network = first_network;
   atm::GpuSnapshot gpu = first_gpu;
@@ -2014,8 +2154,8 @@ int main() {
             tree = atm::buildProcessTree(snapshot.processes);
             renderView(*cpu, *memory, snapshot.processes, snapshot.stats,
                        sort, view, tree, disk, network, gpu, sensors,
-                       systemd, startup, service_search, service_sort,
-                       startup_search, startup_sort);
+                       systemd, startup, sysinfo, service_search,
+                       service_sort, startup_search, startup_sort);
           }
         }
         continue;
@@ -2046,6 +2186,11 @@ int main() {
                                 startup_sort);
         }
         break;
+      case ConsoleInput::Command::InspectSystemInfo:
+        if (view == ViewMode::List) {
+          interactSystemInfoDetail(system_info, sysinfo, gpu, input);
+        }
+        break;
       case ConsoleInput::Command::None:
         break;
     }
@@ -2072,7 +2217,7 @@ int main() {
     systemd = systemd_manager.read();
     startup = startup_manager.read();
     renderView(*cpu, *memory, snapshot.processes, snapshot.stats, sort, view,
-               tree, disk, network, gpu, sensors, systemd, startup,
+               tree, disk, network, gpu, sensors, systemd, startup, sysinfo,
                service_search, service_sort, startup_search, startup_sort);
   }
 }

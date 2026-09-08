@@ -5,10 +5,10 @@ Linux. It reads system information **directly from Linux interfaces** such as
 `/proc/stat`, `/proc/meminfo`, and `/proc/<pid>/` — no shelling out to `ps`,
 `free`, `top`, `htop`, or other external tools.
 
-> Stage: **Step 11** — CPU, RAM, swap, process monitoring, process actions, the
+> Stage: **Step 12** — CPU, RAM, swap, process monitoring, process actions, the
 > process tree, disk/storage monitoring, network monitoring, GPU monitoring,
-> temperature & hardware sensor monitoring, systemd service management, and
-> startup application management.
+> temperature & hardware sensor monitoring, systemd service management,
+> startup application management, and system information / hardware overview.
 > Everything else on the roadmap is intentionally **not** implemented yet, but
 > the code is structured so future modules can be added without rewriting the
 > existing ones.
@@ -101,6 +101,17 @@ feature per milestone, hosted on GitHub.
       files are preserved. This is configuration management only — commands
       are never executed — and it is deliberately separate from the systemd
       service manager (Step 10).
+- [x] **System information & hardware overview** — a `SystemInfoProvider`
+      module that reads and caches the high-level machine identity: hostname,
+      operating system and distribution from `/etc/os-release`, kernel version
+      and architecture via `uname(2)`, CPU model, logical/physical core counts
+      from `/proc/cpuinfo`, total RAM and swap (reusing the existing memory
+      monitor), uptime from `/proc/uptime`, GPU names (from the existing GPU
+      monitor), and DMI hardware/firmware identity (manufacturer, model,
+      motherboard, BIOS/UEFI) from `/sys/class/dmi/id`. Press `y` for the full
+      breakdown, which also offers an on-demand **refresh** — the static files
+      are read once and cached, never rescanned every second. Everything is
+      strictly read-only and missing fields always degrade to "N/A".
 
 ### Planned
 
@@ -171,6 +182,13 @@ ARCH TASK MANAGER
 
 CPU Usage:       35.2%
 Memory Usage:    52.4%
+
+## SYSTEM INFORMATION
+
+Operating System:    Arch Linux
+Kernel:              6.x.x-arch1-1
+Architecture:        x86_64
+Uptime:              2 days, 5 hours, 32 minutes
 
 ## MEMORY
 
@@ -282,6 +300,9 @@ Manage: press 'm' (then Enter) to control a process by PID
 Network detail: press 'i' (then Enter) to inspect an interface
 GPU detail: press 'g' (then Enter) to inspect a GPU
 Sensor detail: press 's' (then Enter) to inspect a sensor
+Systemd services: press 'u' (then Enter) to manage services
+Startup apps: press 'a' (then Enter) to manage autostart
+System info: press 'y' (then Enter) for the hardware overview
 Updating every 1 second...
 ```
 
@@ -536,6 +557,7 @@ arch-task-manager/
 │   ├── sensor_monitor.hpp      # TemperatureSensor, FanSensor, SensorSnapshot, SensorMonitor
 │   ├── systemd_manager.hpp     # SystemdService, SystemdSnapshot, SystemdManager (D-Bus)
 │   ├── startup_manager.hpp     # StartupApplication, StartupSnapshot, StartupManager (XDG)
+│   ├── system_info.hpp         # SystemInfo, SystemInfoProvider (OS/kernel/CPU/DMI), formatUptime()
 │   └── format_bytes.hpp        # shared byte-formatter (KB/MB/GB, used by disk + network)
 ├── src/
 │   ├── main.cpp                # UI loop: frame rendering + 1 s refresh + control flow
@@ -549,7 +571,8 @@ arch-task-manager/
 │   ├── gpu_monitor.cpp         # /sys/class/drm GPU discovery + vendor metrics
 │   ├── sensor_monitor.cpp      # /sys/class/hwmon temperature/fan discovery + readings
 │   ├── systemd_manager.cpp     # sd-bus / org.freedesktop.systemd1 discovery + management
-│   └── startup_manager.cpp     # XDG autostart scan, .desktop parse, enable/disable
+│   ├── startup_manager.cpp     # XDG autostart scan, .desktop parse, enable/disable
+│   └── system_info.cpp         # gethostname/uname, os-release, cpuinfo, DMI read + caching
 └── build/                      # generated; never committed to git
 ```
 
@@ -1317,6 +1340,125 @@ dependency. It does not emulate DE-specific autostart features such as
 `AutostartCondition=` (GSettings-backed conditions), KDE's `X-KDE-*` phases, or
 `StartupNotify`. Startup **timing** (`X-GNOME-Autostart-Phase`,
 `X-KDE-autostart-phase`) is not acted upon; those keys are ignored.
+
+## System Information
+
+A dedicated `SystemInfoProvider` module provides a high-level, mostly **static**
+overview of the machine. It is intentionally separate from the continuously
+sampled CPU, memory, GPU and disk monitors: those diff fast-changing counters
+every second, while System Information answers the "what is this machine?"
+question from **immutable** sources read once and cached.
+
+Press `y` (then Enter) in the list view to open the full breakdown:
+
+```text
+SYSTEM INFORMATION
+--------------------------------
+Hostname:            archlinux
+Operating System:    Arch Linux
+Distribution:        arch
+Kernel:              6.x.x-arch1-1
+Kernel Release:      #1 SMP PREEMPT_DYNAMIC ...
+Architecture:        x86_64
+Uptime:              2 days, 5 hours, 32 minutes
+
+CPU
+--------------------------------
+Model:               AMD Ryzen 7 5800X ...
+Architecture:        x86_64
+Logical CPUs:        16
+Physical cores:      8
+
+MEMORY
+--------------------------------
+RAM:                 15.5 GB
+Swap:                8.0 GB
+
+GPU
+--------------------------------
+GPU 0:               AMD Radeon RX 6600
+
+HARDWARE
+--------------------------------
+Manufacturer:        ASUSTeK COMPUTER INC.
+Model:               PRIME B550-A
+Product Version:     Rev 1.xx
+Motherboard:         ASUSTeK PRIME B550-A
+
+FIRMWARE
+--------------------------------
+Vendor:              American Megatrends
+Version:             3603
+Date:                12/20/2023
+```
+
+The live list view shows a compact summary (`## SYSTEM INFORMATION` with
+operating system, kernel, architecture and uptime) near the top; the `y` screen
+always offers `[1] Refresh System Information`, which re-reads every static
+source on demand. Nothing is rescanned continuously.
+
+### Sources
+
+| Value | Source |
+|---|---|
+| Hostname | `gethostname(2)` |
+| Operating system / distribution | `/etc/os-release` (`PRETTY_NAME`/`NAME`, `ID`, `VERSION_ID`) |
+| Kernel version / architecture | `uname(2)` (`release`, `version`, `machine`) |
+| CPU model | `/proc/cpuinfo` (`model name`, first `processor` block) |
+| Logical CPUs | `processor` entries in `/proc/cpuinfo` |
+| Physical cores | `cpu cores` × distinct `physical id` in `/proc/cpuinfo` |
+| Total RAM / swap | existing `readMemoryInfo()` (`/proc/meminfo`) — never parsed twice |
+| Uptime | first field of `/proc/uptime` |
+| GPU names | existing `GpuMonitor` snapshot (shared, no re-detection) |
+| Manufacturer / model | `/sys/class/dmi/id/sys_vendor`, `product_name`, `product_version` |
+| Motherboard | `/sys/class/dmi/id/board_vendor`, `board_name`, `board_version` |
+| BIOS/UEFI | `/sys/class/dmi/id/bios_vendor`, `bios_version`, `bios_date` |
+
+No shell commands are used for any of this (`uname`, `hostname`, `lsb_release`,
+`hostnamectl`, `lscpu`, `free`, `dmidecode`, `neofetch` are never invoked;
+`system()`/`popen()` are not used).
+
+### OS/kernel identification
+
+`/etc/os-release` is parsed as plain `KEY=value` configuration data (quoted
+values are supported) and the application is **not** hard-coded to Arch Linux:
+any distribution that reports itself via os-release — Debian, Fedora, NixOS,
+… — is identified correctly. The kernel version and machine architecture come
+straight from the `uname(2)` syscall. Machine strings are mapped to friendly
+names (`x86_64`, `arm64`, …); anything unrecognized is shown verbatim.
+
+### CPU topology
+
+Logical CPUs are the `processor` lines of `/proc/cpuinfo`. Physical cores are
+derived as cores-per-package (`cpu cores`) multiplied by the number of distinct
+`physical id` packages — the standard reliable x86 relationship. When a
+platform does not expose these topology fields the physical count is left
+unknown and displayed as `N/A` (never guessed).
+
+### Uptime
+
+`/proc/uptime`'s first field is the whole number of seconds since boot. It is
+formatted by a shared `formatUptime()` helper into "45 seconds", "12 minutes",
+"4 hours, 25 minutes" or "2 days, 7 hours, 10 minutes", dropping unnecessary
+precision and never overflowing the integer math.
+
+### Hardware (DMI) availability
+
+Manufacturer, model, motherboard and BIOS/UEFI strings come from the kernel's
+DMI interface under `/sys/class/dmi/id/`. **These files may not exist on every
+machine** — and even on machines that have DMI tables, some fields are readable
+only by root (the kernel rides the `dmi=` restrictions / `%p` hashing), some
+laptop/OEM firmware leaves fields blank, and virtual machines often provide
+only generic strings. Every single field degrades to `N/A` when its source
+file is missing, unreadable or empty; one unavailable field never prevents the
+others from loading, and the feature never crashes because a DMI value is
+absent.
+
+### Security
+
+This feature is strictly **read-only**: it never modifies `/sys`, `/proc`,
+`/etc/os-release` or any DMI data, never changes the hostname, kernel or
+firmware settings, and never executes external commands.
 
 ## License
 

@@ -42,6 +42,7 @@ add_executable(arch-task-manager
   src/sensor_monitor.cpp
   src/systemd_manager.cpp
   src/startup_manager.cpp
+  src/system_info.cpp
 )
 
 target_include_directories(arch-task-manager PRIVATE include)
