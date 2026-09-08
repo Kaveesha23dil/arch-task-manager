@@ -41,6 +41,16 @@ feature per milestone, hosted on GitHub.
       population built from the PPID field of the existing `/proc/<pid>/stat`
       scan, with box-drawing connectors (├──, └──, │), orphan handling and
       dynamic tree statistics.
+- [x] **Process details** — a per-process inspector (press `d`) that reads the
+      `/proc/<pid>` entries of a selected process directly and displays basic
+      identity (PID, name, state, user/UID/GID, PPID, threads, priority/nice,
+      start time, command line, executable, working directory), a detailed
+      memory breakdown (virtual, resident, shared, text, data, stack), CPU
+      time and reuse of the process table's CPU %, per-process I/O statistics,
+      and voluntary/non-voluntary context switches. Unreadable fields (root or
+      kernel processes, permission-denied files) degrade to "N/A" instead of
+      crashing, and information is refreshed on demand without a separate
+      thread.
 - [x] **Disk / storage monitoring** — physical filesystem capacities via
       `statvfs(2)` over the mounts listed in `/proc/mounts`, real-time
       read/write throughput from two samples of `/proc/diskstats`, and whole
@@ -297,6 +307,7 @@ Processes: 186
 Sort: [1] CPU  [2] Memory  [3] PID  [4] Name (current: CPU)
 View: [l] Process List  [t] Process Tree (current: List)
 Manage: press 'm' (then Enter) to control a process by PID
+Details: press 'd' (then Enter) to inspect a process in detail
 Network detail: press 'i' (then Enter) to inspect an interface
 GPU detail: press 'g' (then Enter) to inspect a GPU
 Sensor detail: press 's' (then Enter) to inspect a sensor
@@ -325,6 +336,7 @@ While it runs you can switch views at any time (then Enter):
 
 - `l` — Process List (flat table)
 - `t` — Process Tree (hierarchical)
+- `d` — inspect one process in detail (list view only)
 - `i` — inspect one network interface in detail (list view only)
 - `g` — read the full per-GPU breakdown (list view only)
 - `s` — read the full sensor breakdown with limits and status (list view only)
@@ -537,6 +549,75 @@ bash -c 'sleep 300 & exec sleep 400' &
 Orphaned children stay alive and simply move under their new parent (usually
 PID 1) on the next refresh; they never disappear into a crash.
 
+## Process details
+
+Press `d` **and then Enter** at any time in the process-list view to inspect a
+single process in detail. The current process list is shown frozen; enter a PID
+(or leave it blank to cancel). Unlike process *control*, viewing details is
+read-only and safe, so PID `1` and the Task Manager's own PID can be inspected
+here.
+
+The details screen is its own little loop:
+
+| Key | Action                               | Notes                             |
+| --- | ------------------------------------ | --------------------------------- |
+| 1   | Refresh                              | re-reads `/proc/<pid>` immediately|
+| 2   | Terminate                            | `kill(pid, SIGTERM)` + confirmation|
+| 3   | Kill                                 | `kill(pid, SIGKILL)` + confirmation|
+| 4   | Stop (Pause)                         | `kill(pid, SIGSTOP)` + confirmation|
+| 5   | Continue (Resume)                    | `kill(pid, SIGCONT)` + confirmation|
+| 0   | Back                                 | return to the live view           |
+
+Control actions 2–5 reuse the existing `ProcessActions` wrappers (no signal
+logic is re-implemented) and are blocked for PID `1` / the monitor's own PID.
+
+### Information displayed
+
+Everything is collected by `ProcessDetails::getProcessDetails(pid)` reading the
+selected process's `/proc/<pid>` directory directly — never by shelling out to
+`ps`/`top`/`pgrep`.
+
+| Section            | Source                                        | Fields                                                       |
+| ------------------ | --------------------------------------------- | ------------------------------------------------------------ |
+| Basic              | `/proc/<pid>/stat`, `/proc/<pid>/status`, `getpwuid_r` | name, PID, state, user, UID, GID, parent PID, threads, priority, nice, start time, running time |
+| Location           | `/proc/<pid>/exe` (readlink), `/proc/<pid>/cwd` (readlink), `/proc/<pid>/cmdline` | executable path, working directory, command line |
+| Memory             | `/proc/<pid>/status` (`VmSize`, `VmRSS`, `VmExe`, `VmData`, `VmStk`), `/proc/<pid>/statm` | virtual, resident, shared, text, data, stack, memory % |
+| CPU                | `/proc/<pid>/stat` (`utime`, `stime`) + the process table's CPU % | user time, system time, CPU %, thread count |
+| Context switches   | `/proc/<pid>/status` (voluntary/nonvoluntary) | voluntary, non-voluntary counts |
+| I/O statistics     | `/proc/<pid>/io`                              | read bytes, written bytes, read/write syscalls, cancelled writes |
+
+Start time is derived from the `starttime` tick in `/proc/<pid>/stat`, the
+system uptime (`/proc/uptime`) and the current clock; "Running For" reports the
+process age. Memory values are converted to human-readable units (kB / MB / GB)
+and the CPU % shown is the same value the process table computed, reused rather
+than recomputed by a second tracker.
+
+### Permission limitations
+
+`/proc/<pid>` is not equally readable for every process:
+
+- **Other users' / kernel processes** (e.g. `systemd`, PID 1) typically let you
+  read `/stat` and `/status` (name, state, memory, context switches) but may
+  refuse `/exe`, `/cwd`, `/cmdline` and especially `/io`, which requires
+  ownership or `CAP_SYS_RESOURCE`.
+- A file that cannot be read shows **`Permission denied`** (for `/exe` and
+  `/cwd`) or **`N/A`** rather than stopping the application.
+- The application never asks for or stores a password, and never bypasses Linux
+  permissions — it simply reads what the kernel allows.
+- **Environment variables are deliberately not shown.** `/proc/<pid>/environ`
+  can contain API keys, tokens and credentials; it is never read in the normal
+  details view.
+
+### Robustness
+
+The process may disappear at any moment. If it exits between the list snapshot
+and the read, or an individual `/proc/<pid>` file vanishes mid-read, the
+affected field degrades to `N/A`; if the whole `/proc/<pid>` entry is gone the
+screen reports **"Process no longer exists."** and returns to the process list.
+Zombie processes are reported with state `Z` / `Zombie`, malformed files are
+skipped, broken `/proc` links are shown as such, and none of these conditions
+ever crashes the application or spawns an extra thread or update loop.
+
 ## Project structure
 
 ```text
@@ -550,6 +631,7 @@ arch-task-manager/
 │   ├── memory_monitor.hpp      # MemoryInfo, readMemoryInfo(), MemoryMonitor
 │   ├── process_monitor.hpp     # Process, ProcessState, ProcessMonitor
 │   ├── process_actions.hpp     # ProcessActions, ActionResult, ActionStatus
+│   ├── process_details.hpp     # ProcessDetailsInfo, ProcessDetails (/proc parser)
 │   ├── process_tree.hpp        # ProcessTreeNode, ProcessTree, build/render
 │   ├── disk_monitor.hpp        # DiskUsage, BlockDevice, DiskSnapshot, DiskMonitor
 │   ├── network_monitor.hpp     # NetworkInterfaceStats, NetworkSnapshot, NetworkMonitor
@@ -565,6 +647,7 @@ arch-task-manager/
 │   ├── memory_monitor.cpp      # /proc/meminfo reading + memory/swap math
 │   ├── process_monitor.cpp     # /proc scanning + per-process parsing
 │   ├── process_actions.cpp     # kill(2)/setpriority(2) wrappers + errno mapping
+│   ├── process_details.cpp     # per-PID /proc read + parse into ProcessDetailsInfo
 │   ├── process_tree.cpp        # PID/PPID tree build + box-drawing renderer
 │   ├── disk_monitor.cpp        # statvfs(2) usage + /proc/diskstats rates + /sys/block
 │   ├── network_monitor.cpp     # /proc/net/dev two-sample rates + operstate
