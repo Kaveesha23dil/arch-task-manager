@@ -53,6 +53,10 @@ add_executable(arch-task-manager
   src/notification_manager.cpp
   src/package_manager.cpp
   src/package_transaction.cpp
+  src/logger.cpp
+  src/settings.cpp
+  src/settings_manager.cpp
+  src/settings_apply.cpp
 )
 
 target_include_directories(arch-task-manager PRIVATE include)
@@ -60,3 +64,26 @@ target_include_directories(arch-task-manager PRIVATE include)
 target_link_libraries(arch-task-manager PRIVATE Threads::Threads ${SYSTEMD_LIBRARIES} ${ALPM_LIBRARIES})
 target_include_directories(arch-task-manager PRIVATE ${SYSTEMD_INCLUDE_DIRS} ${ALPM_INCLUDE_DIRS})
 target_link_directories(arch-task-manager PRIVATE ${SYSTEMD_LIBRARY_DIRS} ${ALPM_LIBRARY_DIRS})
+
+# --- Tests ----------------------------------------------------------------
+enable_testing()
+
+add_executable(settings-tests
+  tests/settings_tests.cpp
+  src/logger.cpp
+  src/settings.cpp
+  src/settings_manager.cpp
+  src/settings_apply.cpp
+  src/alert_manager.cpp
+  src/history_manager.cpp
+  src/notification_manager.cpp
+  src/resource_history.cpp
+)
+
+target_include_directories(settings-tests PRIVATE include)
+
+target_link_libraries(settings-tests PRIVATE Threads::Threads ${SYSTEMD_LIBRARIES} ${ALPM_LIBRARIES})
+target_include_directories(settings-tests PRIVATE ${SYSTEMD_INCLUDE_DIRS} ${ALPM_INCLUDE_DIRS})
+target_link_directories(settings-tests PRIVATE ${SYSTEMD_LIBRARY_DIRS} ${ALPM_LIBRARY_DIRS})
+
+add_test(NAME settings COMMAND settings-tests)
