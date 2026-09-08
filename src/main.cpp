@@ -10,6 +10,7 @@
 #include <ctime>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <optional>
 #include <poll.h>
 #include <sstream>
@@ -17,18 +18,21 @@
 #include <thread>
 #include <unistd.h>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "cpu_monitor.hpp"
 #include "disk_monitor.hpp"
 #include "format_bytes.hpp"
 #include "gpu_monitor.hpp"
+#include "history_manager.hpp"
 #include "memory_monitor.hpp"
 #include "network_monitor.hpp"
 #include "process_actions.hpp"
 #include "process_details.hpp"
 #include "process_monitor.hpp"
 #include "process_tree.hpp"
+#include "resource_history.hpp"
 #include "sensor_monitor.hpp"
 #include "startup_manager.hpp"
 #include "system_info.hpp"
@@ -388,6 +392,125 @@ void renderNetworkSections(std::ostringstream &out,
       << '\n'
       << "Loopback traffic is excluded from the totals."
       << "\nDetailed stats: press 'i' (then Enter)\n";
+}
+
+/// Renders the RESOURCE HISTORY section: live time-series graphs for CPU,
+/// memory, swap, disk, network, GPU and temperature. All data is read from
+/// the HistoryManager's bounded ring buffers (already-collected values); the
+/// renderer never reads system metrics itself.
+void renderResourceHistorySection(std::ostringstream &out,
+                                  const atm::HistoryManager &history) {
+  out << "\n## RESOURCE HISTORY\n\n";
+
+  atm::GraphConfig percent;      // 0-100 fixed scale
+  percent.width = 40;
+  percent.height = 6;
+  percent.dynamic_scale = false;
+
+  atm::GraphConfig rate;         // auto-scaling MB-scale
+  rate.width = 40;
+  rate.height = 6;
+  rate.dynamic_scale = true;
+
+  // Overall CPU usage (%).
+  out << "[CPU Usage]\n" << atm::GraphRenderer::renderText(
+      history.cpuHistory(), percent, "", "%") << '\n';
+
+  // Memory usage (%).
+  out << "\n[MEMORY Usage]\n" << atm::GraphRenderer::renderText(
+      history.memoryHistory(), percent, "", "%") << '\n';
+
+  // Swap usage (%).
+  out << "\n[SWAP Usage]\n" << atm::GraphRenderer::renderText(
+      history.swapHistory(), percent, "", "%") << '\n';
+
+  // Disk throughput (auto-scaling, MB-scale).
+  out << "\n[DISK READ]\n" << atm::GraphRenderer::renderText(
+      history.diskReadHistory(), rate, "", "B/s") << '\n';
+  out << "\n[DISK WRITE]\n" << atm::GraphRenderer::renderText(
+      history.diskWriteHistory(), rate, "", "B/s") << '\n';
+
+  // Network throughput (auto-scaling).
+  out << "\n[NETWORK RX]\n" << atm::GraphRenderer::renderText(
+      history.networkRxHistory(), rate, "", "B/s") << '\n';
+  out << "\n[NETWORK TX]\n" << atm::GraphRenderer::renderText(
+      history.networkTxHistory(), rate, "", "B/s") << '\n';
+
+  // GPU utilization (per GPU).
+  const auto &gpus = history.gpuHistories();
+  if (!gpus.empty()) {
+    out << "\n[GPU Utilization]\n";
+    for (std::size_t i = 0; i < gpus.size(); ++i) {
+      const std::string name = "GPU " + std::to_string(i) + " " + gpus[i].name;
+      out << name << '\n' << atm::GraphRenderer::renderText(
+          gpus[i].utilization, percent, "", "%") << '\n';
+    }
+  } else {
+    out << "\n[GPU]\n"
+        << "N/A (no GPU utilization data).\n";
+  }
+
+  // Temperature sensors (auto CPU-like scale up to ~110C).
+  const auto &sensors = history.sensorHistories();
+  if (!sensors.empty()) {
+    atm::GraphConfig temp;
+    temp.width = 40;
+    temp.height = 6;
+    temp.dynamic_scale = true;
+    out << "\n[TEMPERATURES]\n";
+    for (const auto &sensor : sensors) {
+      out << sensor.label << '\n' << atm::GraphRenderer::renderText(
+          sensor.temperature, temp, "", "\u00b0C") << '\n';
+    }
+  } else {
+    out << "\n[TEMPERATURES]\n"
+        << "N/A (no hardware sensors).\n";
+  }
+
+  out << "\nGraphs update every refresh; buffer holds "
+      << history.maxSamples() << " samples.\n";
+}
+
+/// Builds the name/value pairs for GPU utilization and VRAM usage from a
+/// GpuSnapshot, using NaN to mark an unavailable metric so the history layer
+/// skips it.
+void buildGpuMetricVectors(const atm::GpuSnapshot &gpu,
+                           std::vector<std::pair<std::string, double>> &utils,
+                           std::vector<std::pair<std::string, double>> &vrams) {
+  utils.clear();
+  vrams.clear();
+  utils.reserve(gpu.devices.size());
+  vrams.reserve(gpu.devices.size());
+  for (const atm::GpuStats &stats : gpu.devices) {
+    std::string name = stats.name;
+    if (name.empty()) {
+      name = stats.card;
+    }
+    utils.emplace_back(name,
+                       stats.utilization_percent.has_value()
+                           ? *stats.utilization_percent
+                           : std::numeric_limits<double>::quiet_NaN());
+    vrams.emplace_back(
+        name, stats.memory_usage_percent.has_value()
+                  ? *stats.memory_usage_percent
+                  : std::numeric_limits<double>::quiet_NaN());
+  }
+}
+
+/// Builds the name/value pairs for temperatures from a SensorSnapshot. Only
+/// temperature sensors that expose a valid reading are included.
+void buildTemperatureVector(const atm::SensorSnapshot &sensors,
+                            std::vector<std::pair<std::string, double>> &temps) {
+  temps.clear();
+  temps.reserve(sensors.temperatures.size());
+  for (const atm::TemperatureSensor &sensor : sensors.temperatures) {
+    std::string label = atm::sensorTypeName(sensor.type);
+    label += " " + sensor.label;
+    if (!sensor.device.empty()) {
+      label += " (" + sensor.device + ")";
+    }
+    temps.emplace_back(label, sensor.temperature_celsius);
+  }
 }
 
 /// Formats a utilization value with a trailing '%' ("72.0%"), or "N/A" when
@@ -1176,6 +1299,8 @@ std::string renderFrame(double cpu_usage, const atm::MemoryInfo &memory,
                         const atm::SystemdSnapshot &systemd,
                         const atm::StartupSnapshot &startup,
                         const atm::SystemInfo &sysinfo,
+                        const atm::HistoryManager &history,
+                        bool show_history,
                         const std::string &service_search,
                         atm::ServiceSort service_sort,
                         const std::string &startup_search,
@@ -1190,6 +1315,9 @@ std::string renderFrame(double cpu_usage, const atm::MemoryInfo &memory,
   renderHeader(out, cpu_usage, memory);
   renderSystemInfoSections(out, sysinfo);
   renderMemorySections(out, memory);
+  if (show_history) {
+    renderResourceHistorySection(out, history);
+  }
   renderStorageSections(out, disk);
   renderNetworkSections(out, network);
   renderGpuSections(out, gpu);
@@ -1205,6 +1333,8 @@ std::string renderFrame(double cpu_usage, const atm::MemoryInfo &memory,
          " (current: "
       << atm::processSortName(sort) << ")\n"
       << "View: [l] Process List  [t] Process Tree (current: List)\n"
+      << "Resource history: press 'r' (then Enter) to toggle graphs (current: "
+      << (show_history ? "shown" : "hidden") << ")\n"
       << "Manage: press 'm' (then Enter) to control a process by PID\n"
       << "Details: press 'd' (then Enter) to inspect a process in detail\n"
       << "Network detail: press 'i' (then Enter) to inspect an interface\n"
@@ -1229,6 +1359,8 @@ void renderView(double cpu_usage, const atm::MemoryInfo &memory,
                 const atm::SystemdSnapshot &systemd,
                 const atm::StartupSnapshot &startup,
                 const atm::SystemInfo &sysinfo,
+                const atm::HistoryManager &history,
+                bool show_history,
                 const std::string &service_search,
                 atm::ServiceSort service_sort,
                 const std::string &startup_search,
@@ -1238,8 +1370,8 @@ void renderView(double cpu_usage, const atm::MemoryInfo &memory,
   std::cout << "\033[2J\033[H";
   std::cout << renderFrame(cpu_usage, memory, processes, stats, sort, view, tree,
                            disk, network, gpu, sensors, systemd, startup,
-                           sysinfo, service_search, service_sort, startup_search,
-                           startup_sort)
+                           sysinfo, history, show_history, service_search,
+                           service_sort, startup_search,                            startup_sort)
             << std::flush;
 }
 
@@ -1303,6 +1435,7 @@ class ConsoleInput {
     InspectSystemd,
     InspectStartup,
     InspectSystemInfo,
+    ToggleHistory,
   };
 
   /// Non-blocking: drains whatever stdin currently has, then returns the next
@@ -1403,6 +1536,7 @@ class ConsoleInput {
     if (token == "u" || token == "U") return Command::InspectSystemd;
     if (token == "a" || token == "A") return Command::InspectStartup;
     if (token == "y" || token == "Y") return Command::InspectSystemInfo;
+    if (token == "r" || token == "R") return Command::ToggleHistory;
     return Command::None;
   }
 };
@@ -2397,6 +2531,7 @@ int main() {
   atm::SystemInfoProvider system_info;
   atm::ProcessActions actions;
   atm::ProcessDetails process_details;
+  atm::HistoryManager history;
   ConsoleInput input;
 
   atm::ProcessSort sort = atm::ProcessSort::Cpu;
@@ -2405,6 +2540,7 @@ int main() {
   std::string service_search;
   atm::StartupSort startup_sort = atm::StartupSort::Name;
   std::string startup_search;
+  bool show_history = true;
 
   // Choose the starting view. EOF (e.g. /dev/null stdin) defaults to List.
   std::cout << "Select view:\n"
@@ -2453,10 +2589,31 @@ int main() {
   auto snapshot = process_monitor.read(first_memory->total);
   atm::sortProcesses(snapshot.processes, sort);
   atm::ProcessTree tree = atm::buildProcessTree(snapshot.processes);
+
+  // Seed the resource history with the first sample so graphs show data from
+  // the very first frame.
+  {
+    std::vector<std::pair<std::string, double>> gpu_utils;
+    std::vector<std::pair<std::string, double>> gpu_vrams;
+    std::vector<std::pair<std::string, double>> temps;
+    buildGpuMetricVectors(first_gpu, gpu_utils, gpu_vrams);
+    buildTemperatureVector(first_sensors, temps);
+    history.update(*first_cpu, first_memory->usagePercent(),
+                   static_cast<double>(first_memory->used()),
+                   static_cast<double>(first_memory->available),
+                   first_memory->swapUsagePercent(),
+                   static_cast<double>(first_disk.total_read_bytes_per_second),
+                   static_cast<double>(first_disk.total_write_bytes_per_second),
+                   static_cast<double>(first_network.total_rx_bytes_per_second),
+                   static_cast<double>(first_network.total_tx_bytes_per_second),
+                   gpu_utils, gpu_vrams, temps);
+  }
+
   renderView(*first_cpu, *first_memory, snapshot.processes, snapshot.stats,
              sort, view, tree, first_disk, first_network, first_gpu,
-             first_sensors, first_systemd, first_startup, sysinfo,
-             service_search, service_sort, startup_search, startup_sort);
+             first_sensors, first_systemd, first_startup, sysinfo, history,
+             show_history, service_search, service_sort, startup_search,
+             startup_sort);
 
   atm::NetworkSnapshot network = first_network;
   atm::GpuSnapshot gpu = first_gpu;
@@ -2507,10 +2664,27 @@ int main() {
             snapshot = process_monitor.read(memory->total);
             atm::sortProcesses(snapshot.processes, sort);
             tree = atm::buildProcessTree(snapshot.processes);
+            {
+              std::vector<std::pair<std::string, double>> gpu_utils;
+              std::vector<std::pair<std::string, double>> gpu_vrams;
+              std::vector<std::pair<std::string, double>> temps;
+              buildGpuMetricVectors(gpu, gpu_utils, gpu_vrams);
+              buildTemperatureVector(sensors, temps);
+              history.update(*cpu, memory->usagePercent(),
+                             static_cast<double>(memory->used()),
+                             static_cast<double>(memory->available),
+                             memory->swapUsagePercent(),
+                             static_cast<double>(disk.total_read_bytes_per_second),
+                             static_cast<double>(disk.total_write_bytes_per_second),
+                             static_cast<double>(network.total_rx_bytes_per_second),
+                             static_cast<double>(network.total_tx_bytes_per_second),
+                             gpu_utils, gpu_vrams, temps);
+            }
             renderView(*cpu, *memory, snapshot.processes, snapshot.stats,
                        sort, view, tree, disk, network, gpu, sensors,
-                       systemd, startup, sysinfo, service_search,
-                       service_sort, startup_search, startup_sort);
+                       systemd, startup, sysinfo, history, show_history,
+                       service_search, service_sort, startup_search,
+                       startup_sort);
           }
         }
         continue;
@@ -2555,6 +2729,9 @@ int main() {
           interactSystemInfoDetail(system_info, sysinfo, gpu, input);
         }
         break;
+      case ConsoleInput::Command::ToggleHistory:
+        show_history = !show_history;
+        break;
       case ConsoleInput::Command::None:
         break;
     }
@@ -2580,8 +2757,27 @@ int main() {
     sensors = sensor_monitor.read();
     systemd = systemd_manager.read();
     startup = startup_manager.read();
+
+    {
+      std::vector<std::pair<std::string, double>> gpu_utils;
+      std::vector<std::pair<std::string, double>> gpu_vrams;
+      std::vector<std::pair<std::string, double>> temps;
+      buildGpuMetricVectors(gpu, gpu_utils, gpu_vrams);
+      buildTemperatureVector(sensors, temps);
+      history.update(*cpu, memory->usagePercent(),
+                     static_cast<double>(memory->used()),
+                     static_cast<double>(memory->available),
+                     memory->swapUsagePercent(),
+                     static_cast<double>(disk.total_read_bytes_per_second),
+                     static_cast<double>(disk.total_write_bytes_per_second),
+                     static_cast<double>(network.total_rx_bytes_per_second),
+                     static_cast<double>(network.total_tx_bytes_per_second),
+                     gpu_utils, gpu_vrams, temps);
+    }
+
     renderView(*cpu, *memory, snapshot.processes, snapshot.stats, sort, view,
                tree, disk, network, gpu, sensors, systemd, startup, sysinfo,
-               service_search, service_sort, startup_search, startup_sort);
+               history, show_history, service_search, service_sort,
+               startup_search, startup_sort);
   }
 }
