@@ -52,6 +52,7 @@ add_executable(arch-task-manager
   src/alert_manager.cpp
   src/notification_manager.cpp
   src/package_manager.cpp
+  src/package_transaction.cpp
 )
 
 target_include_directories(arch-task-manager PRIVATE include)

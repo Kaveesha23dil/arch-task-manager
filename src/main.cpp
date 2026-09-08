@@ -32,6 +32,7 @@
 #include "network_monitor.hpp"
 #include "notification_manager.hpp"
 #include "package_manager.hpp"
+#include "package_transaction.hpp"
 #include "process_actions.hpp"
 #include "process_details.hpp"
 #include "process_monitor.hpp"
@@ -2942,12 +2943,211 @@ void interactStartupDetail(atm::StartupManager &startup_mgr,
   std::this_thread::sleep_for(300ms);
 }
 
+/// An internal progress formatter for the commit phase: renders a simple ASCII
+/// progress bar from 0-100, using "Working..." when no precise value exists.
+std::string progressBar(int percent, std::size_t width) {
+  if (percent < 0 || percent > 100) {
+    return "Working...";
+  }
+  const std::size_t filled =
+      static_cast<std::size_t>(percent * static_cast<int>(width) / 100);
+  const std::size_t empty = width - filled;
+  return std::string(filled, '#') + std::string(empty, '.') + " " +
+         std::to_string(percent) + "%";
+}
+
+/// Renders the computed upgrade preview plus the pending modifications so the
+/// user can review before confirming.
+void renderTransactionPreview(const atm::TransactionPreview &preview) {
+  std::cout << "Upgrade Preview\n"
+               "────────────────────────────\n\n";
+  std::cout << "Upgrade:       " << preview.to_upgrade << '\n'
+            << "Install:       " << preview.to_install << '\n'
+            << "Remove:        " << preview.to_remove << '\n'
+            << "Reinstall:     " << preview.to_reinstall << '\n';
+  if (preview.download_size > 0) {
+    std::cout << "Download:      "
+              << atm::formatBytes(preview.download_size) << '\n';
+  }
+  std::cout << "Size change:   ";
+  if (preview.size_change >= 0) {
+    std::cout << '+' << atm::formatBytes(
+        static_cast<std::uint64_t>(preview.size_change));
+  } else {
+    std::cout << '-' << atm::formatBytes(
+        static_cast<std::uint64_t>(-preview.size_change));
+  }
+  std::cout << "\n\n";
+
+  std::cout << std::left << std::setw(kPackageNameWidth) << "Package"
+            << std::setw(kPackageVersionWidth) << "Old Version"
+            << std::setw(kPackageVersionWidth) << "New Version"
+            << "  Source\n";
+  for (const atm::TransactionPackage &p : preview.packages) {
+    std::cout << std::left << std::setw(kPackageNameWidth)
+              << fitTo(p.name, kPackageNameWidth);
+    if (p.will_remove) {
+      std::cout << std::setw(kPackageVersionWidth)
+                << fitTo(p.old_version, kPackageVersionWidth)
+                << std::setw(kPackageVersionWidth) << "REMOVE"
+                << "  " << fitTo(p.repository, 12) << '\n';
+    } else {
+      std::cout << std::setw(kPackageVersionWidth)
+                << fitTo(p.old_version, kPackageVersionWidth)
+                << std::setw(kPackageVersionWidth)
+                << fitTo(p.new_version, kPackageVersionWidth)
+                << "  " << fitTo(p.repository, 12) << '\n';
+    }
+  }
+
+  if (preview.has_removals) {
+    std::cout << "\n⚠ Transaction includes package removals.\n\n"
+                 "Review the following packages:\n\n";
+    for (const atm::TransactionPackage &p : preview.packages) {
+      if (p.will_remove) {
+        std::cout << "- " << p.name << '\n';
+      }
+    }
+    std::cout << "\nContinue?\n";
+  }
+}
+
+/// Reads a confirmation line. Returns true only for y/Y/yes.
+bool confirmPrompt(const std::string &prompt, ConsoleInput &input) {
+  std::cout << prompt << " [y/N] " << std::flush;
+  const std::optional<std::string> line = input.readLine();
+  if (!line) {
+    std::cout << '\n';
+    return false;
+  }
+  const std::string answer = trimWhitespace(*line);
+  return answer == "y" || answer == "Y" || answer == "yes" ||
+         answer == "Yes" || answer == "YES";
+}
+
+/// Drives the full, safe upgrade workflow: sync databases -> resolve -> show
+/// preview -> explicit confirmation -> execute -> refresh package info.
+/// Never auto-upgrades; the user must confirm at every destructive step.
+void runSystemUpgrade(atm::PackageTransaction &transaction,
+                      atm::PackageManager &packages, ConsoleInput &input) {
+  if (transaction.is_running()) {
+    std::cout << "A package operation is already in progress.\n";
+    return;
+  }
+
+  // Step 1: explicit database synchronisation (may touch the network).
+  std::cout << "\nRefreshing package databases...\n"
+            << "This may download updated repository metadata.\n";
+  if (!transaction.syncDatabases()) {
+    std::cout << "\nUpdate check failed.\n\nReason:\n"
+              << transaction.error() << '\n';
+    return;
+  }
+
+  // Step 2: resolve the full-system-upgrade target list.
+  std::cout << "Calculating updates...\n";
+  if (!transaction.resolve()) {
+    std::cout << "\nUnable to calculate updates.\n\nReason:\n"
+              << transaction.error() << '\n';
+    return;
+  }
+
+  const atm::TransactionPreview &preview = transaction.preview();
+  if (preview.to_upgrade == 0 && preview.to_install == 0 &&
+      preview.to_remove == 0) {
+    std::cout << "No updates available. The system is up to date.\n";
+    transaction.cancel();
+    return;
+  }
+
+  // Step 3: explicit confirmation (never implied by opening the page).
+  std::cout << "\nYou are about to upgrade " << preview.to_upgrade
+            << " package(s) and install " << preview.to_install
+            << " and remove " << preview.to_remove << ".\n"
+            << "This operation will modify the system package database and "
+               "installed software.\n\n";
+  if (!confirmPrompt("Continue?", input)) {
+    std::cout << "Cancelled. No packages were modified.\n";
+    transaction.cancel();
+    return;
+  }
+
+  // If the transaction includes removals, show an additional warning. This is
+  // informational only - legitimate Arch upgrades can involve replacements.
+  if (preview.has_removals) {
+    std::cout << "\n⚠ Transaction includes package removals.\n"
+                 "Review the following packages:\n\n";
+    for (const atm::TransactionPackage &p : preview.packages) {
+      if (p.will_remove) {
+        std::cout << "- " << p.name << '\n';
+      }
+    }
+    std::cout << '\n';
+    if (!confirmPrompt("Continue anyway?", input)) {
+      std::cout << "Cancelled. No packages were modified.\n";
+      transaction.cancel();
+      return;
+    }
+  }
+
+  // Show the final preview for review.
+  std::cout << "\n";
+  renderTransactionPreview(preview);
+  std::cout << '\n';
+  if (!confirmPrompt("Proceed?", input)) {
+    std::cout << "Cancelled. No packages were modified.\n";
+    transaction.cancel();
+    return;
+  }
+
+  // Step 4: execute. Note: on Arch this normally requires root, which the
+  // application does not auto-elevate; the transaction reports that clearly.
+  std::cout << "\nUpdating System\n"
+               "────────────────────────────\n\n"
+            << "Resolving dependencies...\n"
+            << progressBar(-1, 20) << '\n' << std::flush;
+  atm::TransactionProgress progress;
+  transaction.commit(&progress);
+
+  if (transaction.state() == atm::TransactionState::Completed) {
+    std::cout << "\n✓ System update completed successfully.\n";
+    const std::vector<std::string> names = [&]() {
+      std::vector<std::string> n;
+      n.reserve(preview.packages.size());
+      for (const atm::TransactionPackage &p : preview.packages) {
+        n.push_back(p.name);
+      }
+      return n;
+    }();
+    if (transaction.includesRebootPackage(names)) {
+      std::cout << "\nA reboot may be recommended after updates to:\n"
+                   "- Linux kernel\n"
+                   "- system libraries\n"
+                   "- systemd\n\n"
+                   "This is informational only; the application does not "
+                   "reboot automatically.\n";
+    }
+  } else if (transaction.state() == atm::TransactionState::Failed) {
+    std::cout << "\n⚠ System update failed.\n\nReason:\n"
+              << transaction.error() << '\n';
+  } else {
+    std::cout << "\nTransaction ended: "
+              << atm::transactionStateName(transaction.state()) << '\n';
+  }
+
+  // Step 5: refresh package information so the UI reflects the new state.
+  packages.refresh();
+  std::cout << "\nUpdates Available: " << packages.summary().total_updates
+            << '\n';
+}
+
 /// Full-screen package update management. Accessible via 'p' (then Enter):
 /// shows the update summary and update table, and offers an explicit Refresh,
 /// a package-details view and a search/filter over the already-fetched
-/// updates. No install/remove/upgrade actions exist in this step.
-void interactPackageDetail(atm::PackageManager &packages, ConsoleInput &input,
-                           std::string &package_search) {
+/// updates. Also provides the safe full-system-upgrade workflow.
+void interactPackageDetail(atm::PackageManager &packages,
+                           atm::PackageTransaction &transaction,
+                           ConsoleInput &input, std::string &package_search) {
   const atm::PackageUpdateSummary &summary = packages.summary();
   std::vector<atm::PackageUpdate> filtered =
       filterPackageUpdates(packages.updates(), package_search);
@@ -2989,9 +3189,10 @@ void interactPackageDetail(atm::PackageManager &packages, ConsoleInput &input,
               << " updates (search: \"" << package_search << "\")\n";
   }
   std::cout << "\nManagement:\n"
-               "[1] Refresh\n"
+               "[1] Refresh (local check)\n"
                "[2] View Package Details\n"
                "[3] Search/Filter Updates\n"
+               "[4] Full System Upgrade\n"
                "[0] Cancel\n\n"
                "Select action:\n> "
             << std::flush;
@@ -3006,7 +3207,8 @@ void interactPackageDetail(atm::PackageManager &packages, ConsoleInput &input,
     std::cout << "Cancelled.\n";
     return;
   }
-  if (action_text != "1" && action_text != "2" && action_text != "3") {
+  if (action_text != "1" && action_text != "2" && action_text != "3" &&
+      action_text != "4") {
     std::cout << "Invalid action.\n";
     return;
   }
@@ -3041,6 +3243,12 @@ void interactPackageDetail(atm::PackageManager &packages, ConsoleInput &input,
       std::cout << "Filtering updates by: \"" << package_search << "\"\n";
     }
     std::this_thread::sleep_for(300ms);
+    return;
+  }
+
+  if (action_text == "4") {
+    runSystemUpgrade(transaction, packages, input);
+    std::this_thread::sleep_for(600ms);
     return;
   }
 
@@ -3086,6 +3294,7 @@ int main() {
   atm::AlertManager alerts;
   atm::NotificationManager notifications;
   atm::PackageManager packages;
+  atm::PackageTransaction package_transaction;
   ConsoleInput input;
 
   // Forward alert state transitions to desktop notifications.
@@ -3098,6 +3307,7 @@ int main() {
   // never synchronises repositories or touches the network.
   packages.initialize();
   packages.refresh();
+  package_transaction.initialize();
 
   atm::ProcessSort sort = atm::ProcessSort::Cpu;
   ViewMode view = ViewMode::List;
@@ -3302,7 +3512,8 @@ int main() {
         break;
       case ConsoleInput::Command::InspectPackages:
         if (view == ViewMode::List) {
-          interactPackageDetail(packages, input, package_search);
+          interactPackageDetail(packages, package_transaction, input,
+                                package_search);
         }
         break;
       case ConsoleInput::Command::ToggleHistory:
