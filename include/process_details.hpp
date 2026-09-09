@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "process_cgroup.hpp"
+#include "process_environment.hpp"
 #include "process_memory_map.hpp"
 #include "process_monitor.hpp"
 #include "process_namespace.hpp"
@@ -128,6 +129,14 @@ struct ProcessDetailsInfo {
   // distinct error state). Resource values describe the whole cgroup — which
   // may include other processes and threads — never just this process.
   std::optional<ProcessCgroupResult> cgroups;
+
+  // Read-only environment variables from /proc/<pid>/environ, collected on the
+  // inspector refresh only (never for every process, never polled). Nullopt
+  // only when no process identity was available; otherwise always present
+  // (Success with zero or more entries, empty, or a distinct error state).
+  // Values of potentially sensitive variables are masked in the result itself;
+  // raw secrets are never stored, logged, copied or persisted.
+  std::optional<ProcessEnvironmentResult> environment;
 
   // Start wall-clock time derived from the starttime tick, boot uptime and the
   // current clock. process_uptime_seconds is how long the process has been

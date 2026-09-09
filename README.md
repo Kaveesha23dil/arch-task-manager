@@ -5,7 +5,7 @@ Linux. It reads system information **directly from Linux interfaces** such as
 `/proc/stat`, `/proc/meminfo`, and `/proc/<pid>/` — no shelling out to `ps`,
 `free`, `top`, `htop`, or other external tools.
 
-> Stage: **Step 28** — CPU, RAM, swap, process monitoring, process actions, the
+> Stage: **Step 29** — CPU, RAM, swap, process monitoring, process actions, the
 > process tree, disk/storage monitoring, network monitoring, GPU monitoring,
 > temperature & hardware sensor monitoring, systemd service management,
 > startup application management, system information / hardware overview,
@@ -17,8 +17,9 @@ Linux. It reads system information **directly from Linux interfaces** such as
 > priority management (confirmed, identity-checked scheduling changes),
 > a read-only per-process memory-maps inspector, a read-only
 > per-process network-connections inspector, a read-only
-> per-process namespaces inspector, and a read-only per-process
-> cgroups inspector.
+> per-process namespaces inspector, a read-only per-process
+> cgroups inspector, and a read-only, security-conscious per-process
+> environment inspector (potentially sensitive values masked).
 > Everything else on the roadmap is intentionally **not** implemented yet, but
 > the code is structured so future modules can be added without rewriting the
 > existing ones.
@@ -148,6 +149,22 @@ feature per milestone, hosted on GitHub.
       shown as unavailable (never fabricated), nothing is ever written (no
       limits changed, no controllers enabled/disabled, no process moved), and
       no external tool (`systemd-cgls`, `cgget`, `ps`, shell) is used.
+- [x] **Process environment inspection** — a read-only, security-conscious
+      **Environment** section in the process inspector that parses the selected
+      process's `/proc/<pid>/environ` natively (NUL-separated `NAME=value`
+      records; no `env`, `printenv`, `strings`, `ps e`, or subprocesses).
+      Values whose variable name matches conservative secret-bearing signal
+      words (`PASSWORD`, `TOKEN`, `SECRET`, `API_KEY`, `PRIVATE_KEY`,
+      `CREDENTIAL`, `AUTH`, `SESSION`, `COOKIE`, …) are masked as `********`
+      immediately; the plaintext never enters the display model, so it cannot
+      leak through logs, persistence, or the UI — the detection is a documented
+      heuristic and may over- or under-match. Reads are bounded (256 KiB /
+      1024 variables) with explicit truncation reporting, results are
+      identity-gated against PID reuse, and permission-denied / disappeared /
+      empty / malformed states are distinct and never crash the app. The
+      environment is only shown for the selected process, only on refresh; it
+      is never persisted, never logged, never exported, and the section is
+      strictly read-only (no environment editing or process launching).
 - [x] **Disk / storage monitoring** — physical filesystem capacities via
       `statvfs(2)` over the mounts listed in `/proc/mounts`, real-time
       read/write throughput from two samples of `/proc/diskstats`, and whole
@@ -839,16 +856,16 @@ The details screen is its own little loop:
 | 5   | Continue (Resume)                    | `kill(pid, SIGCONT)` + confirmation|
 | 6   | Change Nice Priority                 | `setpriority(PRIO_PROCESS)` + confirmation|
 | 7   | Change CPU Affinity                  | `sched_setaffinity(2)` + confirmation|
-| 8   | Filter Memory Maps                   | path-substring filter on the maps rows |
-| 9   | Clear Memory Maps Filter             | show the full memory-maps table       |
+| 8   | Filter Sections (Memory Maps / Environment)      | substring filter: maps by path, environment by variable name |
+| 9   | Clear Section Filter             | show the full memory-maps / environment tables       |
 | 0   | Back                                 | return to the live view           |
 
 Control actions 2–5 reuse the existing `ProcessActions` wrappers (no signal
 logic is re-implemented) and scheduling actions 6–7 go through the dedicated
 scheduling manager; all of them are blocked for PID `1` / the monitor's own PID.
-Actions 8–9 are read-only display filters for the Memory Maps section and need
-no confirmation. The Network Connections, Namespaces and Cgroups sections
-(below) are purely read-only and have no action keys.
+Actions 8–9 are read-only display filters for the Memory Maps and Environment
+sections and need no confirmation. The Network Connections, Namespaces, Cgroups
+and Environment sections (below) are purely read-only and have no action keys.
 
 ### Information displayed
 
@@ -870,6 +887,7 @@ selected process's `/proc/<pid>` directory directly — never by shelling out to
 | Network connections | `/proc/<pid>/fd` (`socket:[inode]`) + `/proc/net/tcp{,6}`, `/proc/net/udp{,6}`, `/proc/net/unix` | per-socket FD, protocol, numeric local/remote address + port, TCP state, Unix path/type/state; summary counts |
 | Namespaces          | `/proc/<pid>/ns` (readlink)                 | per-namespace type (with kernel short name), numeric ID, raw symlink target; availability/partial states; summary counts |
 | Cgroups             | `/proc/<pid>/cgroup` + `/proc/self/mountinfo` + the selected cgroup v2 directory's read-only control files | cgroup version (v1/v2), per-hierarchy id/controllers/path/mount point; v2: CPU weight, `cpu.max` quota/period, memory current/max/high, pids current/max, controllers, `cgroup.type`; current-vs-limit-vs-unlimited distinction |
+| Environment         | `/proc/<pid>/environ` (NUL-separated, native parse) | sorted `NAME`/value pairs parsed at the first `=`; filtered by the shared section filter (key 8/9) on variable name; total size (KiB), variable count, sensitive-variable count; entries whose name matches conservative secret signals are masked (`********`) and the plaintext value never enters the model; duplicate names collapse to the first value (counted), malformed records are skipped (counted), byte- and variable-count limits report truncation; permission-denied / disappeared / empty / malformed states are distinct |
 
 Start time is derived from the `starttime` tick in `/proc/<pid>/stat`, the
 system uptime (`/proc/uptime`) and the current clock; "Running For" reports the
@@ -1337,6 +1355,59 @@ malformed.
 
 Each state is distinct and never crashes the application.
 
+## Process environment inspection
+
+The details screen ends with an **Environment** section showing the selected
+process's environment as a sorted `NAME=value` table. The data comes natively
+from `/proc/<pid>/environ` — a NUL-separated dump of the environment the kernel
+recorded at the process's last `execve` — on every inspector refresh and only
+then. No external command is used (`env`, `printenv`, `strings`, `ps e`,
+shells, or any subprocess).
+
+### Read-only, bounded, and never leaked
+
+- The section is strictly read-only: nothing is edited, injected, or launched,
+  and the process is neither started nor restarted.
+- Reads are bounded to **256 KiB** of environment data and **1024 variables**.
+  When either limit is hit the section reports **"Environment truncated"** with
+  the relevant limit instead of presenting a partial dump as complete.
+- The environment is collected once per refresh for the selected process only;
+  it is never persisted, never exported, never sent to a clipboard, and never
+  written to logs, crash reports, or notifications.
+
+### Masking
+
+Variable names are classified **before** any value is stored. Names containing
+conservative secret-bearing signal words — e.g. `PASSWORD`, `PASSWD`, `SECRET`,
+`TOKEN`, `API_KEY`, `APIKEY`, `ACCESS_KEY`, `PRIVATE_KEY`, `CREDENTIAL`, `AUTH`,
+`BEARER`, `SESSION`, `COOKIE` (matched case-insensitively, so `DatabasePassword`,
+`GITHUB_TOKEN`, `AWS_SECRET_ACCESS_KEY`, `AUTH_TOKEN` and similar are all caught)
+— are masked: the entry's value is replaced with `********` and the plaintext
+value never enters the display model. Because the raw value is discarded at
+parse time, it cannot reach the UI, logs, or any persistence path. This is a
+documented heuristic: it may mask a value that is not a secret (e.g. a variable
+whose name merely *contains* `SESSION`), and it may miss a secret stored under
+an unrelated name.
+
+### States
+
+- Success (with the parsed table and the `Variables` / `Total size` /
+  `Sensitive variables` statistics).
+- **"No environment variables available."** for a genuinely empty environment.
+- **"Environment unavailable: permission denied."** when the kernel refuses
+  access (`/proc/<pid>/environ` requires ptrace permissions, so many
+  not-ours processes land here).
+- **"Process no longer exists."** when the process vanished mid-inspection.
+- **"The process identity changed (the PID was reused); environment data was
+  discarded."** — the inspection is gated on the process identity (PID +
+  start-time tick, the same mechanism used by the scheduling editor) both
+  before and after the read, so a reused PID never shows another process's
+  environment.
+- Malformed data and generic read errors are reported distinctly and never
+  crash the application.
+
+Each state is distinct and never crashes the application.
+
 ## Application Settings & Persistent Configuration
 
 Press `o` (then Enter) in the list view to open the settings page. It edits the
@@ -1557,6 +1628,7 @@ arch-task-manager/
 │   ├── process_network.hpp     # ProcessNetworkConnectionManager, /proc/net/* + fd correlation
 │   ├── process_namespace.hpp   # ProcessNamespace + /proc/<pid>/ns readlink enumerator
 │   ├── process_cgroup.hpp      # ProcessCgroup + /proc/<pid>/cgroup + mountinfo resolver
+│   ├── process_environment.hpp # ProcessEnvironmentManager, masked /proc/<pid>/environ parser
 │   ├── process_tree.hpp        # ProcessTreeNode, ProcessTree, build/render
 │   ├── disk_monitor.hpp        # DiskUsage, BlockDevice, DiskSnapshot, DiskMonitor
 │   ├── network_monitor.hpp     # NetworkInterfaceStats, NetworkSnapshot, NetworkMonitor
@@ -1590,6 +1662,8 @@ arch-task-manager/
 │   ├── process_memory_map.cpp  # /proc/<pid>/maps parse, classify, identity-gated inspect
 │   ├── process_network.cpp     # /proc/net/{tcp,tcp6,udp,udp6,unix} parse + fd/socket correlation
 │   ├── process_namespace.cpp   # /proc/<pid>/ns enumeration, target parse, identity-gated inspect
+│   ├── process_cgroup.cpp      # /proc/<pid>/cgroup + mountinfo resolver, identity-gated inspect
+│   ├── process_environment.cpp # bounded /proc/<pid>/environ parse + masking, identity-gated inspect
 │   ├── process_tree.cpp        # PID/PPID tree build + box-drawing renderer
 │   ├── disk_monitor.cpp        # statvfs(2) usage + /proc/diskstats rates + /sys/block
 │   ├── network_monitor.cpp     # /proc/net/dev two-sample rates + operstate

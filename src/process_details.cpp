@@ -597,6 +597,19 @@ ProcessDetails::getProcessDetails(pid_t pid, std::uint64_t system_total_kib,
         ProcessIdentity{pid, *info.starttime_ticks});
   }
 
+  // Environment (read-only, security-conscious) from /proc/<pid>/environ,
+  // collected on this same refresh pass and gated by the process identity so
+  // a reused PID never shows another process's variables. It is never read for
+  // every process and never polled on a timer: only the selected process on
+  // its inspector refresh. Sensitive values are masked in the result and the
+  // raw secret is dropped immediately; nothing is logged, copied, notified or
+  // persisted.
+  if (info.starttime_ticks.has_value()) {
+    const ProcessEnvironmentManager environment;
+    info.environment = environment.inspect(
+        ProcessIdentity{pid, *info.starttime_ticks});
+  }
+
   // Start time: boot wall-clock + (starttime ticks / USER_HZ). Running time =
   // system uptime − (starttime ticks / USER_HZ).
   if (stat_data->starttime_ticks.has_value()) {
