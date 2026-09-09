@@ -41,6 +41,7 @@ add_executable(arch-task-manager
   src/process_details.cpp
   src/process_resources.cpp
   src/process_memory_map.cpp
+  src/process_network.cpp
   src/process_scheduling.cpp
   src/process_tree.cpp
   src/disk_monitor.cpp
@@ -145,3 +146,17 @@ target_include_directories(process-memory-map-tests PRIVATE include)
 target_link_libraries(process-memory-map-tests PRIVATE Threads::Threads)
 
 add_test(NAME process-memory-map COMMAND process-memory-map-tests)
+
+add_executable(process-network-tests
+  tests/process_network_tests.cpp
+  src/process_network.cpp
+  src/process_resources.cpp
+  src/process_scheduling.cpp
+  src/logger.cpp
+)
+
+target_include_directories(process-network-tests PRIVATE include)
+
+target_link_libraries(process-network-tests PRIVATE Threads::Threads)
+
+add_test(NAME process-network COMMAND process-network-tests)

@@ -5,7 +5,7 @@ Linux. It reads system information **directly from Linux interfaces** such as
 `/proc/stat`, `/proc/meminfo`, and `/proc/<pid>/` — no shelling out to `ps`,
 `free`, `top`, `htop`, or other external tools.
 
-> Stage: **Step 25** — CPU, RAM, swap, process monitoring, process actions, the
+> Stage: **Step 26** — CPU, RAM, swap, process monitoring, process actions, the
 > process tree, disk/storage monitoring, network monitoring, GPU monitoring,
 > temperature & hardware sensor monitoring, systemd service management,
 > startup application management, system information / hardware overview,
@@ -15,7 +15,8 @@ Linux. It reads system information **directly from Linux interfaces** such as
 > autostart for the application itself, per-process resource monitoring
 > with read-only resource limits, per-process CPU affinity & nice
 > priority management (confirmed, identity-checked scheduling changes),
-> and a read-only per-process memory-maps inspector.
+> a read-only per-process memory-maps inspector, and a read-only
+> per-process network-connections inspector.
 > Everything else on the roadmap is intentionally **not** implemented yet, but
 > the code is structured so future modules can be added without rewriting the
 > existing ones.
@@ -96,6 +97,20 @@ feature per milestone, hosted on GitHub.
       truncated / empty states are distinct and never crash the app, and the
       view is capped at 4096 mappings with an explicit truncation notice. No
       memory contents are ever read.
+- [x] **Process network connections inspection** — a read-only **Network
+      Connections** section in the process inspector that lists the selected
+      process's sockets, natively correlated from `/proc/<pid>/fd` (`socket:
+      [inode]`) against `/proc/net/tcp{,6}`, `/proc/net/udp{,6}` and
+      `/proc/net/unix` — never `ss`/`netstat`/`lsof`/shell. Each row shows the
+      file descriptor, protocol (TCP/UDP/Unix/Unknown), numeric local/remote
+      address and port (IPv4 and IPv6 via `inet_ntop`, with **no DNS
+      resolution**), the decoded TCP state (LISTEN/ESTABLISHED/...; UDP labelled
+      UNCONNECTED), and the socket inode. A compact summary separates total /
+      TCP / UDP / Unix / listening / established counts accurately. Results are
+      identity-gated against PID reuse, permission-denied / disappeared / empty
+      / truncated states are distinct and never crash the app, up to 1024
+      connections are collected with an explicit truncation notice, non-socket
+      descriptors are ignored, and no socket is ever modified or intercepted.
 - [x] **Disk / storage monitoring** — physical filesystem capacities via
       `statvfs(2)` over the mounts listed in `/proc/mounts`, real-time
       read/write throughput from two samples of `/proc/diskstats`, and whole
@@ -795,7 +810,8 @@ Control actions 2–5 reuse the existing `ProcessActions` wrappers (no signal
 logic is re-implemented) and scheduling actions 6–7 go through the dedicated
 scheduling manager; all of them are blocked for PID `1` / the monitor's own PID.
 Actions 8–9 are read-only display filters for the Memory Maps section and need
-no confirmation.
+no confirmation. The Network Connections section (below) is purely read-only
+and has no action keys.
 
 ### Information displayed
 
@@ -814,6 +830,7 @@ selected process's `/proc/<pid>` directory directly — never by shelling out to
 | Resource limits    | `/proc/<pid>/limits`                          | open files, processes, stack size, locked memory, address space, core file size, pending signals, POSIX message queues, realtime priority, realtime timeout |
 | Scheduling         | `getpriority(2)`, `sched_getaffinity(2)`, `/proc/<pid>/stat` | nice value, allowed CPU list, allowed CPU count |
 | Memory maps        | `/proc/<pid>/maps`                       | per-mapping start/end address, size, permission string, file offset, device, inode, pathname; summary counts |
+| Network connections | `/proc/<pid>/fd` (`socket:[inode]`) + `/proc/net/tcp{,6}`, `/proc/net/udp{,6}`, `/proc/net/unix` | per-socket FD, protocol, numeric local/remote address + port, TCP state, Unix path/type/state; summary counts |
 
 Start time is derived from the `starttime` tick in `/proc/<pid>/stat`, the
 system uptime (`/proc/uptime`) and the current clock; "Running For" reports the
@@ -992,6 +1009,89 @@ filter is local to the inspection session and applies to the current refresh.
 Each of these is a distinct state — a permission problem is never mistaken for
 an empty mapping list, and a disappeared process is never mistaken for an empty
 one.
+
+## Process network connections inspection
+
+The details screen ends with a **Network Connections** section listing the
+sockets owned by the selected process, read natively and read-only. It is
+correlated from the process's own file descriptors and the kernel's socket
+tables — no external command (`ss`, `netstat`, `lsof`, `fuser`, `ip`, ...) is
+ever executed, no subprocess/shell is launched, and no packet capture or socket
+modification takes place. It is refreshed only when the inspector refreshes,
+never by the main process monitor.
+
+### Data sources and correlation
+
+| Source             | Use                                                            |
+| ------------------ | -------------------------------------------------------------- |
+| `/proc/<pid>/fd/`  | discover the process's file descriptors                        |
+| `socket:[inode]`   | symlink target that marks a descriptor as a socket             |
+| `/proc/net/tcp`    | TCP/IPv4 sockets                                               |
+| `/proc/net/tcp6`   | TCP/IPv6 sockets                                               |
+| `/proc/net/udp`    | UDP/IPv4 sockets                                               |
+| `/proc/net/udp6`   | UDP/IPv6 sockets                                               |
+| `/proc/net/unix`   | Unix domain sockets                                            |
+
+The inspector reads only the descriptor symlinks of the selected process and
+each relevant `/proc/net/*` table once per inspection (only the tables that can
+resolve a socket), then correlates the `socket:[inode]` numbers against a
+single inode → connection index. A descriptor that is not a socket (a regular
+file, pipe, tty, etc.) is ignored. A socket whose inode matches no protocol
+table is shown as `Unknown` with no fabricated address or port. The application
+never reads socket data or `/proc/<fd>` file contents and never intercepts or
+modifies anything.
+
+### What is shown
+
+| Column         | Meaning                                                             |
+| -------------- | ------------------------------------------------------------------- |
+| FD             | the file descriptor number in the process                           |
+| Protocol       | TCP, UDP, Unix, or Unknown                                          |
+| Local Address  | numeric IPv4/IPv6, or the socket path / abstract `@` name for Unix  |
+| Local Port     | numeric local port (0 when not applicable)                          |
+| Remote Address | numeric remote IPv4/IPv6 (empty for Unix / not-applicable)          |
+| Remote Port    | numeric remote port                                                 |
+| State          | TCP state (LISTEN, ESTABLISHED, TIME_WAIT, ...), `UNCONNECTED` for UDP |
+
+IPv4 and IPv6 addresses are shown as numeric `inet_ntop()` output and are
+**never** resolved to hostnames — the UI performs no DNS lookups, so it never
+blocks and never shows misleading names. For Unix sockets the state and socket
+type (STREAM/DGRAM/SEQPACKET) are appended to the display; unnamed and abstract
+(`@`-prefixed) sockets are represented without assuming a filesystem pathname.
+
+Supported protocols: TCP/IPv4, TCP/IPv6, UDP/IPv4, UDP/IPv6 and Unix domain
+sockets. For TCP the Linux connection state is decoded into stable names; UDP
+sockets are labelled `UNCONNECTED` (they carry no TCP state) and are never
+mistaken for listening or established connections.
+
+### Summary
+
+A compact summary distinguishes total connections, TCP connections, UDP
+sockets, Unix sockets, listening sockets and established connections — each is
+counted accurately (a listening socket is not counted as established; UDP
+sockets are counted as neither). Addresses are numeric by design.
+
+### Limitation and result bound
+
+Visibility is bounded by Linux permissions: with a restricted `/proc` mount
+(e.g. `hidepid`) or another user's process the socket table may be withheld.
+That case is reported as **"Network connections unavailable: permission
+denied."**, never as an empty list, and no sudo/privileged helper is used. Up to
+1024 connections are collected per inspection; a process with more is reported
+as **"Results truncated: only the first N of at least M connections are
+shown."** rather than silently dropping records.
+
+### States
+
+- Success (with zero or more connections), reported as **"No network
+  connections found."** when empty.
+- A process that vanished mid-inspection shows **"Process no longer exists."**.
+- A PID that was reused while inspecting is detected through the process
+  identity (PID + start-time tick, the same mechanism used by the scheduling
+  editor) and the stale result is discarded — a reused PID never shows another
+  process's connections.
+
+Each state is distinct and never crashes the application.
 
 ## Application Settings & Persistent Configuration
 
@@ -1210,6 +1310,7 @@ arch-task-manager/
 │   ├── process_resources.hpp   # /proc/<pid>/io, stat, status, limits parsers + I/O rates
 │   ├── process_scheduling.hpp  # ProcessIdentity, sched_* / getpriority editors, CpuList parse
 │   ├── process_memory_map.hpp  # ProcessMemoryMap, /proc/<pid>/maps parser + manager
+│   ├── process_network.hpp     # ProcessNetworkConnectionManager, /proc/net/* + fd correlation
 │   ├── process_tree.hpp        # ProcessTreeNode, ProcessTree, build/render
 │   ├── disk_monitor.hpp        # DiskUsage, BlockDevice, DiskSnapshot, DiskMonitor
 │   ├── network_monitor.hpp     # NetworkInterfaceStats, NetworkSnapshot, NetworkMonitor
@@ -1241,6 +1342,7 @@ arch-task-manager/
 │   ├── process_resources.cpp   # process /proc parsers (io/stat/status/limits) + rate math
 │   ├── process_scheduling.cpp  # getpriority/setpriority + sched_get/setaffinity, identity gate
 │   ├── process_memory_map.cpp  # /proc/<pid>/maps parse, classify, identity-gated inspect
+│   ├── process_network.cpp     # /proc/net/{tcp,tcp6,udp,udp6,unix} parse + fd/socket correlation
 │   ├── process_tree.cpp        # PID/PPID tree build + box-drawing renderer
 │   ├── disk_monitor.cpp        # statvfs(2) usage + /proc/diskstats rates + /sys/block
 │   ├── network_monitor.cpp     # /proc/net/dev two-sample rates + operstate

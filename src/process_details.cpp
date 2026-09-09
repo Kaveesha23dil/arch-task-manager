@@ -15,6 +15,7 @@
 #include <unistd.h>
 
 #include "process_memory_map.hpp"
+#include "process_network.hpp"
 #include "process_resources.hpp"
 #include "process_scheduling.hpp"
 
@@ -558,6 +559,16 @@ ProcessDetails::getProcessDetails(pid_t pid, std::uint64_t system_total_kib,
   if (info.starttime_ticks.has_value()) {
     const ProcessMemoryMapManager memory_maps;
     info.memory_maps = memory_maps.inspect(
+        ProcessIdentity{pid, *info.starttime_ticks});
+  }
+
+  // Network connections (read-only metadata) from /proc/<pid>/fd and
+  // /proc/net/*, collected on this same refresh pass and gated by the process
+  // identity so a reused PID never shows another process's connections. Reading
+  // the tables belongs to the inspector refresh lifecycle only.
+  if (info.starttime_ticks.has_value()) {
+    const ProcessNetworkConnectionManager connections;
+    info.network_connections = connections.inspect(
         ProcessIdentity{pid, *info.starttime_ticks});
   }
 

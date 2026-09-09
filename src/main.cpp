@@ -38,6 +38,7 @@
 #include "process_details.hpp"
 #include "process_memory_map.hpp"
 #include "process_monitor.hpp"
+#include "process_network.hpp"
 #include "process_resources.hpp"
 #include "process_scheduling.hpp"
 #include "process_tree.hpp"
@@ -1687,6 +1688,82 @@ void renderMemoryMapsSection(std::ostringstream &out,
   }
 }
 
+/// Renders the read-only network-connections section of the process inspector.
+/// Built from /proc/<pid>/fd + /proc/net/* — socket metadata only, never
+/// packet contents, and no socket is modified.
+void renderNetworkConnectionsSection(
+    std::ostringstream &out,
+    const atm::ProcessNetworkConnectionsResult &connections) {
+  switch (connections.status) {
+    case atm::NetworkConnectionsStatus::Success:
+      break;
+    case atm::NetworkConnectionsStatus::PermissionDenied:
+      out << "Network connections unavailable: permission denied.\n";
+      return;
+    case atm::NetworkConnectionsStatus::ProcessNotFound:
+    case atm::NetworkConnectionsStatus::IdentityUnknown:
+      out << "Process no longer exists.\n";
+      return;
+    case atm::NetworkConnectionsStatus::ProcessReused:
+      out << "The process identity changed (the PID was reused); network "
+             "connections were discarded.\n";
+      return;
+    case atm::NetworkConnectionsStatus::InvalidPid:
+      out << "Invalid PID.\n";
+      return;
+    case atm::NetworkConnectionsStatus::ReadError:
+      out << "Network connections unavailable: "
+          << (connections.errno_value != 0
+                  ? std::strerror(connections.errno_value)
+                  : std::string("read failed"))
+          << ".\n";
+      return;
+  }
+
+  appendLabeled(out, "Total connections:",
+                std::to_string(connections.connections.size()));
+  appendLabeled(out, "TCP connections:", std::to_string(connections.tcp_count));
+  appendLabeled(out, "UDP sockets:", std::to_string(connections.udp_count));
+  appendLabeled(out, "Unix sockets:", std::to_string(connections.unix_count));
+  appendLabeled(out, "Listening sockets:",
+                std::to_string(connections.listening_count));
+  appendLabeled(out, "Established connections:",
+                std::to_string(connections.established_count));
+  out << "Addresses are numeric (no DNS resolution is performed).\n";
+
+  if (connections.connections.empty()) {
+    out << "\nNo network connections found.\n";
+    return;
+  }
+  if (connections.truncated) {
+    out << "\nResults truncated: only the first "
+        << connections.connections.size() << " of at least "
+        << connections.connections.size() + 1
+        << " connections are shown.\n";
+  }
+
+  out << "\n"
+         "FD  Protocol  Local Address                Local Port  "
+         "Remote Address               Remote Port  State\n";
+  for (const atm::ProcessNetworkConnection &conn : connections.connections) {
+    out << std::right << std::setw(3) << conn.fd << "  " << std::left
+        << std::setw(9) << atm::connectionProtocolName(conn.protocol)
+        << std::setw(30) << conn.local_address << std::right
+        << std::setw(11) << conn.local_port << "  " << std::left
+        << std::setw(31) << conn.remote_address << std::right
+        << std::setw(12) << conn.remote_port;
+
+    std::string state;
+    if (conn.protocol == atm::ConnectionProtocol::Udp4 ||
+        conn.protocol == atm::ConnectionProtocol::Udp6) {
+      state = "UNCONNECTED";
+    } else if (conn.tcp_state.has_value()) {
+      state = atm::tcpStateName(*conn.tcp_state);
+    }
+    out << "  " << state << '\n';
+  }
+}
+
 /// Renders the full detailed breakdown for one process (Step 13). Every
 /// field degrades to "N/A" when it could not be read; nothing here re-reads
 /// /proc — the data was already collected by ProcessDetails.
@@ -1853,6 +1930,13 @@ std::string renderProcessDetails(const atm::ProcessDetailsInfo &info,
     out << "Loading memory maps...\n";
   } else {
     renderMemoryMapsSection(out, *info.memory_maps, maps_filter);
+  }
+
+  out << "\n## Network Connections\n\n";
+  if (!info.network_connections.has_value()) {
+    out << "Loading network connections...\n";
+  } else {
+    renderNetworkConnectionsSection(out, *info.network_connections);
   }
 
   return out.str();
