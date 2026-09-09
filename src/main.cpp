@@ -220,6 +220,7 @@ std::string formatProcessRow(const atm::Process &process) {
       << std::setw(kNameColumnWidth) << fitName(process.name) << "  "
       << std::right << std::setw(8) << (formatPercent(process.cpu_percent) + "%")
       << "  " << std::setw(9) << formatKibibytes(process.memory_kib) << "  "
+      << std::setw(6) << process.thread_count << "  "
       << std::left << std::setw(10) << atm::processStateName(process.state);
   return out.str();
 }
@@ -1499,7 +1500,7 @@ std::string buildInterfaceDetail(const atm::NetworkInterfaceStats &iface) {
 void renderProcessTable(std::ostringstream &out,
                         const std::vector<atm::Process> &processes) {
   out << "\n## PROCESSES\n\n"
-      << "    PID  NAME                     CPU        RAM  STATE\n";
+      << "    PID  NAME                     CPU        RAM   THR  STATE\n";
   for (const atm::Process &process : processes) {
     out << "  " << formatProcessRow(process) << '\n';
   }
@@ -1556,6 +1557,47 @@ std::string formatDuration(std::uint64_t seconds) {
 /// "N/A" when absent.
 std::string orNa(const std::string &value) {
   return value.empty() ? std::string("N/A") : value;
+}
+
+/// Formats an I/O throughput value (bytes/second). Zero rates are rendered as
+/// "0 B/s" (or "N/A" when no I/O data is available); otherwise the network
+/// rate formatter produces a human-readable unit such as "12.3 MB/s".
+/// Returns "N/A" when `available` is false (permission-denied I/O).
+std::string formatIoRate(double bytes_per_second, bool available) {
+  if (!available) {
+    return "N/A";
+  }
+  if (bytes_per_second < 0.0) {
+    return "N/A";
+  }
+  return atm::formatNetworkRate(
+      static_cast<std::uint64_t>(bytes_per_second + 0.5));
+}
+
+/// Renders one resource-limit row as "Label: soft / hard", where either side
+/// shows "Unlimited" or a formatted value and the whole row is "N/A" when the
+/// limit could not be parsed. `as_count` selects a plain count (files,
+/// processes, signals, queues) versus a byte-based limit.
+void renderLimit(std::ostringstream &out, const std::string &label,
+                 const std::optional<atm::ResourceLimit> &limit,
+                 bool as_count) {
+  if (!limit.has_value()) {
+    appendLabeled(out, label + ":", "N/A");
+    return;
+  }
+  const auto side = [as_count](std::optional<std::uint64_t> value,
+                               bool unlimited) {
+    if (unlimited) {
+      return std::string("Unlimited");
+    }
+    if (value.has_value()) {
+      return as_count ? std::to_string(*value) : atm::formatBytes(*value);
+    }
+    return std::string("N/A");
+  };
+  appendLabeled(out, label + ":",
+                side(limit->soft, limit->soft_unlimited) + " / " +
+                    side(limit->hard, limit->hard_unlimited));
 }
 
 /// Renders the full detailed breakdown for one process (Step 13). Every
@@ -1671,6 +1713,10 @@ std::string renderProcessDetails(const atm::ProcessDetailsInfo &info) {
                 info.write_bytes.has_value()
                     ? atm::formatBytes(*info.write_bytes)
                     : std::string("N/A"));
+  appendLabeled(out, "Read Rate:",
+                formatIoRate(info.read_rate, info.read_bytes.has_value()));
+  appendLabeled(out, "Write Rate:",
+                formatIoRate(info.write_rate, info.write_bytes.has_value()));
   appendLabeled(out, "Read Calls:",
                 info.read_syscalls.has_value()
                     ? formatThousands(*info.read_syscalls)
@@ -1683,6 +1729,25 @@ std::string renderProcessDetails(const atm::ProcessDetailsInfo &info) {
                 info.cancelled_write_bytes.has_value()
                     ? atm::formatBytes(*info.cancelled_write_bytes)
                     : std::string("N/A"));
+
+  out << "\n## Resource Limits\n\n";
+  if (info.limits.empty()) {
+    appendLabeled(out, "Limits:", "N/A (unavailable)");
+  } else {
+    renderLimit(out, "Open Files", info.limits.open_files, true);
+    renderLimit(out, "Processes", info.limits.max_processes, true);
+    renderLimit(out, "Stack Size", info.limits.max_stack_size, false);
+    renderLimit(out, "Locked Memory", info.limits.locked_memory, false);
+    renderLimit(out, "Address Space", info.limits.address_space, false);
+    renderLimit(out, "Core File Size", info.limits.core_file_size, false);
+    renderLimit(out, "Pending Signals", info.limits.pending_signals, true);
+    renderLimit(out, "POSIX Msg Queues", info.limits.posix_message_queues,
+                true);
+    renderLimit(out, "Realtime Priority", info.limits.realtime_priority, true);
+    renderLimit(out, "Realtime Timeout", info.limits.realtime_timeout, false);
+    out << "Resource limits are read-only and not modified by this "
+           "application.\n";
+  }
 
   return out.str();
 }
@@ -1758,7 +1823,8 @@ std::string renderFrame(double cpu_usage, const atm::MemoryInfo &memory,
   out << "\n---\n\n"
          "Processes: "
       << processes.size() << "\n"
-      << "Sort: [1] CPU  [2] Memory  [3] PID  [4] Name"
+      << "Sort: [1] CPU  [2] Memory  [3] PID  [4] Name  [5] Threads"
+         "  [6] Read  [7] Write"
          " (current: "
       << atm::processSortName(sort) << ")\n"
       << "View: [l] Process List  [t] Process Tree (current: List)\n"
@@ -1864,6 +1930,9 @@ class ConsoleInput {
     SortMemory,
     SortPid,
     SortName,
+    SortThreads,
+    SortReadRate,
+    SortWriteRate,
     ViewList,
     ViewTree,
     Manage,
@@ -1969,6 +2038,9 @@ class ConsoleInput {
     if (token == "2") return Command::SortMemory;
     if (token == "3") return Command::SortPid;
     if (token == "4") return Command::SortName;
+    if (token == "5") return Command::SortThreads;
+    if (token == "6") return Command::SortReadRate;
+    if (token == "7") return Command::SortWriteRate;
     if (token == "l" || token == "L") return Command::ViewList;
     if (token == "t" || token == "T") return Command::ViewTree;
     if (token == "m" || token == "M") return Command::Manage;
@@ -2039,7 +2111,7 @@ void showProcessSelection(const std::vector<atm::Process> &processes,
                "========================================\n\n"
             << "Process list (sorted by " << atm::processSortName(sort)
             << "):\n\n"
-            << "    PID  NAME                     CPU        RAM  STATE\n";
+            << "    PID  NAME                     CPU        RAM   THR  STATE\n";
   for (const atm::Process &process : processes) {
     std::cout << "  " << formatProcessRow(process) << '\n';
   }
@@ -2413,6 +2485,7 @@ void interactProcessDetail(atm::ProcessDetails &details,
                 << "\nPress Enter to return to the process list.\n"
                 << std::flush;
       static_cast<void>(input.readLine());
+      details.forgetBaseline(pid);
       return;
     }
 
@@ -2433,10 +2506,12 @@ void interactProcessDetail(atm::ProcessDetails &details,
     const std::optional<std::string> action_line = input.readLine();
     if (!action_line) {
       std::cout << "\nInput cancelled.\n";
+      details.forgetBaseline(pid);
       return;
     }
     const std::string action_text = trimWhitespace(*action_line);
     if (action_text == "0" || action_text.empty()) {
+      details.forgetBaseline(pid);
       return;  // Back to the live view
     }
     if (action_text == "1") {
@@ -3872,6 +3947,15 @@ int main() {
         break;
       case ConsoleInput::Command::SortName:
         sort = atm::ProcessSort::Name;
+        break;
+      case ConsoleInput::Command::SortThreads:
+        sort = atm::ProcessSort::Threads;
+        break;
+      case ConsoleInput::Command::SortReadRate:
+        sort = atm::ProcessSort::ReadRate;
+        break;
+      case ConsoleInput::Command::SortWriteRate:
+        sort = atm::ProcessSort::WriteRate;
         break;
       case ConsoleInput::Command::ViewList:
         view = ViewMode::List;

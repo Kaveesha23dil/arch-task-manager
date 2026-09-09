@@ -12,6 +12,7 @@
 #include <unistd.h>
 
 #include "cpu_monitor.hpp"
+#include "process_resources.hpp"
 
 namespace atm {
 
@@ -49,119 +50,6 @@ int parseInt(std::string_view view) {
   return result;
 }
 
-/// Parses a leading unsigned 64-bit integer without throwing; returns 0 on
-/// failure, so a malformed field degrades to "no data" instead of crashing.
-std::uint64_t parseU64(std::string_view view) {
-  std::uint64_t result = 0;
-  std::from_chars(view.data(), view.data() + view.size(), result);
-  return result;
-}
-
-/// Parsed fields of /proc/<pid>/stat that the monitor needs.
-struct StatData {
-  std::string comm;
-  char state = '?';
-  int ppid = 0;
-  std::uint64_t utime = 0;
-  std::uint64_t stime = 0;
-  std::uint32_t num_threads = 0;
-};
-
-/**
- * Parses a /proc/<pid>/stat line.
- *
- * The comm field is wrapped in parentheses and may itself contain spaces or
- * parentheses, so it is located between the first '(' and the last ')'.
- * Every field after that closing ')' is whitespace-separated. Skipping the
- * two leading fields (pid, comm), the fields used here (1-indexed in the
- * kernel ABI) are: 3=state, 4=ppid, 14=utime, 15=stime, 20=num_threads.
- * Tail index N maps to kernel field N + 3, so utime/stime are indices 11/12
- * and num_threads is index 17.
- */
-std::optional<StatData> parseStat(std::string_view line) {
-  const std::size_t open = line.find('(');
-  const std::size_t close = line.rfind(')');
-  if (open == std::string_view::npos || close == std::string_view::npos ||
-      close < open) {
-    return std::nullopt;  // malformed — no well-formed comm
-  }
-
-  std::vector<std::string> fields;
-  {
-    std::istringstream tail{std::string(line.substr(close + 1))};
-    std::string field;
-    while (tail >> field) {
-      fields.push_back(field);
-    }
-  }
-  // Indices 0..12 map to kernel fields 3..15; stime is the last required
-  // one, so anything shorter is a truncated (orphaned) line.
-  if (fields.size() < 13) {
-    return std::nullopt;
-  }
-
-  StatData data;
-  data.comm = std::string(line.substr(open + 1, close - open - 1));
-  if (!fields[0].empty()) {
-    data.state = fields[0].front();
-  }
-  data.ppid = parseInt(fields[1]);
-  data.utime = parseU64(fields[11]);
-  data.stime = parseU64(fields[12]);
-  if (fields.size() > 17) {
-    data.num_threads = static_cast<std::uint32_t>(parseU64(fields[17]));
-  }
-  return data;
-}
-
-/// Parsed fields of /proc/<pid>/status that the monitor needs.
-struct StatusData {
-  char state = '?';
-  std::uint32_t uid = 0;
-  std::uint32_t threads = 0;
-  std::uint64_t vm_rss_kib = 0;
-};
-
-/**
- * Parses /proc/<pid>/status, picking out State, Uid (real, first value),
- * Threads, and VmRSS. Missing fields keep their defaults.
- */
-StatusData parseStatus(std::string_view contents) {
-  StatusData data;
-  std::istringstream lines{std::string(contents)};
-  std::string line;
-  while (std::getline(lines, line)) {
-    std::istringstream head(line);
-    std::string key;
-    if (!(head >> key)) {
-      continue;
-    }
-    if (key == "State:") {
-      std::string value;
-      if (head >> value && !value.empty()) {
-        data.state = value.front();
-      }
-    } else if (key == "Uid:") {
-      std::uint32_t value = 0;
-      if (head >> value) {
-        data.uid = value;  // real UID; effective/saved/fs follow on the line
-      }
-    } else if (key == "Threads:") {
-      std::uint32_t value = 0;
-      if (head >> value) {
-        data.threads = value;
-      }
-    } else if (key == "VmRSS:") {
-      std::uint64_t value = 0;
-      std::string unit;
-      if (head >> value >> unit) {
-        data.vm_rss_kib = value;
-      }
-    }
-  }
-  return data;
-}
-
 /// Reads /proc/<pid>/cmdline (NUL-separated argv) joined with spaces. Returns
 /// an empty string for kernel threads, whose cmdline is empty.
 std::string readCommandLine(std::string_view dir) {
@@ -189,7 +77,8 @@ std::optional<Process> readProcess(const std::string &dir, int pid,
   if (!stat) {
     return std::nullopt;
   }
-  const std::optional<StatData> stat_data = parseStat(*stat);
+  const std::optional<ProcessStatParse> stat_data =
+      parseProcessStat(*stat);
   if (!stat_data) {
     return std::nullopt;  // malformed stat — treat as invalid
   }
@@ -202,11 +91,12 @@ std::optional<Process> readProcess(const std::string &dir, int pid,
   process.parent_pid = stat_data->ppid;
   process.thread_count = stat_data->num_threads;
   process.cpu_ticks = stat_data->utime + stat_data->stime;
+  process.starttime_ticks = stat_data->starttime_ticks;
   process.command_line = readCommandLine(dir);
 
   const std::optional<std::string> status = readFile(dir + "/status");
   if (status) {
-    const StatusData status_data = parseStatus(*status);
+    const ProcessStatusParse status_data = parseProcessStatus(*status);
     if (process.state == ProcessState::Unknown && status_data.state != '?') {
       process.state_char = status_data.state;
       process.state = processStateFromChar(status_data.state);
@@ -218,6 +108,19 @@ std::optional<Process> readProcess(const std::string &dir, int pid,
       process.thread_count = status_data.threads;
     }
     process.memory_kib = status_data.vm_rss_kib;
+    process.shared_memory_kib = status_data.shared_kib;
+  }
+
+  // /proc/<pid>/io provides per-process I/O counters. Permission-dependent:
+  // when it cannot be read (EACCES/EPERM, or the process vanished) the
+  // counters simply stay unavailable — never an application-wide failure.
+  if (const std::optional<std::string> io = readFile(dir + "/io"); io) {
+    const ProcessIoCounters io_data = parseProcessIo(*io);
+    process.io_available = io_data.available;
+    process.read_bytes = io_data.read_bytes;
+    process.write_bytes = io_data.write_bytes;
+    process.read_syscalls = io_data.read_syscalls;
+    process.write_syscalls = io_data.write_syscalls;
   }
 
   if (system_total_kib != 0) {
@@ -349,6 +252,33 @@ void sortProcesses(std::vector<Process> &processes, ProcessSort sort) {
                          return a.pid < b.pid;
                        });
       break;
+    case ProcessSort::Threads:
+      std::stable_sort(processes.begin(), processes.end(),
+                       [](const Process &a, const Process &b) {
+                         if (a.thread_count != b.thread_count) {
+                           return a.thread_count > b.thread_count;
+                         }
+                         return a.pid < b.pid;
+                       });
+      break;
+    case ProcessSort::ReadRate:
+      std::stable_sort(processes.begin(), processes.end(),
+                       [](const Process &a, const Process &b) {
+                         if (a.read_rate != b.read_rate) {
+                           return a.read_rate > b.read_rate;
+                         }
+                         return a.pid < b.pid;
+                       });
+      break;
+    case ProcessSort::WriteRate:
+      std::stable_sort(processes.begin(), processes.end(),
+                       [](const Process &a, const Process &b) {
+                         if (a.write_rate != b.write_rate) {
+                           return a.write_rate > b.write_rate;
+                         }
+                         return a.pid < b.pid;
+                       });
+      break;
   }
 }
 
@@ -362,6 +292,12 @@ const char *processSortName(ProcessSort sort) {
       return "PID";
     case ProcessSort::Name:
       return "Name";
+    case ProcessSort::Threads:
+      return "Threads";
+    case ProcessSort::ReadRate:
+      return "Read Rate";
+    case ProcessSort::WriteRate:
+      return "Write Rate";
   }
   return "CPU";
 }
@@ -389,6 +325,9 @@ ProcessSnapshot ProcessMonitor::read(std::uint64_t system_total_kib) {
           static_cast<double>(num_cpus) * 100.0 / static_cast<double>(total_delta);
     }
   }
+
+  // Timestamp for the elapsed window used by I/O rate calculation.
+  const auto now = std::chrono::steady_clock::now();
 
   // Enumerate /proc and read every numeric directory as a process.
   try {
@@ -425,6 +364,26 @@ ProcessSnapshot ProcessMonitor::read(std::uint64_t system_total_kib) {
         }
       }
 
+      // I/O rates are the I/O-counter delta over the elapsed window, gated by
+      // process identity so a reused/restarted PID never reports a bogus rate.
+      if (process->io_available && has_previous_scan_) {
+        const Identity identity{pid, process->starttime_ticks};
+        const auto previous = previous_io_.find(identity);
+        const bool same_process = previous != previous_io_.end();
+        const double elapsed_seconds = std::chrono::duration<double>(
+            now - previous_scan_time_).count();
+        const ProcessIoCounters current_io{
+            true, process->read_bytes, process->write_bytes,
+            process->read_syscalls, process->write_syscalls,
+            /*cancelled=*/0};
+        const ProcessIoCounters prev_io =
+            same_process ? previous->second : ProcessIoCounters{};
+        const IoRates rates =
+            computeIoRates(same_process, prev_io, current_io, elapsed_seconds);
+        process->read_rate = rates.read_rate;
+        process->write_rate = rates.write_rate;
+      }
+
       snapshot.processes.push_back(std::move(*process));
     }
   } catch (const std::exception &) {
@@ -435,9 +394,21 @@ ProcessSnapshot ProcessMonitor::read(std::uint64_t system_total_kib) {
   // Record samples for the next read to diff against.
   previous_ticks_.clear();
   previous_ticks_.reserve(snapshot.processes.size());
+  previous_io_.clear();
+  previous_io_.reserve(snapshot.processes.size());
   for (const Process &process : snapshot.processes) {
     previous_ticks_.emplace(process.pid, process.cpu_ticks);
+    if (process.io_available) {
+      previous_io_.emplace(
+          Identity{process.pid, process.starttime_ticks},
+          ProcessIoCounters{true, process.read_bytes, process.write_bytes,
+                            process.read_syscalls, process.write_syscalls,
+                            /*cancelled=*/0});
+    }
   }
+  previous_scan_time_ = now;
+  has_previous_scan_ = true;
+
   if (current_total.has_value()) {
     previous_total_ticks_ = current_total;
   } else {

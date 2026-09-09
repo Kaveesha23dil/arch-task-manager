@@ -5,14 +5,15 @@ Linux. It reads system information **directly from Linux interfaces** such as
 `/proc/stat`, `/proc/meminfo`, and `/proc/<pid>/` — no shelling out to `ps`,
 `free`, `top`, `htop`, or other external tools.
 
-> Stage: **Step 20** — CPU, RAM, swap, process monitoring, process actions, the
+> Stage: **Step 22** — CPU, RAM, swap, process monitoring, process actions, the
 > process tree, disk/storage monitoring, network monitoring, GPU monitoring,
 > temperature & hardware sensor monitoring, systemd service management,
 > startup application management, system information / hardware overview,
 > real-time resource history & graphs, resource alerts & threshold monitoring,
 > desktop notifications via D-Bus, Arch Linux package update detection,
-> application settings with persistent configuration, and XDG desktop
-> autostart for the application itself.
+> application settings with persistent configuration, XDG desktop
+> autostart for the application itself, and per-process resource monitoring
+> with read-only resource limits.
 > Everything else on the roadmap is intentionally **not** implemented yet, but
 > the code is structured so future modules can be added without rewriting the
 > existing ones.
@@ -55,6 +56,19 @@ feature per milestone, hosted on GitHub.
       kernel processes, permission-denied files) degrade to "N/A" instead of
       crashing, and information is refreshed on demand without a separate
       thread.
+- [x] **Per-process resource monitoring & limits** — the live process table now
+      shows a thread count column and can be sorted by CPU, memory, PID, name,
+      thread count, or per-process read/write rates (`5`/`6`/`7`). Read/write
+      throughput comes from two samples of `/proc/<pid>/io` guarded by the
+      process identity (PID + kernel start time), so a restarted process that
+      reuses a PID never produces a bogus rate. The inspector adds a "Resource
+      Limits" section read straight from `/proc/<pid>/limits` (open files,
+      processes, stack size, locked memory, address space, core file size,
+      pending signals, POSIX message queues, realtime priority and timeout)
+      with `unlimited` rendered as text rather than `RLIM_INFINITY`. Everything
+      here is **read-only observation**: limits are displayed, never modified
+      (`setrlimit`, cgroups, priorities, CPU affinity and rejoining sessions
+      are all out of scope).
 - [x] **Disk / storage monitoring** — physical filesystem capacities via
       `statvfs(2)` over the mounts listed in `/proc/mounts`, real-time
       read/write throughput from two samples of `/proc/diskstats`, and whole
@@ -455,11 +469,11 @@ Startup apps: press 'a' (then Enter) to manage autostart
 
 ## PROCESSES
 
-    PID  NAME             CPU       RAM     STATE
-   1245  firefox         18.4%     1.2 GB  Running
-   2187  code            12.1%     856 MB  Sleeping
-    982  hyprland         4.2%     320 MB  Sleeping
-    431  systemd          0.1%      18 MB  Sleeping
+    PID  NAME             CPU       RAM     THR  STATE
+   1245  firefox         18.4%     1.2 GB     42  Running
+   2187  code            12.1%     856 MB     18  Sleeping
+    982  hyprland         4.2%     320 MB      8  Sleeping
+    431  systemd          0.1%      18 MB      1  Sleeping
 
 ## Process Statistics
 
@@ -472,7 +486,7 @@ Zombie:                4
 ---
 
 Processes: 186
-Sort: [1] CPU  [2] Memory  [3] PID  [4] Name (current: CPU)
+Sort: [1] CPU  [2] Memory  [3] PID  [4] Name  [5] Threads  [6] Read  [7] Write (current: CPU)
 View: [l] Process List  [t] Process Tree (current: List)
 Manage: press 'm' (then Enter) to control a process by PID
 Details: press 'd' (then Enter) to inspect a process in detail
@@ -526,6 +540,9 @@ the next refresh:
 - `2` — Memory usage (descending)
 - `3` — PID (ascending)
 - `4` — Process name (ascending, case-insensitive)
+- `5` — Thread count (descending)
+- `6` — I/O read rate (descending)
+- `7` — I/O write rate (descending)
 
 The tree is always drawn with children ordered by **PID ascending** — sorting
 options for the tree are deliberately not added yet to keep the CLI simple.
@@ -759,13 +776,23 @@ selected process's `/proc/<pid>` directory directly — never by shelling out to
 | Memory             | `/proc/<pid>/status` (`VmSize`, `VmRSS`, `VmExe`, `VmData`, `VmStk`), `/proc/<pid>/statm` | virtual, resident, shared, text, data, stack, memory % |
 | CPU                | `/proc/<pid>/stat` (`utime`, `stime`) + the process table's CPU % | user time, system time, CPU %, thread count |
 | Context switches   | `/proc/<pid>/status` (voluntary/nonvoluntary) | voluntary, non-voluntary counts |
-| I/O statistics     | `/proc/<pid>/io`                              | read bytes, written bytes, read/write syscalls, cancelled writes |
+| I/O statistics     | `/proc/<pid>/io`                              | read bytes, written bytes, read/write syscalls, cancelled writes, read/write **rates** |
+| Resource limits    | `/proc/<pid>/limits`                          | open files, processes, stack size, locked memory, address space, core file size, pending signals, POSIX message queues, realtime priority, realtime timeout |
 
 Start time is derived from the `starttime` tick in `/proc/<pid>/stat`, the
 system uptime (`/proc/uptime`) and the current clock; "Running For" reports the
 process age. Memory values are converted to human-readable units (kB / MB / GB)
 and the CPU % shown is the same value the process table computed, reused rather
 than recomputed by a second tracker.
+
+The read/write **rates** are computed between two inspector refreshes from the
+`/proc/<pid>/io` counters, guarded by the process identity (PID + kernel start
+time from `/proc/<pid>/stat`). If the process restarted (e.g. a PID got reused)
+or a counter reset, the rate falls back to `0` rather than reporting a bogus
+negative throughput. The **Resource limits** table reflects the kernel's
+`/proc/<pid>/limits` verbatim: `unlimited` is rendered as `Unlimited` (not the
+`RLIM_INFINITY` sentinel), and everything is read-only — the limits are never
+changed from the application.
 
 ### Permission limitations
 
