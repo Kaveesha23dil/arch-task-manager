@@ -583,6 +583,20 @@ ProcessDetails::getProcessDetails(pid_t pid, std::uint64_t system_total_kib,
         ProcessIdentity{pid, *info.starttime_ticks});
   }
 
+  // Cgroups (read-only metadata) from /proc/<pid>/cgroup, collected on this
+  // same refresh pass and gated by the process identity so a reused PID never
+  // shows another process's cgroup membership. For the unified cgroup v2
+  // hierarchy the selected process's own cgroup directory (resolved from the
+  // mounted cgroup filesystem in /proc/self/mountinfo) and its read-only
+  // control/metadata files are read; nothing is ever written, no controller is
+  // enabled or disabled and no process is moved. Resource values describe the
+  // whole cgroup, not just this process.
+  if (info.starttime_ticks.has_value()) {
+    const ProcessCgroupManager cgroups;
+    info.cgroups = cgroups.inspect(
+        ProcessIdentity{pid, *info.starttime_ticks});
+  }
+
   // Start time: boot wall-clock + (starttime ticks / USER_HZ). Running time =
   // system uptime − (starttime ticks / USER_HZ).
   if (stat_data->starttime_ticks.has_value()) {

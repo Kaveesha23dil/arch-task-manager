@@ -5,7 +5,7 @@ Linux. It reads system information **directly from Linux interfaces** such as
 `/proc/stat`, `/proc/meminfo`, and `/proc/<pid>/` — no shelling out to `ps`,
 `free`, `top`, `htop`, or other external tools.
 
-> Stage: **Step 27** — CPU, RAM, swap, process monitoring, process actions, the
+> Stage: **Step 28** — CPU, RAM, swap, process monitoring, process actions, the
 > process tree, disk/storage monitoring, network monitoring, GPU monitoring,
 > temperature & hardware sensor monitoring, systemd service management,
 > startup application management, system information / hardware overview,
@@ -16,8 +16,9 @@ Linux. It reads system information **directly from Linux interfaces** such as
 > with read-only resource limits, per-process CPU affinity & nice
 > priority management (confirmed, identity-checked scheduling changes),
 > a read-only per-process memory-maps inspector, a read-only
-> per-process network-connections inspector, and a read-only
-> per-process namespaces inspector.
+> per-process network-connections inspector, a read-only
+> per-process namespaces inspector, and a read-only per-process
+> cgroups inspector.
 > Everything else on the roadmap is intentionally **not** implemented yet, but
 > the code is structured so future modules can be added without rewriting the
 > existing ones.
@@ -128,6 +129,25 @@ feature per milestone, hosted on GitHub.
       states are distinct and never crash the app, unreadable entries are shown
       as unavailable without inventing IDs, and only the selected process's
       namespace directory is ever scanned.
+- [x] **Process cgroup inspection** — a read-only **Cgroups** section in the
+      process inspector that reads the selected process's cgroup membership
+      from `/proc/<pid>/cgroup` natively and resolves it against the cgroup
+      filesystems discovered in `/proc/self/mountinfo` (the mount point is
+      detected, never hard-coded). For the unified **cgroup v2** hierarchy a
+      small set of read-only control files of the process's own cgroup
+      directory is additionally displayed (CPU weight and `cpu.max` quota/
+      period, `memory.current` / `memory.max` / `memory.high`, `pids.current` /
+      `pids.max`, plus the available controllers and `cgroup.type`),
+      distinguishing a current value, a configured limit, and the unlimited
+      (`max`) marker. On **cgroup v1** each controller hierarchy is listed
+      separately with its mount point; no v2-style resource files are invented.
+      Results are identity-gated against PID reuse, permission-denied /
+      disappeared / malformed / unavailable / truncated states are distinct and
+      never crash the app, path components of the untrusted membership file are
+      sanitised so nothing can escape the cgroup mount, unreadable values are
+      shown as unavailable (never fabricated), nothing is ever written (no
+      limits changed, no controllers enabled/disabled, no process moved), and
+      no external tool (`systemd-cgls`, `cgget`, `ps`, shell) is used.
 - [x] **Disk / storage monitoring** — physical filesystem capacities via
       `statvfs(2)` over the mounts listed in `/proc/mounts`, real-time
       read/write throughput from two samples of `/proc/diskstats`, and whole
@@ -827,8 +847,8 @@ Control actions 2–5 reuse the existing `ProcessActions` wrappers (no signal
 logic is re-implemented) and scheduling actions 6–7 go through the dedicated
 scheduling manager; all of them are blocked for PID `1` / the monitor's own PID.
 Actions 8–9 are read-only display filters for the Memory Maps section and need
-no confirmation. The Network Connections and Namespaces sections (below) are
-purely read-only and have no action keys.
+no confirmation. The Network Connections, Namespaces and Cgroups sections
+(below) are purely read-only and have no action keys.
 
 ### Information displayed
 
@@ -849,6 +869,7 @@ selected process's `/proc/<pid>` directory directly — never by shelling out to
 | Memory maps        | `/proc/<pid>/maps`                       | per-mapping start/end address, size, permission string, file offset, device, inode, pathname; summary counts |
 | Network connections | `/proc/<pid>/fd` (`socket:[inode]`) + `/proc/net/tcp{,6}`, `/proc/net/udp{,6}`, `/proc/net/unix` | per-socket FD, protocol, numeric local/remote address + port, TCP state, Unix path/type/state; summary counts |
 | Namespaces          | `/proc/<pid>/ns` (readlink)                 | per-namespace type (with kernel short name), numeric ID, raw symlink target; availability/partial states; summary counts |
+| Cgroups             | `/proc/<pid>/cgroup` + `/proc/self/mountinfo` + the selected cgroup v2 directory's read-only control files | cgroup version (v1/v2), per-hierarchy id/controllers/path/mount point; v2: CPU weight, `cpu.max` quota/period, memory current/max/high, pids current/max, controllers, `cgroup.type`; current-vs-limit-vs-unlimited distinction |
 
 Start time is derived from the `starttime` tick in `/proc/<pid>/stat`, the
 system uptime (`/proc/uptime`) and the current clock; "Running For" reports the
@@ -1113,7 +1134,7 @@ Each state is distinct and never crashes the application.
 
 ## Process namespace inspection
 
-The details screen ends with a **Namespaces** section listing the Linux
+The details screen includes a **Namespaces** section listing the Linux
 namespaces the selected process belongs to, read directly from
 `/proc/<pid>/ns` on every inspector refresh (and only then — the main process
 monitor never scans `/*/ns`). It is a **read-only metadata** view: nothing
@@ -1198,6 +1219,121 @@ kernel ever exposes more.
   identity (PID + start-time tick, the same mechanism used by the scheduling
   editor) and the stale result is discarded — a reused PID never shows another
   process's namespace IDs.
+
+Each state is distinct and never crashes the application.
+
+## Process cgroup inspection
+
+The details screen ends with a **Cgroups** section showing which Linux cgroup
+hierarchies the selected process belongs to and, for the unified **cgroup v2**
+hierarchy, a small read-only resource/metadata snapshot of the process's own
+cgroup directory. Everything is read natively on every inspector refresh (and
+only then): `/proc/<pid>/cgroup`, `/proc/self/mountinfo`, and the control files
+of the selected cgroup directory. No external command (`systemd-cgls`,
+`systemd-cgtop`, `cgget`, `ps`, ...) and no shell or subprocess at all is used,
+and no root privileges are required.
+
+### Read-only, always
+
+The section is strictly **read-only inspection**: it reads membership and a set
+of control files (`cpu.weight`, `cpu.max`, `memory.current`, `memory.max`,
+`memory.high`, `pids.current`, `pids.max`, `cgroup.controllers`,
+`cgroup.type`). It never writes anything — no limit is changed, no controller
+is enabled or disabled in `cgroup.subtree_control`, no process is moved, no
+`echo >` happens, and no freeze/notify_on_release switch is touched. cgroup
+management, container detection and persistent rule editing are deliberately
+out of scope.
+
+### cgroup v1 vs cgroup v2
+
+Linux offers two cgroup interfaces:
+
+- **cgroup v1** mounts multiple per-controller hierarchies (`/sys/fs/cgroup/
+  cpu`, `/sys/fs/cgroup/memory`, ...). `/proc/<pid>/cgroup` then contains one
+  record per controlled hierarchy:
+  `5:cpu,cpuacct:/user.slice`. The application lists each hierarchy separately
+  with its hierarchy id, controllers, relative path and (when a matching
+  `cgroup` mount is found) its mount point. Linux cgroup-on-cgroupfs/legacy
+  setups may hide the per-controller mounts; the section then shows the
+  relative path without inventing a mount point.
+- **cgroup v2** mounts one unified hierarchy (`/sys/fs/cgroup`, typically) and
+  `/proc/<pid>/cgroup` has a single record `0::/relative/path`. The relative
+  path is resolved against the `cgroup2` mount found in `/proc/self/mountinfo`
+  (the mount location is **detected**, never hard-coded as `/sys/fs/cgroup`),
+  and the process's own cgroup directory's read-only files are displayed.
+
+On a hybrid system both kinds of records appear; the unified v2 resources are
+still read, and every additional v1 hierarchy is listed separately.
+
+### What is shown
+
+For the unified v2 hierarchy the **Path** (relative), the controllers available
+at that cgroup (`cgroup.controllers`), the `cgroup.type`, and three groups of
+resource values:
+
+```text
+CPU
+  Weight:  N/A                     (cpu.weight; absent if the CPU controller
+                                   is not enabled at this level)
+  Max:     100000 / 100000 µs      (cpu.max quota/period, with the resulting
+                                   percentage when the quota is finite)
+Memory
+  Current: 1.6 GB                  (memory.current — a current value)
+  Max:     unlimited               (memory.max — a configured limit; "max")
+  High:    10.0 GB                 (memory.high — a configured limit)
+Processes
+  Current: 234                     (pids.current)
+  Max:     9326                    (pids.max — a configured limit)
+```
+
+### Current vs limit vs unlimited
+
+Every value is labelled by what it is: **current** values (`memory.current`,
+`pids.current`), **configured limits** (`memory.max`, `memory.high`,
+`pids.max`, `cpu.max`) and the **unlimited** marker, which is shown literally
+when a control file contains the kernel's `max` token (e.g. `memory.max = max`
+→ "unlimited", not a huge fabricated number). A control file that does not
+exist — a controller not enabled at this level, like `cpu.weight` when the CPU
+controller is unavailable — is shown as **N/A**, never as zero or as some other
+invented value.
+
+### Cgroup values are not per-process values
+
+The resource files describe the state of the **whole cgroup directory**, which
+may contain many processes and threads (a systemd scope, a user session, a
+cgroup-namespaced child tree), not just the selected process. The section says
+so explicitly and never presents a cgroup aggregate as a per-process value.
+
+### Path safety
+
+The membership file is treated as **untrusted metadata**: its path components
+are sanity-checked lexically (`..`, `.` and empty components are rejected) and
+the resolved absolute path is therefore guaranteed to stay inside the cgroup
+mount. A record whose path cannot be resolved (for example a process in a
+nested cgroup namespace, where the kernel emits `..` components relative to the
+reader's cgroup namespace root) is displayed with its relative path, marked as
+not resolvable, and its resource values are reported as unavailable — it is
+never chased outside the mount and never treated as a regular directory.
+
+### Permission limitations
+
+Visibility follows Linux permissions. If `/proc/<pid>/cgroup` or the selected
+cgroup directory is withheld, the section reports **"Cgroup information
+unavailable: permission denied."** or **"Cgroup resource files were not
+readable"** respectively — never fabricated values and never a crash. If the
+cgroup filesystem is not mounted it reports **"Cgroup information
+unavailable."**; a membership file with no parseable record reports the data as
+malformed.
+
+### States and identity gating
+
+- Success (with the hierarchies the kernel exposes), including the v2 resource
+  block when it can be resolved.
+- A process that vanished mid-inspection shows **"Process no longer exists."**.
+- A PID that was reused while inspecting is detected through the process
+  identity (PID + start-time tick, the same mechanism used by the scheduling
+  editor) and the stale result is discarded — a reused PID never shows another
+  process's cgroup membership or resource values.
 
 Each state is distinct and never crashes the application.
 
@@ -1420,6 +1556,7 @@ arch-task-manager/
 │   ├── process_memory_map.hpp  # ProcessMemoryMap, /proc/<pid>/maps parser + manager
 │   ├── process_network.hpp     # ProcessNetworkConnectionManager, /proc/net/* + fd correlation
 │   ├── process_namespace.hpp   # ProcessNamespace + /proc/<pid>/ns readlink enumerator
+│   ├── process_cgroup.hpp      # ProcessCgroup + /proc/<pid>/cgroup + mountinfo resolver
 │   ├── process_tree.hpp        # ProcessTreeNode, ProcessTree, build/render
 │   ├── disk_monitor.hpp        # DiskUsage, BlockDevice, DiskSnapshot, DiskMonitor
 │   ├── network_monitor.hpp     # NetworkInterfaceStats, NetworkSnapshot, NetworkMonitor

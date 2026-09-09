@@ -35,6 +35,7 @@
 #include "package_manager.hpp"
 #include "package_transaction.hpp"
 #include "process_actions.hpp"
+#include "process_cgroup.hpp"
 #include "process_details.hpp"
 #include "process_memory_map.hpp"
 #include "process_monitor.hpp"
@@ -1843,6 +1844,184 @@ void renderNamespacesSection(
   }
 }
 
+/// Formats a CgroupValue that counts bytes: "N/A", "unlimited", or a 1024-base
+/// size like "1.6 GB".
+std::string formatCgroupBytes(const atm::CgroupValue &value) {
+  if (!value.available) {
+    return "N/A";
+  }
+  if (value.unlimited) {
+    return "unlimited";
+  }
+  return atm::formatBytes(value.value);
+}
+
+/// Formats a CgroupValue that counts items: "N/A", "unlimited", or a
+/// thousand-separated integer.
+std::string formatCgroupCount(const atm::CgroupValue &value) {
+  if (!value.available) {
+    return "N/A";
+  }
+  if (value.unlimited) {
+    return "unlimited";
+  }
+  return formatThousands(value.value);
+}
+
+/// Joins a controller list ("memory pids") or returns "N/A".
+std::string joinCgroupControllers(const std::vector<std::string> &controllers) {
+  if (controllers.empty()) {
+    return "N/A";
+  }
+  std::string joined;
+  for (std::size_t i = 0; i < controllers.size(); ++i) {
+    if (i > 0) {
+      joined.push_back(' ');
+    }
+    joined += controllers[i];
+  }
+  return joined;
+}
+
+/// Renders the read-only cgroup view of one process (Step 28). Everything is
+/// native: /proc/<pid>/cgroup, /proc/self/mountinfo and the selected cgroup's
+/// read-only control/metadata files. Nothing is ever written and no external
+/// tool is used. Resource values describe the whole cgroup — which may include
+/// other processes and threads — never only this process.
+void renderCgroupsSection(std::ostringstream &out,
+                          const atm::ProcessCgroupResult &cgroups) {
+  switch (cgroups.status) {
+    case atm::CgroupStatus::Success:
+      break;
+    case atm::CgroupStatus::PermissionDenied:
+      out << "Cgroup information unavailable: permission denied.\n";
+      return;
+    case atm::CgroupStatus::ProcessNotFound:
+    case atm::CgroupStatus::IdentityUnknown:
+      out << "Process no longer exists.\n";
+      return;
+    case atm::CgroupStatus::ProcessReused:
+      out << "The process identity changed (the PID was reused); cgroup "
+             "information was discarded.\n";
+      return;
+    case atm::CgroupStatus::InvalidPid:
+      out << "Invalid PID.\n";
+      return;
+    case atm::CgroupStatus::Unavailable:
+      out << "Cgroup information unavailable.\n";
+      return;
+    case atm::CgroupStatus::MalformedData:
+      out << "Cgroup information unavailable: membership data could not be "
+             "parsed.\n";
+      return;
+    case atm::CgroupStatus::ReadError:
+      out << "Cgroup information unavailable: "
+          << (cgroups.errno_value != 0
+                  ? std::strerror(cgroups.errno_value)
+                  : std::string("read failed"))
+          << ".\n";
+      return;
+  }
+
+  appendLabeled(out, "Version:", atm::cgroupVersionName(cgroups.version));
+
+  const atm::ProcessCgroupHierarchy *unified = nullptr;
+  for (const atm::ProcessCgroupHierarchy &hierarchy : cgroups.hierarchies) {
+    if (hierarchy.hierarchy_id == 0) {
+      unified = &hierarchy;
+      break;
+    }
+  }
+
+  bool showed_v2 = false;
+  if (unified != nullptr) {
+    showed_v2 = true;
+    appendLabeled(out, "Path:", unified->relative_path.empty()
+                                   ? std::string("N/A")
+                                   : unified->relative_path);
+    if (!unified->resolvable) {
+      out << "The cgroup path could not be resolved outside the cgroup mount "
+             "(the process may live in another cgroup namespace).\n";
+    }
+    const atm::ProcessCgroupResources &resources = cgroups.resources;
+    appendLabeled(out, "Controllers:",
+                  joinCgroupControllers(resources.controllers));
+    appendLabeled(out, "Type:", resources.type.empty() ? std::string("N/A")
+                                                       : resources.type);
+
+    out << "\nCPU\n";
+    out << "  Weight:  " << formatCgroupCount(resources.cpu_weight) << "\n";
+    if (resources.cpu_max.available && !resources.cpu_max.unlimited) {
+      out << "  Max:     " << formatThousands(resources.cpu_max.quota_usec)
+          << " / " << formatThousands(resources.cpu_max.period_usec) << " µs";
+      if (resources.cpu_max.period_usec > 0) {
+        out << " ("
+            << std::setprecision(1) << std::fixed
+            << (100.0 * static_cast<double>(resources.cpu_max.quota_usec) /
+                static_cast<double>(resources.cpu_max.period_usec))
+            << "%)";
+      }
+      out << "\n";
+    } else if (resources.cpu_max.available) {
+      out << "  Max:     unlimited\n";
+    } else {
+      out << "  Max:     N/A\n";
+    }
+
+    out << "\nMemory\n";
+    out << "  Current: " << formatCgroupBytes(resources.memory_current) << "\n";
+    out << "  Max:     " << formatCgroupBytes(resources.memory_max) << "\n";
+    out << "  High:    " << formatCgroupBytes(resources.memory_high) << "\n";
+
+    out << "\nProcesses\n";
+    out << "  Current: " << formatCgroupCount(resources.pids_current) << "\n";
+    out << "  Max:     " << formatCgroupCount(resources.pids_max) << "\n";
+
+    if (unified->resolvable && resources.readable_file_count == 0) {
+      out << "\nCgroup resource files were not readable (permission or kernel "
+             "configuration).\n";
+    } else if (!unified->resolvable) {
+      out << "\nCgroup resource values are unavailable: the cgroup path "
+             "cannot be resolved.\n";
+    }
+    out << "\nResource values describe the whole cgroup, which may include "
+           "other processes and threads; they are not per-process values.\n";
+  }
+
+  // Any additional (typically cgroup v1) hierarchies are listed separately.
+  std::vector<const atm::ProcessCgroupHierarchy *> extra;
+  for (const atm::ProcessCgroupHierarchy &hierarchy : cgroups.hierarchies) {
+    if (hierarchy.hierarchy_id != 0) {
+      extra.push_back(&hierarchy);
+    }
+  }
+  if (!extra.empty()) {
+    out << "\nThe process also belongs to these cgroup hierarchies:\n\n";
+    for (const atm::ProcessCgroupHierarchy *hierarchy : extra) {
+      const std::string controllers = joinCgroupControllers(
+          hierarchy->controllers);
+      out << "  Hierarchy " << hierarchy->hierarchy_id << "  Controllers "
+          << controllers << "  Path " << hierarchy->relative_path;
+      if (hierarchy->mount_point.empty()) {
+        out << "  [mount not found]";
+      } else {
+        out << "  [mounted at " << hierarchy->mount_point << "]";
+      }
+      out << "\n";
+    }
+    if (cgroups.truncated) {
+      out << "Results truncated: only the first " << cgroups.hierarchies.size()
+          << " records are shown.\n";
+    }
+    out << "\nFor cgroup v1 each controller hierarchy is separate; resource "
+           "control files are only read for the unified cgroup v2 hierarchy.\n";
+  }
+
+  if (!showed_v2 && cgroups.hierarchies.empty()) {
+    out << "No cgroup membership records were found.\n";
+  }
+}
+
 /// Renders the full detailed breakdown for one process (Step 13). Every
 /// field degrades to "N/A" when it could not be read; nothing here re-reads
 /// /proc — the data was already collected by ProcessDetails.
@@ -2023,6 +2202,13 @@ std::string renderProcessDetails(const atm::ProcessDetailsInfo &info,
     out << "Loading namespaces...\n";
   } else {
     renderNamespacesSection(out, *info.namespaces);
+  }
+
+  out << "\n## Cgroups\n\n";
+  if (!info.cgroups.has_value()) {
+    out << "Loading cgroup information...\n";
+  } else {
+    renderCgroupsSection(out, *info.cgroups);
   }
 
   return out.str();

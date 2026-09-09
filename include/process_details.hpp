@@ -7,6 +7,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "process_cgroup.hpp"
 #include "process_memory_map.hpp"
 #include "process_monitor.hpp"
 #include "process_namespace.hpp"
@@ -119,6 +120,14 @@ struct ProcessDetailsInfo {
   // as permission denied or process disappeared). Entries whose targets could
   // not be read are reported as unavailable, never as fabricated IDs.
   std::optional<ProcessNamespaceResult> namespaces;
+
+  // Read-only cgroup membership from /proc/<pid>/cgroup (and, for the unified
+  // cgroup v2 hierarchy, the read-only resource/metadata files of the process's
+  // own cgroup directory). Nullopt only when no process identity was available;
+  // otherwise always present (Success with one or more hierarchies, or a
+  // distinct error state). Resource values describe the whole cgroup — which
+  // may include other processes and threads — never just this process.
+  std::optional<ProcessCgroupResult> cgroups;
 
   // Start wall-clock time derived from the starttime tick, boot uptime and the
   // current clock. process_uptime_seconds is how long the process has been

@@ -38,6 +38,7 @@ add_executable(arch-task-manager
   src/memory_monitor.cpp
   src/process_monitor.cpp
   src/process_actions.cpp
+  src/process_cgroup.cpp
   src/process_details.cpp
   src/process_resources.cpp
   src/process_memory_map.cpp
@@ -175,3 +176,17 @@ target_include_directories(process-namespace-tests PRIVATE include)
 target_link_libraries(process-namespace-tests PRIVATE Threads::Threads)
 
 add_test(NAME process-namespace COMMAND process-namespace-tests)
+
+add_executable(process-cgroup-tests
+  tests/process_cgroup_tests.cpp
+  src/process_cgroup.cpp
+  src/process_resources.cpp
+  src/process_scheduling.cpp
+  src/logger.cpp
+)
+
+target_include_directories(process-cgroup-tests PRIVATE include)
+
+target_link_libraries(process-cgroup-tests PRIVATE Threads::Threads)
+
+add_test(NAME process-cgroup COMMAND process-cgroup-tests)
