@@ -7,6 +7,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "process_memory_map.hpp"
 #include "process_monitor.hpp"
 #include "process_resources.hpp"
 
@@ -98,6 +99,13 @@ struct ProcessDetailsInfo {
   // collector.
   std::optional<std::vector<int>> allowed_cpus;
   int system_cpu_count = 0;
+
+  // Read-only memory mappings from /proc/<pid>/maps. Nullopt only when no
+  // process identity was available so the read was never attempted; otherwise
+  // always present (Success with zero or more mappings, or a distinct error
+  // state such as permission denied or process disappeared). The mappings are
+  // the virtual address space layout of the process, never its memory contents.
+  std::optional<ProcessMemoryMapsResult> memory_maps;
 
   // Start wall-clock time derived from the starttime tick, boot uptime and the
   // current clock. process_uptime_seconds is how long the process has been
