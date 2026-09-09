@@ -5,7 +5,7 @@ Linux. It reads system information **directly from Linux interfaces** such as
 `/proc/stat`, `/proc/meminfo`, and `/proc/<pid>/` — no shelling out to `ps`,
 `free`, `top`, `htop`, or other external tools.
 
-> Stage: **Step 26** — CPU, RAM, swap, process monitoring, process actions, the
+> Stage: **Step 27** — CPU, RAM, swap, process monitoring, process actions, the
 > process tree, disk/storage monitoring, network monitoring, GPU monitoring,
 > temperature & hardware sensor monitoring, systemd service management,
 > startup application management, system information / hardware overview,
@@ -15,8 +15,9 @@ Linux. It reads system information **directly from Linux interfaces** such as
 > autostart for the application itself, per-process resource monitoring
 > with read-only resource limits, per-process CPU affinity & nice
 > priority management (confirmed, identity-checked scheduling changes),
-> a read-only per-process memory-maps inspector, and a read-only
-> per-process network-connections inspector.
+> a read-only per-process memory-maps inspector, a read-only
+> per-process network-connections inspector, and a read-only
+> per-process namespaces inspector.
 > Everything else on the roadmap is intentionally **not** implemented yet, but
 > the code is structured so future modules can be added without rewriting the
 > existing ones.
@@ -111,6 +112,22 @@ feature per milestone, hosted on GitHub.
       / truncated states are distinct and never crash the app, up to 1024
       connections are collected with an explicit truncation notice, non-socket
       descriptors are ignored, and no socket is ever modified or intercepted.
+- [x] **Process namespace inspection** — a read-only **Namespaces** section in
+      the process inspector that enumerates the selected process's `/proc/
+      <pid>/ns` symlinks natively (readlink(2)); never `lsns`/`nsenter`/
+      `readlink(1)`/shell, and nothing is ever entered, created or modified.
+      Each row shows the namespace type (with its kernel short name, e.g.
+      `Mount (mnt)`), the numeric namespace ID parsed safely into an unsigned
+      64-bit value, and the raw symlink target such as `net:[4026531992]`.
+      Unknown types the kernel may expose are preserved by their raw name and
+      shown as `Unknown` rather than breaking. A compact summary counts the
+      namespaces detected and the distinct namespace IDs, with a clear note
+      that matching IDs mean shared namespaces and that this read-only view
+      does **not** identify containers. Results are identity-gated against PID
+      reuse, permission-denied / disappeared / empty / partial / truncated
+      states are distinct and never crash the app, unreadable entries are shown
+      as unavailable without inventing IDs, and only the selected process's
+      namespace directory is ever scanned.
 - [x] **Disk / storage monitoring** — physical filesystem capacities via
       `statvfs(2)` over the mounts listed in `/proc/mounts`, real-time
       read/write throughput from two samples of `/proc/diskstats`, and whole
@@ -810,8 +827,8 @@ Control actions 2–5 reuse the existing `ProcessActions` wrappers (no signal
 logic is re-implemented) and scheduling actions 6–7 go through the dedicated
 scheduling manager; all of them are blocked for PID `1` / the monitor's own PID.
 Actions 8–9 are read-only display filters for the Memory Maps section and need
-no confirmation. The Network Connections section (below) is purely read-only
-and has no action keys.
+no confirmation. The Network Connections and Namespaces sections (below) are
+purely read-only and have no action keys.
 
 ### Information displayed
 
@@ -831,6 +848,7 @@ selected process's `/proc/<pid>` directory directly — never by shelling out to
 | Scheduling         | `getpriority(2)`, `sched_getaffinity(2)`, `/proc/<pid>/stat` | nice value, allowed CPU list, allowed CPU count |
 | Memory maps        | `/proc/<pid>/maps`                       | per-mapping start/end address, size, permission string, file offset, device, inode, pathname; summary counts |
 | Network connections | `/proc/<pid>/fd` (`socket:[inode]`) + `/proc/net/tcp{,6}`, `/proc/net/udp{,6}`, `/proc/net/unix` | per-socket FD, protocol, numeric local/remote address + port, TCP state, Unix path/type/state; summary counts |
+| Namespaces          | `/proc/<pid>/ns` (readlink)                 | per-namespace type (with kernel short name), numeric ID, raw symlink target; availability/partial states; summary counts |
 
 Start time is derived from the `starttime` tick in `/proc/<pid>/stat`, the
 system uptime (`/proc/uptime`) and the current clock; "Running For" reports the
@@ -1093,6 +1111,96 @@ shown."** rather than silently dropping records.
 
 Each state is distinct and never crashes the application.
 
+## Process namespace inspection
+
+The details screen ends with a **Namespaces** section listing the Linux
+namespaces the selected process belongs to, read directly from
+`/proc/<pid>/ns` on every inspector refresh (and only then — the main process
+monitor never scans `/*/ns`). It is a **read-only metadata** view: nothing
+enters a namespace, nothing is created or modified, no `setns(2)`,
+`unshare(2)` or `clone(2)` namespace API is used, and no external command
+(`lsns`, `nsenter`, `readlink(1)`, `ps`, ...) — actually no shell or subprocess
+at all — is executed. No root privileges are required.
+
+### Data source and correlation
+
+The namespace directory of the selected process usually contains some of:
+
+```text
+cgroup  ipc  mnt  net  pid  pid_for_children  time  time_for_children  user  uts
+```
+
+Each entry is a symlink whose target encodes the type and the numeric
+namespace identifier:
+
+```text
+net:[4026531992]
+```
+
+The identifiers are the kernel inode numbers of the namespace objects (in a
+separate, dedicated inode range, which is why they look like `4026531xxx`).
+Matching IDs across entries mean the exact same namespace object is shared —
+for example `pid` and `pid_for_children` of one process always reference the
+same PID namespace. The application reads each symlink natively with
+`readlink(2)`, parses the ID into an **unsigned 64-bit integer** (never
+truncated to a signed 32-bit value, never negative), and keeps the original
+target string for the raw "Target" column.
+
+### What is shown
+
+| Column  | Meaning                                                        |
+| ------- | -------------------------------------------------------------- |
+| Type    | friendly name plus kernel short name, e.g. `Mount (mnt)`, `PID for Children (pid_for_children)` |
+| ID      | the numeric namespace identifier; `N/A` when unreadable or malformed |
+| Target  | the raw symlink target, e.g. `net:[4026531992]`; `(unavailable)` when it could not be read |
+
+Rows are ordered in a deterministic, logical order: cgroup, ipc, mnt, net, pid,
+pid_for_children, time, time_for_children, user, uts. Any additional namespace
+type a newer kernel exposes is preserved by its raw name and shown as
+`Unknown (…name…)` rather than breaking the inspection.
+
+### Kernel / version availability
+
+Not every kernel exposes every type: the `time` family requires Linux ≥ 5.6,
+and older kernels lack some other entries. The section simply lists whatever
+the running kernel exposes; a namespace type that is absent on this kernel
+simply does not appear — it is never reported as an error or invented. This
+feature intentionally does **not** hard-code any namespace IDs; all values come
+from the selected process.
+
+### Summary and scope
+
+A compact summary reports the count of namespaces detected and the count of
+distinct namespace IDs, followed by an explicit note that **matching IDs mean
+the same namespace is shared and that this view does not identify containers.**
+The application never labels a process as a Docker/Podman/Kubernetes container,
+a host process or a VM based on namespace IDs — container detection is outside
+this feature's scope.
+
+### Permission limitations and result bound
+
+Visibility follows Linux permissions: with a restricted `/proc` mount (e.g.
+`hidepid`) or another user's process, all or some `/proc/<pid>/ns` entries may
+be withheld. A fully withheld directory is reported as **"Namespaces
+unavailable: permission denied."**; if only individual entries fail to read,
+the section reports **"Partially available: N namespace entries could not be
+read."** and shows them with `N/A` / `(unavailable)` — the application never
+invents IDs and never asks for sudo or a privileged helper. Up to 64 namespaces
+are collected per inspection with an explicit truncation notice if a future
+kernel ever exposes more.
+
+### States
+
+- Success (with the namespaces the kernel exposes), reported as **"No
+  namespaces found."** when the directory is empty.
+- A process that vanished mid-inspection shows **"Process no longer exists."**.
+- A PID that was reused while inspecting is detected through the process
+  identity (PID + start-time tick, the same mechanism used by the scheduling
+  editor) and the stale result is discarded — a reused PID never shows another
+  process's namespace IDs.
+
+Each state is distinct and never crashes the application.
+
 ## Application Settings & Persistent Configuration
 
 Press `o` (then Enter) in the list view to open the settings page. It edits the
@@ -1311,6 +1419,7 @@ arch-task-manager/
 │   ├── process_scheduling.hpp  # ProcessIdentity, sched_* / getpriority editors, CpuList parse
 │   ├── process_memory_map.hpp  # ProcessMemoryMap, /proc/<pid>/maps parser + manager
 │   ├── process_network.hpp     # ProcessNetworkConnectionManager, /proc/net/* + fd correlation
+│   ├── process_namespace.hpp   # ProcessNamespace + /proc/<pid>/ns readlink enumerator
 │   ├── process_tree.hpp        # ProcessTreeNode, ProcessTree, build/render
 │   ├── disk_monitor.hpp        # DiskUsage, BlockDevice, DiskSnapshot, DiskMonitor
 │   ├── network_monitor.hpp     # NetworkInterfaceStats, NetworkSnapshot, NetworkMonitor
@@ -1343,6 +1452,7 @@ arch-task-manager/
 │   ├── process_scheduling.cpp  # getpriority/setpriority + sched_get/setaffinity, identity gate
 │   ├── process_memory_map.cpp  # /proc/<pid>/maps parse, classify, identity-gated inspect
 │   ├── process_network.cpp     # /proc/net/{tcp,tcp6,udp,udp6,unix} parse + fd/socket correlation
+│   ├── process_namespace.cpp   # /proc/<pid>/ns enumeration, target parse, identity-gated inspect
 │   ├── process_tree.cpp        # PID/PPID tree build + box-drawing renderer
 │   ├── disk_monitor.cpp        # statvfs(2) usage + /proc/diskstats rates + /sys/block
 │   ├── network_monitor.cpp     # /proc/net/dev two-sample rates + operstate

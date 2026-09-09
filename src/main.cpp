@@ -38,6 +38,7 @@
 #include "process_details.hpp"
 #include "process_memory_map.hpp"
 #include "process_monitor.hpp"
+#include "process_namespace.hpp"
 #include "process_network.hpp"
 #include "process_resources.hpp"
 #include "process_scheduling.hpp"
@@ -1764,6 +1765,84 @@ void renderNetworkConnectionsSection(
   }
 }
 
+/// Renders the read-only namespaces section of the process inspector. Built
+/// from the selected process's /proc/<pid>/ns symlinks — nothing is entered,
+/// created, or modified, and no external tool is used.
+void renderNamespacesSection(
+    std::ostringstream &out,
+    const atm::ProcessNamespaceResult &namespaces) {
+  switch (namespaces.status) {
+    case atm::NamespaceStatus::Success:
+      break;
+    case atm::NamespaceStatus::PermissionDenied:
+      out << "Namespaces unavailable: permission denied.\n";
+      return;
+    case atm::NamespaceStatus::ProcessNotFound:
+    case atm::NamespaceStatus::IdentityUnknown:
+      out << "Process no longer exists.\n";
+      return;
+    case atm::NamespaceStatus::ProcessReused:
+      out << "The process identity changed (the PID was reused); namespace "
+             "information was discarded.\n";
+      return;
+    case atm::NamespaceStatus::InvalidPid:
+      out << "Invalid PID.\n";
+      return;
+    case atm::NamespaceStatus::ReadError:
+      out << "Namespaces unavailable: "
+          << (namespaces.errno_value != 0
+                  ? std::strerror(namespaces.errno_value)
+                  : std::string("read failed"))
+          << ".\n";
+      return;
+  }
+
+  appendLabeled(out, "Namespaces detected:",
+                std::to_string(namespaces.detected_count));
+  appendLabeled(out, "Unique namespace IDs:",
+                std::to_string(namespaces.unique_id_count));
+  out << "Matching namespace IDs mean the entries reference the same "
+         "namespace; the view is read-only and does not identify "
+         "containers.\n";
+
+  if (namespaces.namespaces.empty()) {
+    out << "\nNo namespaces found.\n";
+    return;
+  }
+  if (namespaces.truncated) {
+    out << "\nResults truncated: only the first "
+        << namespaces.namespaces.size() << " of " << namespaces.detected_count
+        << " namespace entries are shown.\n";
+  }
+  if (namespaces.unavailable_count > 0) {
+    out << "\nPartially available: " << namespaces.unavailable_count
+        << " namespace entr"
+        << (namespaces.unavailable_count == 1 ? "y" : "ies")
+        << " could not be read.\n";
+  }
+
+  out << "\n"
+         "Type                                ID            Target\n";
+  for (const atm::ProcessNamespace &ns : namespaces.namespaces) {
+    std::string type_label;
+    if (ns.type == atm::NamespaceType::Unknown) {
+      type_label = "Unknown (" + ns.name + ")";
+    } else {
+      type_label = atm::namespaceTypeName(ns.type);
+      const char *short_name = atm::namespaceTypeShortName(ns.type);
+      if (short_name != nullptr && short_name[0] != '\0') {
+        type_label += " (" + std::string(short_name) + ")";
+      }
+    }
+    const std::string id_text =
+        ns.id.has_value() ? std::to_string(*ns.id) : std::string("N/A");
+    const std::string target =
+        ns.target.empty() ? "(unavailable)" : ns.target;
+    out << std::left << std::setw(34) << type_label << std::right
+        << std::setw(14) << id_text << "  " << std::left << target << '\n';
+  }
+}
+
 /// Renders the full detailed breakdown for one process (Step 13). Every
 /// field degrades to "N/A" when it could not be read; nothing here re-reads
 /// /proc — the data was already collected by ProcessDetails.
@@ -1937,6 +2016,13 @@ std::string renderProcessDetails(const atm::ProcessDetailsInfo &info,
     out << "Loading network connections...\n";
   } else {
     renderNetworkConnectionsSection(out, *info.network_connections);
+  }
+
+  out << "\n## Namespaces\n\n";
+  if (!info.namespaces.has_value()) {
+    out << "Loading namespaces...\n";
+  } else {
+    renderNamespacesSection(out, *info.namespaces);
   }
 
   return out.str();
