@@ -37,6 +37,7 @@
 #include "process_actions.hpp"
 #include "process_cgroup.hpp"
 #include "process_details.hpp"
+#include "process_environment.hpp"
 #include "process_memory_map.hpp"
 #include "process_monitor.hpp"
 #include "process_namespace.hpp"
@@ -2022,11 +2023,119 @@ void renderCgroupsSection(std::ostringstream &out,
   }
 }
 
+/// Renders the read-only environment view of one process (Step 29). The data
+/// was already collected and masked by ProcessDetails; this only formats it.
+/// Raw secrets never reach this function. `name_filter` (optional) restricts
+/// the rows to variables whose name contains the substring — values are never
+/// searched. Filtering reuses the inspector's existing Memory Maps filter
+/// (keys 8/9), so no second filtering mechanism is introduced.
+void renderEnvironmentSection(std::ostringstream &out,
+                              const atm::ProcessEnvironmentResult &environment,
+                              const std::string *name_filter = nullptr) {
+  switch (environment.status) {
+    case atm::EnvironmentStatus::Success:
+      break;
+    case atm::EnvironmentStatus::EmptyEnvironment:
+      out << "No environment variables available.\n";
+      return;
+    case atm::EnvironmentStatus::PermissionDenied:
+      out << "Environment unavailable: permission denied.\n";
+      return;
+    case atm::EnvironmentStatus::ProcessNotFound:
+    case atm::EnvironmentStatus::IdentityUnknown:
+      out << "Process no longer exists.\n";
+      return;
+    case atm::EnvironmentStatus::ProcessReused:
+      out << "The process identity changed (the PID was reused); environment "
+             "data was discarded.\n";
+      return;
+    case atm::EnvironmentStatus::InvalidPid:
+      out << "Invalid PID.\n";
+      return;
+    case atm::EnvironmentStatus::MalformedData:
+      out << "Environment unavailable: the environment data was malformed.\n";
+      return;
+    case atm::EnvironmentStatus::ReadError:
+      out << "Environment unavailable: "
+          << (environment.errno_value != 0
+                  ? std::strerror(environment.errno_value)
+                  : std::string("read failed"))
+          << ".\n";
+      return;
+  }
+
+  appendLabeled(out, "Variables:",
+                std::to_string(environment.entries.size()));
+  appendLabeled(out, "Total size:",
+                formatKibibytes((environment.byte_count + 1023) / 1024));
+  appendLabeled(out, "Sensitive variables:",
+                std::to_string(environment.sensitive_count));
+
+  bool truncated = environment.size_truncated ||
+                   environment.variable_truncated;
+  if (truncated) {
+    out << "Environment truncated";
+    if (environment.size_truncated && environment.variable_truncated) {
+      out << " (size and variable count limits).\n";
+    } else if (environment.size_truncated) {
+      out << " (size limit).\n";
+    } else {
+      out << " (variable count limit).\n";
+    }
+  }
+  if (environment.duplicate_count > 0) {
+    out << environment.duplicate_count
+        << " duplicate variable name"
+        << (environment.duplicate_count == 1 ? " was" : "s were")
+        << " collapsed (the first value was kept).\n";
+  }
+  if (environment.malformed_count > 0) {
+    out << environment.malformed_count
+        << " malformed record"
+        << (environment.malformed_count == 1 ? " was" : "s were")
+        << " skipped.\n";
+  }
+
+  if (name_filter != nullptr && !name_filter->empty()) {
+    out << "\nFiltering by variable name: \"" << *name_filter
+        << "\" (press 8 to change, 9 to clear)\n";
+  }
+
+  if (environment.entries.empty()) {
+    return;  // Success with zero entries after filtering: nothing to list
+  }
+
+  std::size_t name_width = 8;
+  for (const atm::ProcessEnvironmentEntry &entry : environment.entries) {
+    name_width = std::max(name_width, entry.name.size());
+  }
+  const std::size_t kMaxNameWidth = 60;
+  name_width = std::min(name_width, kMaxNameWidth);
+
+  out << "\n" << std::left << std::setw(name_width) << "Variable"
+      << "  Value\n";
+  for (const atm::ProcessEnvironmentEntry &entry : environment.entries) {
+    if (name_filter != nullptr && !name_filter->empty() &&
+        entry.name.find(*name_filter) == std::string::npos) {
+      continue;
+    }
+    std::string name = entry.name;
+    if (name.size() > kMaxNameWidth) {
+      name.resize(kMaxNameWidth - 1);
+      name += "…";
+    }
+    out << std::left << std::setw(name_width) << name << "  "
+        << entry.value << "\n";
+  }
+  out << "\nPotentially sensitive values are masked (********); sensitivity "
+         "detection is a heuristic and may not identify every secret.\n";
+}
+
 /// Renders the full detailed breakdown for one process (Step 13). Every
 /// field degrades to "N/A" when it could not be read; nothing here re-reads
 /// /proc — the data was already collected by ProcessDetails.
 std::string renderProcessDetails(const atm::ProcessDetailsInfo &info,
-                                 const std::string *maps_filter = nullptr) {
+                                 const std::string *section_filter = nullptr) {
   std::ostringstream out;
   out << "Process Details\n"
          "────────────────────────────────\n\n";
@@ -2187,7 +2296,7 @@ std::string renderProcessDetails(const atm::ProcessDetailsInfo &info,
   if (!info.memory_maps.has_value()) {
     out << "Loading memory maps...\n";
   } else {
-    renderMemoryMapsSection(out, *info.memory_maps, maps_filter);
+    renderMemoryMapsSection(out, *info.memory_maps, section_filter);
   }
 
   out << "\n## Network Connections\n\n";
@@ -2209,6 +2318,13 @@ std::string renderProcessDetails(const atm::ProcessDetailsInfo &info,
     out << "Loading cgroup information...\n";
   } else {
     renderCgroupsSection(out, *info.cgroups);
+  }
+
+  out << "\n## Environment\n\n";
+  if (!info.environment.has_value()) {
+    out << "Loading environment...\n";
+  } else {
+    renderEnvironmentSection(out, *info.environment, section_filter);
   }
 
   return out.str();
@@ -3169,7 +3285,7 @@ void interactProcessDetail(atm::ProcessDetails &details,
 
   // Optional path filter for the read-only memory-maps section; local to this
   // inspection session, applied only to the displayed mapping rows.
-  std::string maps_filter;
+  std::string section_filter;
 
   for (;;) {
     // Reuse the Process Monitor's CPU figure for this PID (the snapshot is at
@@ -3198,7 +3314,7 @@ void interactProcessDetail(atm::ProcessDetails &details,
     std::cout << "========================================\n"
                  "ARCH TASK MANAGER — Process Details\n"
                  "========================================\n\n"
-              << renderProcessDetails(*info, &maps_filter) << "\n\n"
+              << renderProcessDetails(*info, &section_filter) << "\n\n"
               << "[1] Refresh\n"
                  "[2] Terminate\n"
                  "[3] Kill\n"
@@ -3206,8 +3322,8 @@ void interactProcessDetail(atm::ProcessDetails &details,
                  "[5] Continue (Resume)\n"
                  "[6] Change Nice Priority\n"
                  "[7] Change CPU Affinity\n"
-                 "[8] Filter Memory Maps\n"
-                 "[9] Clear Memory Maps Filter\n"
+                 "[8] Filter Sections (Memory Maps / Environment)\n"
+                 "[9] Clear Section Filter\n"
                  "[0] Back\n\n"
                  "Select action:\n> "
               << std::flush;
@@ -3240,16 +3356,17 @@ void interactProcessDetail(atm::ProcessDetails &details,
       runChangeCpuAffinity(scheduling, input, pid, name);
       continue;  // redraw details: the refresh shows the kernel-confirmed value
     }
-    if (action_text == "8") {  // filter the memory-maps rows by path
-      std::cout << "\nFilter memory maps by mapped path (Enter to clear):\n> "
+    if (action_text == "8") {  // filter memory maps (by path) + environment (by name)
+      std::cout << "\nFilter memory maps by mapped path and environment by "
+                   "variable name (Enter to clear):\n> "
                 << std::flush;
       const std::optional<std::string> filter_line = input.readLine();
-      maps_filter =
+      section_filter =
           filter_line ? trimWhitespace(*filter_line) : std::string{};
       continue;  // redraw with the new filter
     }
-    if (action_text == "9") {  // clear the memory-maps filter
-      maps_filter.clear();
+    if (action_text == "9") {  // clear the section filter
+      section_filter.clear();
       continue;
     }
     std::cout << "Invalid action.\n";
