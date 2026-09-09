@@ -14,6 +14,8 @@
 #include <string_view>
 #include <unistd.h>
 
+#include "process_resources.hpp"
+
 namespace atm {
 
 namespace {
@@ -355,7 +357,7 @@ std::optional<std::uint64_t> systemUptimeSeconds() {
 
 std::optional<ProcessDetailsInfo>
 ProcessDetails::getProcessDetails(pid_t pid, std::uint64_t system_total_kib,
-                                  std::optional<double> cpu_percent) const {
+                                  std::optional<double> cpu_percent) {
   if (pid <= 0) {
     return std::nullopt;
   }
@@ -484,6 +486,7 @@ ProcessDetails::getProcessDetails(pid_t pid, std::uint64_t system_total_kib,
   }
 
   // I/O statistics from /proc/<pid>/io (permission-dependent).
+  ProcessIoCounters current_io;
   if (const std::optional<std::string> io = readFile(dir + "/io"); io) {
     const IoData io_data = parseIo(*io);
     info.read_bytes = io_data.read_bytes;
@@ -491,6 +494,42 @@ ProcessDetails::getProcessDetails(pid_t pid, std::uint64_t system_total_kib,
     info.read_syscalls = io_data.read_syscalls;
     info.write_syscalls = io_data.write_syscalls;
     info.cancelled_write_bytes = io_data.cancelled_write_bytes;
+    current_io = ProcessIoCounters{
+        true, io_data.read_bytes.value_or(0), io_data.write_bytes.value_or(0),
+        io_data.read_syscalls.value_or(0), io_data.write_syscalls.value_or(0),
+        io_data.cancelled_write_bytes.value_or(0)};
+  }
+
+  // I/O rates: delta over the elapsed window, gated by process identity so a
+  // restarted/reused PID never produces a spurious rate.
+  if (current_io.available && stat_data->starttime_ticks.has_value()) {
+    const auto now = std::chrono::steady_clock::now();
+    const Identity identity{pid, *stat_data->starttime_ticks};
+    const auto previous = previous_io_.find(identity);
+    const bool same_process =
+        previous != previous_io_.end() && has_previous_scan_;
+    const double elapsed =
+        has_previous_scan_
+            ? std::chrono::duration<double>(now - previous_scan_time_).count()
+            : 0.0;
+    const ProcessIoCounters prev_io =
+        same_process ? previous->second : ProcessIoCounters{};
+    const IoRates rates =
+        computeIoRates(same_process, prev_io, current_io, elapsed);
+    info.read_rate = rates.read_rate;
+    info.write_rate = rates.write_rate;
+
+    // Record the baseline for the next inspection of this identity.
+    previous_io_[identity] = current_io;
+    previous_scan_time_ = now;
+    has_previous_scan_ = true;
+  }
+
+  // Read-only resource limits from /proc/<pid>/limits. Strictly observational;
+  // the application never modifies them.
+  if (const std::optional<std::string> limits = readFile(dir + "/limits");
+      limits) {
+    info.limits = parseProcessLimits(*limits);
   }
 
   // Start time: boot wall-clock + (starttime ticks / USER_HZ). Running time =
@@ -516,6 +555,16 @@ ProcessDetails::getProcessDetails(pid_t pid, std::uint64_t system_total_kib,
   }
 
   return info;
+}
+
+void ProcessDetails::forgetBaseline(pid_t pid) {
+  for (auto it = previous_io_.begin(); it != previous_io_.end();) {
+    if (it->first.pid == pid) {
+      it = previous_io_.erase(it);
+    } else {
+      ++it;
+    }
+  }
 }
 
 }  // namespace atm
