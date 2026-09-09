@@ -37,6 +37,8 @@
 #include "process_actions.hpp"
 #include "process_details.hpp"
 #include "process_monitor.hpp"
+#include "process_resources.hpp"
+#include "process_scheduling.hpp"
 #include "process_tree.hpp"
 #include "resource_history.hpp"
 #include "sensor_monitor.hpp"
@@ -121,8 +123,8 @@ constexpr std::size_t kPackageVersionWidth = 16;
 constexpr std::size_t kPackageSrcWidth = 10;
 constexpr std::size_t kPackageDetailRuleWidth = 32;
 constexpr std::size_t kMaxPackageFrameRows = 15;  // main-frame table cap
-constexpr int kMinNice = -20;
-constexpr int kMaxNice = 19;
+constexpr int kMinNice = atm::kMinimumNice;
+constexpr int kMaxNice = atm::kMaximumNice;
 
 /// Formats a utilization value as " 34.7" (fixed width so the updating view
 /// does not shimmer as the value changes).
@@ -1624,13 +1626,6 @@ std::string renderProcessDetails(const atm::ProcessDetailsInfo &info) {
   appendLabeled(out, "Priority:", info.priority.has_value()
                                       ? std::to_string(*info.priority)
                                       : std::string("N/A"));
-  if (info.nice_priority.has_value()) {
-    appendLabeled(out, "Nice:", std::to_string(*info.nice_priority));
-  } else {
-    appendLabeled(out, "Nice:", info.nice_value.has_value()
-                                    ? std::to_string(*info.nice_value)
-                                    : std::string("N/A"));
-  }
   if (info.start_time.has_value()) {
     appendLabeled(out, "Started:", formatTimestamp(*info.start_time));
   } else {
@@ -1703,6 +1698,24 @@ std::string renderProcessDetails(const atm::ProcessDetailsInfo &info) {
                 info.nonvoluntary_context_switches.has_value()
                     ? formatThousands(*info.nonvoluntary_context_switches)
                     : std::string("N/A"));
+
+  out << "\n## Scheduling\n\n";
+  appendLabeled(out, "Nice:",
+                info.nice_priority.has_value()
+                    ? std::to_string(*info.nice_priority)
+                    : (info.nice_value.has_value()
+                           ? std::to_string(*info.nice_value)
+                           : std::string("N/A")));
+  appendLabeled(out, "CPU Affinity:",
+                info.allowed_cpus.has_value()
+                    ? atm::formatCpuList(*info.allowed_cpus)
+                    : std::string("N/A"));
+  appendLabeled(out, "Allowed CPU Count:",
+                info.allowed_cpus.has_value()
+                    ? std::to_string(info.allowed_cpus->size())
+                    : std::string("N/A"));
+  out << "Scheduling edits (keys 6/7) change the running process only and are "
+         "never applied without confirmation; they are not persisted.\n";
 
   out << "\n## I/O Statistics\n\n";
   appendLabeled(out, "Read:",
@@ -2102,6 +2115,210 @@ void printActionFailure(const char *action, int pid,
   }
 }
 
+/// Prints the outcome of a failed scheduling operation with process/action
+/// context and the guidance required by the safety policy.
+void printSchedulingFailure(const char *action, int pid,
+                            const atm::SchedulingResult &result) {
+  switch (result.status) {
+    case atm::SchedulingStatus::InvalidPid:
+      std::cout << atm::schedulingStatusMessage(atm::SchedulingStatus::InvalidPid)
+                << '\n';
+      break;
+    case atm::SchedulingStatus::ProcessNotFound:
+      std::cout << "Process does not exist.\n";
+      break;
+    case atm::SchedulingStatus::PermissionDenied:
+      std::cout << "Permission denied.\n"
+                   "You do not have permission to change this process's "
+                   "scheduling priority.\n";
+      break;
+    case atm::SchedulingStatus::ProcessReused:
+      std::cout << "Cancelled: the process identity changed (the PID was "
+                   "reused by a different process). No change was applied.\n";
+      break;
+    case atm::SchedulingStatus::IdentityUnknown:
+      std::cout << "The process no longer exists.\n";
+      break;
+    case atm::SchedulingStatus::InvalidNice:
+      std::cout << "Invalid nice value. Choose a value between "
+                << atm::kMinimumNice << " and " << atm::kMaximumNice << ".\n";
+      break;
+    case atm::SchedulingStatus::InvalidCpu:
+      std::cout << "Invalid CPU id.\n";
+      break;
+    case atm::SchedulingStatus::EmptyAffinity:
+      std::cout << "At least one CPU must remain selected.\n";
+      break;
+    case atm::SchedulingStatus::InvalidCpuset:
+      std::cout << "The kernel rejected the CPU set (EINVAL).\n";
+      break;
+    case atm::SchedulingStatus::Failed:
+      std::cout << "Failed to " << action << " process " << pid << ": "
+                << std::strerror(result.errno_value) << '\n';
+      break;
+    case atm::SchedulingStatus::Success:
+      break;
+  }
+}
+
+/// "Change Nice Priority": prompt for a new nice value, show a current-to-new
+/// confirmation, and apply via ProcessSchedulingManager with the captured
+/// process identity. The identity is re-verified by the manager immediately
+/// before setpriority(2), so a reused PID is never modified.
+void runChangeNice(atm::ProcessSchedulingManager &scheduling,
+                   ConsoleInput &input, int pid, const std::string &name) {
+  if (atm::isProtectedPid(pid)) {
+    std::cout << "PID " << pid
+              << " is protected by the application and its scheduling cannot "
+                 "be changed from this interface.\n";
+    return;
+  }
+
+  const std::optional<atm::ProcessIdentity> identity =
+      atm::ProcessIdentity::current(pid);
+  if (!identity) {
+    std::cout << "Process no longer exists.\n";
+    return;
+  }
+  const std::optional<int> current = scheduling.getNice(pid);
+  if (!current) {
+    std::cout << "Could not read the process's nice value "
+                 "(the process may no longer exist).\n";
+    return;
+  }
+
+  std::cout << "\nCurrent nice: " << *current << "\n"
+            << "Lower values = higher scheduling priority; "
+               "higher values = lower priority.\n"
+            << "Raising priority beyond your limit requires privileges.\n\n"
+            << "Enter new nice value (" << atm::kMinimumNice << " to "
+            << atm::kMaximumNice << ", blank to cancel):\n> " << std::flush;
+
+  const std::optional<std::string> line = input.readLine();
+  if (!line) {
+    std::cout << "\nInput cancelled.\n";
+    return;
+  }
+  const std::string text = trimWhitespace(*line);
+  if (text.empty()) {
+    std::cout << "Cancelled.\n";
+    return;
+  }
+  int new_nice = 0;
+  if (!parseSignedInteger(text, new_nice) || new_nice < atm::kMinimumNice ||
+      new_nice > atm::kMaximumNice) {
+    std::cout << "Invalid nice value. Choose a value between "
+              << atm::kMinimumNice << " and " << atm::kMaximumNice << ".\n";
+    return;
+  }
+  if (new_nice == *current) {
+    std::cout << "Nice value is already " << *current << ". No change.\n";
+    return;
+  }
+
+  std::cout << "\nChange process priority?\n\n"
+            << "Process: " << name << "\n"
+            << "PID: " << pid << "\n"
+            << "Current nice: " << *current << "\n"
+            << "New nice: " << new_nice << "\n\n"
+            << "This may affect process scheduling.\n\n";
+  if (!confirm("Apply this change?", input)) {
+    std::cout << "Cancelled. The process's nice value was not changed.\n";
+    return;
+  }
+
+  const atm::SchedulingResult result = scheduling.setNice(*identity, new_nice);
+  if (result.success()) {
+    std::cout << "Process " << pid
+              << " nice value change applied. The inspector will refresh to "
+                 "show the kernel-confirmed value.\n";
+  } else {
+    printSchedulingFailure("change the nice value of", pid, result);
+  }
+  std::this_thread::sleep_for(1200ms);
+}
+
+/// "Change CPU Affinity": let the user type a new CPU list, validate it against
+/// the online CPU range (never allowing an empty mask), show a current-to-new
+/// confirmation and apply through ProcessSchedulingManager with the captured
+/// identity. Cancelling discards the pending selection.
+void runChangeCpuAffinity(atm::ProcessSchedulingManager &scheduling,
+                          ConsoleInput &input, int pid,
+                          const std::string &name) {
+  if (atm::isProtectedPid(pid)) {
+    std::cout << "PID " << pid
+              << " is protected by the application and its scheduling cannot "
+                 "be changed from this interface.\n";
+    return;
+  }
+
+  const std::optional<atm::ProcessIdentity> identity =
+      atm::ProcessIdentity::current(pid);
+  if (!identity) {
+    std::cout << "Process no longer exists.\n";
+    return;
+  }
+  const std::optional<std::vector<int>> current = scheduling.getCpuAffinity(pid);
+  if (!current) {
+    std::cout << "Could not read the process's CPU affinity "
+                 "(the process may no longer exist).\n";
+    return;
+  }
+  const int cpu_count = atm::ProcessSchedulingManager::systemCpuCount();
+
+  std::cout << "\nCPU Affinity\n"
+               "────────────────────────\n"
+            << "Available CPUs: 0-" << (cpu_count - 1) << "\n"
+            << "Allowed CPUs: " << atm::formatCpuList(*current) << "\n\n"
+            << "Enter new CPU list (comma/space separated, or ranges like "
+               "0-3; blank to cancel):\n> " << std::flush;
+
+  const std::optional<std::string> line = input.readLine();
+  if (!line) {
+    std::cout << "\nInput cancelled.\n";
+    return;
+  }
+  const std::string text = trimWhitespace(*line);
+  if (text.empty()) {
+    std::cout << "Cancelled.\n";
+    return;
+  }
+  const std::optional<std::vector<int>> parsed =
+      atm::parseCpuSelection(text, cpu_count);
+  if (!parsed) {
+    std::cout << "Invalid CPU list. Choose CPUs between 0 and "
+              << (cpu_count - 1)
+              << " (at least one CPU must remain selected).\n";
+    return;
+  }
+  if (*parsed == *current) {
+    std::cout << "CPU affinity is already "
+              << atm::formatCpuList(*current) << ". No change.\n";
+    return;
+  }
+
+  std::cout << "\nChange CPU affinity?\n\n"
+            << "Process: " << name << "\n"
+            << "PID: " << pid << "\n"
+            << "Current CPUs: " << atm::formatCpuList(*current) << "\n"
+            << "New CPUs: " << atm::formatCpuList(*parsed) << "\n\n";
+  if (!confirm("Apply this change?", input)) {
+    std::cout << "Cancelled. The process's CPU affinity was not changed.\n";
+    return;
+  }
+
+  const atm::SchedulingResult result =
+      scheduling.setCpuAffinity(*identity, *parsed);
+  if (result.success()) {
+    std::cout << "Process " << pid
+              << " CPU affinity change applied. The inspector will refresh to "
+                 "show the kernel-confirmed value.\n";
+  } else {
+    printSchedulingFailure("change the CPU affinity of", pid, result);
+  }
+  std::this_thread::sleep_for(1200ms);
+}
+
 /// Shows the current (sorted) process list for PID selection.
 void showProcessSelection(const std::vector<atm::Process> &processes,
                           atm::ProcessSort sort) {
@@ -2172,10 +2389,12 @@ std::optional<SelectedProcess> selectPid(ConsoleInput &input,
 }
 
 /// Runs the shared action menu for one selected process (terminate, kill,
-/// pause, resume, change priority). ProcessActions performs every syscall —
-/// this UI code never re-implements kill(2)/setpriority(2).
-void runActionMenu(atm::ProcessActions &actions, ConsoleInput &input, int pid,
-                   const std::string &name) {
+/// pause, resume, change priority). ProcessActions performs every signal
+/// syscall and ProcessSchedulingManager performs the scheduling one — this UI
+/// code never re-implements kill(2)/setpriority(2).
+void runActionMenu(atm::ProcessActions &actions,
+                   atm::ProcessSchedulingManager &scheduling,
+                   ConsoleInput &input, int pid, const std::string &name) {
   std::cout << "\nProcess:\n"
             << name << "\nPID: " << pid << "\n\n"
             << "Actions:\n"
@@ -2196,6 +2415,7 @@ void runActionMenu(atm::ProcessActions &actions, ConsoleInput &input, int pid,
 
   atm::ActionResult result{atm::ActionStatus::Failed, 0};
   bool executed = false;
+  bool scheduling_handled = false;
 
   switch (action_text == "1" ? 1 : action_text == "2" ? 2
                        : action_text == "3"          ? 3
@@ -2254,19 +2474,29 @@ void runActionMenu(atm::ProcessActions &actions, ConsoleInput &input, int pid,
       }
       break;
 
-    case 5: {  // Change priority.
-      const std::optional<int> current = actions.currentPriority(pid);
-      if (!current.has_value()) {
+    case 5: {  // Change priority (nice) — scheduling change, identity-checked
+               // and confirmed before any setpriority(2).
+      scheduling_handled = true;
+      const std::optional<atm::ProcessIdentity> identity =
+          atm::ProcessIdentity::current(pid);
+      if (!identity) {
         std::cout << "Process does not exist. "
                      "It may have disappeared before the operation "
                      "completed.\n";
         break;
       }
-      std::cout << "\nCurrent priority: " << *current << "\n"
+      const std::optional<int> current = scheduling.getNice(pid);
+      if (!current) {
+        std::cout << "Process does not exist. "
+                     "It may have disappeared before the operation "
+                     "completed.\n";
+        break;
+      }
+      std::cout << "\nCurrent nice: " << *current << "\n"
                 << "Lower values = higher scheduling priority; "
                    "higher values = lower.\n"
-                << "Raising priority beyond your limit needs root.\n\n"
-                << "Enter new priority (" << kMinNice << " to " << kMaxNice
+                << "Raising priority beyond your limit needs privileges.\n\n"
+                << "Enter new nice value (" << kMinNice << " to " << kMaxNice
                 << "):\n> " << std::flush;
 
       const std::optional<std::string> priority_line = input.readLine();
@@ -2281,12 +2511,28 @@ void runActionMenu(atm::ProcessActions &actions, ConsoleInput &input, int pid,
                   << " and " << kMaxNice << ".\n";
         break;
       }
-      result = actions.setPriority(pid, priority);
-      if (result.success()) {
-        std::cout << "Process " << pid << " priority set to " << priority
-                  << ".\n";
+      if (priority == *current) {
+        std::cout << "Nice value is already " << *current << ". No change.\n";
+        break;
       }
-      executed = true;
+      std::cout << "\nChange process priority?\n\n"
+                << "Process: " << name << "\n"
+                << "PID: " << pid << "\n"
+                << "Current nice: " << *current << "\n"
+                << "New nice: " << priority << "\n\n"
+                << "This may affect process scheduling.\n\n";
+      if (!confirm("Apply this change?", input)) {
+        std::cout << "Cancelled. The process's nice value was not changed.\n";
+        break;
+      }
+      const atm::SchedulingResult sched =
+          scheduling.setNice(*identity, priority);
+      if (sched.success()) {
+        std::cout << "Process " << pid << " nice value set to " << priority
+                  << ".\n";
+      } else {
+        printSchedulingFailure("set the nice value of", pid, sched);
+      }
       break;
     }
 
@@ -2299,13 +2545,13 @@ void runActionMenu(atm::ProcessActions &actions, ConsoleInput &input, int pid,
       break;
   }
 
-  if (executed && !result.success()) {
+  if (executed && !result.success() && !scheduling_handled) {
     printActionFailure(
         action_text == "1" ? "terminate"
             : action_text == "2" ? "kill"
             : action_text == "3" ? "pause"
-            : action_text == "5" ? "set priority for"
-                                  : "resume",
+            : action_text == "4" ? "resume"
+                                 : "operate on",
         pid, result);
   }
 
@@ -2317,21 +2563,25 @@ void runActionMenu(atm::ProcessActions &actions, ConsoleInput &input, int pid,
 
 /// Runs one complete "select a process, choose an action" interaction from the
 /// flat process-list view.
-void runProcessControl(atm::ProcessActions &actions, ConsoleInput &input,
+void runProcessControl(atm::ProcessActions &actions,
+                       atm::ProcessSchedulingManager &scheduling,
+                       ConsoleInput &input,
                        const std::vector<atm::Process> &listed,
                        atm::ProcessSort sort) {
   showProcessSelection(listed, sort);
   const auto selected =
       selectPid(input, listed, "Select PID (blank to cancel)");
   if (selected.has_value()) {
-    runActionMenu(actions, input, selected->pid, selected->name);
+    runActionMenu(actions, scheduling, input, selected->pid, selected->name);
   }
 }
 
 /// Manages a process chosen from the tree view. The tree only identifies the
 /// selected PID; validation and the action menu are the same shared flow used
 /// by the flat table, and ProcessActions performs the actual syscalls.
-void manageFromTree(atm::ProcessActions &actions, ConsoleInput &input,
+void manageFromTree(atm::ProcessActions &actions,
+                    atm::ProcessSchedulingManager &scheduling,
+                    ConsoleInput &input,
                     const atm::ProcessTree &tree,
                     const std::vector<atm::Process> &listed) {
   std::cout << "\033[2J\033[H";
@@ -2342,7 +2592,7 @@ void manageFromTree(atm::ProcessActions &actions, ConsoleInput &input,
 
   const auto selected = selectPid(input, listed, "Enter PID to manage (blank to cancel)");
   if (selected.has_value()) {
-    runActionMenu(actions, input, selected->pid, selected->name);
+    runActionMenu(actions, scheduling, input, selected->pid, selected->name);
   }
 }
 
@@ -2453,7 +2703,9 @@ void runProcessDetailAction(atm::ProcessActions &actions, ConsoleInput &input,
 /// the user can refresh (re-inspect the same PID), apply an existing process
 /// action, or go back to the live view.
 void interactProcessDetail(atm::ProcessDetails &details,
-                           atm::ProcessActions &actions, ConsoleInput &input,
+                           atm::ProcessActions &actions,
+                           atm::ProcessSchedulingManager &scheduling,
+                           ConsoleInput &input,
                            const std::vector<atm::Process> &listed,
                            atm::ProcessSort sort,
                            std::uint64_t system_total_kib) {
@@ -2499,6 +2751,8 @@ void interactProcessDetail(atm::ProcessDetails &details,
                  "[3] Kill\n"
                  "[4] Stop (Pause)\n"
                  "[5] Continue (Resume)\n"
+                 "[6] Change Nice Priority\n"
+                 "[7] Change CPU Affinity\n"
                  "[0] Back\n\n"
                  "Select action:\n> "
               << std::flush;
@@ -2522,6 +2776,14 @@ void interactProcessDetail(atm::ProcessDetails &details,
       const int action = std::atoi(action_text.c_str());
       runProcessDetailAction(actions, input, pid, name, action);
       continue;  // redraw details after the action
+    }
+    if (action_text == "6") {
+      runChangeNice(scheduling, input, pid, name);
+      continue;  // redraw details: the refresh shows the kernel-confirmed value
+    }
+    if (action_text == "7") {
+      runChangeCpuAffinity(scheduling, input, pid, name);
+      continue;  // redraw details: the refresh shows the kernel-confirmed value
     }
     std::cout << "Invalid action.\n";
   }
@@ -3789,6 +4051,7 @@ int main() {
   atm::StartupManager startup_manager;
   atm::SystemInfoProvider system_info;
   atm::ProcessActions actions;
+  atm::ProcessSchedulingManager scheduling;
   atm::ProcessDetails process_details;
   atm::HistoryManager history(
       static_cast<std::size_t>(settings.settings().history.max_samples));
@@ -3965,9 +4228,9 @@ int main() {
         break;
       case ConsoleInput::Command::Manage:
         if (view == ViewMode::Tree) {
-          manageFromTree(actions, input, tree, snapshot.processes);
+          manageFromTree(actions, scheduling, input, tree, snapshot.processes);
         } else {
-          runProcessControl(actions, input, snapshot.processes, sort);
+          runProcessControl(actions, scheduling, input, snapshot.processes, sort);
         }
         // Refresh immediately so the effect of the action is visible without
         // waiting for the next 1 s tick.
@@ -4016,7 +4279,7 @@ int main() {
           const std::optional<atm::MemoryInfo> mem = memory_monitor.read();
           const std::uint64_t total_kib =
               mem.has_value() ? mem->total : 0;
-          interactProcessDetail(process_details, actions, input,
+          interactProcessDetail(process_details, actions, scheduling, input,
                                 snapshot.processes, sort, total_kib);
         }
         break;

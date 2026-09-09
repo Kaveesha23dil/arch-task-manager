@@ -15,6 +15,7 @@
 #include <unistd.h>
 
 #include "process_resources.hpp"
+#include "process_scheduling.hpp"
 
 namespace atm {
 
@@ -385,6 +386,7 @@ ProcessDetails::getProcessDetails(pid_t pid, std::uint64_t system_total_kib,
   info.priority = stat_data->priority;
   info.nice_value = stat_data->nice;
   info.thread_count = stat_data->num_threads;
+  info.starttime_ticks = stat_data->starttime_ticks;
 
   // Command line (NUL-separated argv). Empty for kernel threads.
   if (const std::optional<std::string> raw = readFile(dir + "/cmdline"); raw) {
@@ -530,6 +532,21 @@ ProcessDetails::getProcessDetails(pid_t pid, std::uint64_t system_total_kib,
   if (const std::optional<std::string> limits = readFile(dir + "/limits");
       limits) {
     info.limits = parseProcessLimits(*limits);
+  }
+
+  // Scheduling state (read-only observation). The CPU affinity comes from the
+  // kernel via sched_getaffinity(2); the online CPU count gives the UI the
+  // valid id range. Neither value is ever changed by the collector — editing
+  // happens only through ProcessSchedulingManager after explicit user
+  // confirmation.
+  {
+    const ProcessSchedulingManager scheduling;
+    if (const std::optional<std::vector<int>> affinity =
+            scheduling.getCpuAffinity(pid);
+        affinity) {
+      info.allowed_cpus = affinity;
+    }
+    info.system_cpu_count = ProcessSchedulingManager::systemCpuCount();
   }
 
   // Start time: boot wall-clock + (starttime ticks / USER_HZ). Running time =
