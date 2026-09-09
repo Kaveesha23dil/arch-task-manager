@@ -5,7 +5,7 @@ Linux. It reads system information **directly from Linux interfaces** such as
 `/proc/stat`, `/proc/meminfo`, and `/proc/<pid>/` — no shelling out to `ps`,
 `free`, `top`, `htop`, or other external tools.
 
-> Stage: **Step 23** — CPU, RAM, swap, process monitoring, process actions, the
+> Stage: **Step 25** — CPU, RAM, swap, process monitoring, process actions, the
 > process tree, disk/storage monitoring, network monitoring, GPU monitoring,
 > temperature & hardware sensor monitoring, systemd service management,
 > startup application management, system information / hardware overview,
@@ -13,8 +13,9 @@ Linux. It reads system information **directly from Linux interfaces** such as
 > desktop notifications via D-Bus, Arch Linux package update detection,
 > application settings with persistent configuration, XDG desktop
 > autostart for the application itself, per-process resource monitoring
-> with read-only resource limits, and per-process CPU affinity & nice
-> priority management (confirmed, identity-checked scheduling changes).
+> with read-only resource limits, per-process CPU affinity & nice
+> priority management (confirmed, identity-checked scheduling changes),
+> and a read-only per-process memory-maps inspector.
 > Everything else on the roadmap is intentionally **not** implemented yet, but
 > the code is structured so future modules can be added without rewriting the
 > existing ones.
@@ -82,6 +83,19 @@ feature per milestone, hosted on GitHub.
       syscall, and `EPERM`/`EACCES` surfaces as a plain permission message
       (never auto-elevated). Changes are not persisted and only affect the
       running process.
+- [x] **Process memory maps inspection** — a read-only **Memory Maps** section
+      in the process inspector rendered from `/proc/<pid>/maps` (native C++
+      file I/O; never `pmap`/`ps`/shell). Each mapping shows start/end
+      addresses (hex), size, the original permission string `r-xp`-style, file
+      offset, device, inode and pathname — including `[heap]`, `[stack]`,
+      `[vdso]`, `[vvar]` and `[vsyscall]`. Virtual mapping statistics (mapping
+      count, total mapped bytes, executable/writable/file-backed/anonymous
+      counts) are clearly labelled as virtual, not physical, memory. Refreshing
+      happens only with the inspector's refresh lifecycle, results are
+      identity-gated against PID reuse, permission-denied / disappeared /
+      truncated / empty states are distinct and never crash the app, and the
+      view is capped at 4096 mappings with an explicit truncation notice. No
+      memory contents are ever read.
 - [x] **Disk / storage monitoring** — physical filesystem capacities via
       `statvfs(2)` over the mounts listed in `/proc/mounts`, real-time
       read/write throughput from two samples of `/proc/diskstats`, and whole
@@ -773,11 +787,15 @@ The details screen is its own little loop:
 | 5   | Continue (Resume)                    | `kill(pid, SIGCONT)` + confirmation|
 | 6   | Change Nice Priority                 | `setpriority(PRIO_PROCESS)` + confirmation|
 | 7   | Change CPU Affinity                  | `sched_setaffinity(2)` + confirmation|
+| 8   | Filter Memory Maps                   | path-substring filter on the maps rows |
+| 9   | Clear Memory Maps Filter             | show the full memory-maps table       |
 | 0   | Back                                 | return to the live view           |
 
 Control actions 2–5 reuse the existing `ProcessActions` wrappers (no signal
 logic is re-implemented) and scheduling actions 6–7 go through the dedicated
 scheduling manager; all of them are blocked for PID `1` / the monitor's own PID.
+Actions 8–9 are read-only display filters for the Memory Maps section and need
+no confirmation.
 
 ### Information displayed
 
@@ -795,6 +813,7 @@ selected process's `/proc/<pid>` directory directly — never by shelling out to
 | I/O statistics     | `/proc/<pid>/io`                              | read bytes, written bytes, read/write syscalls, cancelled writes, read/write **rates** |
 | Resource limits    | `/proc/<pid>/limits`                          | open files, processes, stack size, locked memory, address space, core file size, pending signals, POSIX message queues, realtime priority, realtime timeout |
 | Scheduling         | `getpriority(2)`, `sched_getaffinity(2)`, `/proc/<pid>/stat` | nice value, allowed CPU list, allowed CPU count |
+| Memory maps        | `/proc/<pid>/maps`                       | per-mapping start/end address, size, permission string, file offset, device, inode, pathname; summary counts |
 
 Start time is derived from the `starttime` tick in `/proc/<pid>/stat`, the
 system uptime (`/proc/uptime`) and the current clock; "Running For" reports the
@@ -910,6 +929,69 @@ Real-time scheduling classes (`SCHED_FIFO`/`SCHED_RR`/`SCHED_DEADLINE` via
 `chrt`), I/O priority, cgroups/CPU quotas, memory/disk throttling, automatic
 prioritization and any persistent per-process scheduling rules are **not**
 implemented.
+
+## Process memory maps inspection
+
+The details screen ends with a **Memory Maps** section that lists the selected
+process's virtual address-space layout, read directly from `/proc/<pid>/maps`
+on every inspector refresh (and only then — the main process monitor never
+scans `/*/maps`). It is a **read-only metadata** view: nothing reads the
+content of the mapped memory or of the mapped files, nothing uses `ptrace`, and
+no external command (`pmap`, `ps`, `smem`, ...) is executed. No root privileges
+are required.
+
+### What is shown
+
+| Column  | Meaning                                                        |
+| ------- | -------------------------------------------------------------- |
+| Start   | start address of the mapping (hexadecimal)                     |
+| End     | end address of the mapping (hexadecimal, exclusive)            |
+| Size    | `end - start`, human-readable (`atm::formatBytes`)             |
+| Perm    | original permission string, e.g. `r-xp` (`r`/`w`/`x`/`s`/`p`)  |
+| Offset  | file offset of the mapping (hexadecimal)                       |
+| Path    | mapping name: a file path, one of `[heap]`/`[stack]`/`[vdso]`/`[vvar]`/`[vsyscall]`, or `-` for anonymous mappings |
+
+Rows are ordered by ascending start address (the natural `/proc/<pid>/maps`
+order). Special mappings and shared/private permission bits are preserved
+verbatim.
+
+A compact summary is shown above the table and is **clearly labelled as virtual
+memory mapping statistics, not physical RAM usage**:
+
+- mapping count
+- total virtual mapped bytes
+- executable mapping count
+- writable mapping count
+- file-backed mapping count
+- anonymous mapping count
+
+These are derived from the mappings themselves and never duplicate or replace
+the process's `VmSize`/`VmRSS` values shown in the Memory section.
+
+### Filtering
+
+Key `8` prompts for a path substring (e.g. `libexample`) and re-displays only
+the mappings whose displayed path contains it; key `9` clears the filter. The
+filter is local to the inspection session and applies to the current refresh.
+
+### States
+
+- `Permission denied` is shown as **"Memory maps unavailable: permission
+  denied."** — never as an empty list (Linux may withhold `/proc/<pid>/maps`
+  for other users' processes, e.g. under `hidepid` mounts).
+- A process that vanished mid-read shows **"Process no longer exists."**.
+- A PID that was reused while inspecting is detected through the process
+  identity (PID + start-time tick, the same mechanism used by the scheduling
+  editor) and the stale result is discarded.
+- An empty file yields **"No memory mappings available."** (kernel threads, for
+  example).
+- More than 4096 mappings are capped; a **"Results truncated: only the first
+  N of at least M mappings are shown."** line appears instead of silent
+  truncation.
+
+Each of these is a distinct state — a permission problem is never mistaken for
+an empty mapping list, and a disappeared process is never mistaken for an empty
+one.
 
 ## Application Settings & Persistent Configuration
 
@@ -1125,6 +1207,9 @@ arch-task-manager/
 │   ├── process_monitor.hpp     # Process, ProcessState, ProcessMonitor
 │   ├── process_actions.hpp     # ProcessActions, ActionResult, ActionStatus
 │   ├── process_details.hpp     # ProcessDetailsInfo, ProcessDetails (/proc parser)
+│   ├── process_resources.hpp   # /proc/<pid>/io, stat, status, limits parsers + I/O rates
+│   ├── process_scheduling.hpp  # ProcessIdentity, sched_* / getpriority editors, CpuList parse
+│   ├── process_memory_map.hpp  # ProcessMemoryMap, /proc/<pid>/maps parser + manager
 │   ├── process_tree.hpp        # ProcessTreeNode, ProcessTree, build/render
 │   ├── disk_monitor.hpp        # DiskUsage, BlockDevice, DiskSnapshot, DiskMonitor
 │   ├── network_monitor.hpp     # NetworkInterfaceStats, NetworkSnapshot, NetworkMonitor
@@ -1153,6 +1238,9 @@ arch-task-manager/
 │   ├── process_monitor.cpp     # /proc scanning + per-process parsing
 │   ├── process_actions.cpp     # kill(2)/setpriority(2) wrappers + errno mapping
 │   ├── process_details.cpp     # per-PID /proc read + parse into ProcessDetailsInfo
+│   ├── process_resources.cpp   # process /proc parsers (io/stat/status/limits) + rate math
+│   ├── process_scheduling.cpp  # getpriority/setpriority + sched_get/setaffinity, identity gate
+│   ├── process_memory_map.cpp  # /proc/<pid>/maps parse, classify, identity-gated inspect
 │   ├── process_tree.cpp        # PID/PPID tree build + box-drawing renderer
 │   ├── disk_monitor.cpp        # statvfs(2) usage + /proc/diskstats rates + /sys/block
 │   ├── network_monitor.cpp     # /proc/net/dev two-sample rates + operstate

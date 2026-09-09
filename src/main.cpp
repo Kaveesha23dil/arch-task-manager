@@ -36,6 +36,7 @@
 #include "package_transaction.hpp"
 #include "process_actions.hpp"
 #include "process_details.hpp"
+#include "process_memory_map.hpp"
 #include "process_monitor.hpp"
 #include "process_resources.hpp"
 #include "process_scheduling.hpp"
@@ -1602,10 +1603,95 @@ void renderLimit(std::ostringstream &out, const std::string &label,
                     side(limit->hard, limit->hard_unlimited));
 }
 
+/// Renders the read-only memory-map section of the process inspector.
+/// `/proc/<pid>/maps` is metadata only: virtual address ranges, permission
+/// bits, offsets and mapping names — never memory contents.
+void renderMemoryMapsSection(std::ostringstream &out,
+                             const atm::ProcessMemoryMapsResult &maps,
+                             const std::string *path_filter) {
+  switch (maps.status) {
+    case atm::MemoryMapStatus::Success:
+      break;
+    case atm::MemoryMapStatus::PermissionDenied:
+      out << "Memory maps unavailable: permission denied.\n";
+      return;
+    case atm::MemoryMapStatus::ProcessNotFound:
+    case atm::MemoryMapStatus::IdentityUnknown:
+      out << "Process no longer exists.\n";
+      return;
+    case atm::MemoryMapStatus::ProcessReused:
+      out << "The process identity changed (the PID was reused); memory maps "
+             "were discarded.\n";
+      return;
+    case atm::MemoryMapStatus::InvalidPid:
+      out << "Invalid PID.\n";
+      return;
+    case atm::MemoryMapStatus::ReadError:
+      out << "Memory maps unavailable: "
+          << (maps.errno_value != 0 ? std::strerror(maps.errno_value)
+                                    : std::string("read failed"))
+          << ".\n";
+      return;
+  }
+
+  out << "Virtual memory mapping statistics (this is the virtual address space "
+         "layout, not physical RAM usage):\n";
+  appendLabeled(out, "Mappings:", std::to_string(maps.maps.size()));
+  appendLabeled(out, "Total mapped:", atm::formatBytes(maps.total_bytes));
+  appendLabeled(out, "Executable mappings:",
+                std::to_string(maps.executable_count));
+  appendLabeled(out, "Writable mappings:",
+                std::to_string(maps.writable_count));
+  appendLabeled(out, "File-backed mappings:",
+                std::to_string(maps.file_backed_count));
+  appendLabeled(out, "Anonymous mappings:",
+                std::to_string(maps.anonymous_count));
+
+  if (maps.maps.empty()) {
+    out << "\nNo memory mappings available.\n";
+    return;
+  }
+  if (maps.truncated) {
+    out << "\nResults truncated: only the first " << maps.maps.size()
+        << " of at least " << maps.maps.size() + 1
+        << " mappings are shown.\n";
+  }
+  if (path_filter != nullptr && !path_filter->empty()) {
+    out << "\nFiltering by path: \"" << *path_filter << "\" (press 8 to "
+           "change, 9 to clear)\n";
+  }
+
+  out << "\n";
+  out << std::left << std::setw(14) << "Start" << std::setw(15) << "End"
+      << std::setw(9) << "Size" << std::setw(6) << "Perm" << std::right
+      << std::setw(10) << "Offset" << "    Path\n";
+  for (const atm::ProcessMemoryMap &mapping : maps.maps) {
+    if (path_filter != nullptr && !path_filter->empty() &&
+        mapping.pathname.find(*path_filter) == std::string::npos) {
+      continue;
+    }
+    std::ostringstream start_hex;
+    std::ostringstream end_hex;
+    std::ostringstream offset_hex;
+    start_hex << std::hex << std::uppercase << mapping.start;
+    end_hex << std::hex << std::uppercase << mapping.end;
+    offset_hex << std::hex << std::uppercase << mapping.offset;
+    out << std::left << std::setw(14) << start_hex.str()
+        << std::setw(15) << end_hex.str() << std::setw(9)
+        << atm::formatBytes(mapping.size()) << std::setw(6)
+        << mapping.permissions << std::right << std::setw(10)
+        << offset_hex.str() << "    "
+        << (mapping.pathname.empty() ? std::string("-")
+                                     : mapping.pathname)
+        << '\n';
+  }
+}
+
 /// Renders the full detailed breakdown for one process (Step 13). Every
 /// field degrades to "N/A" when it could not be read; nothing here re-reads
 /// /proc — the data was already collected by ProcessDetails.
-std::string renderProcessDetails(const atm::ProcessDetailsInfo &info) {
+std::string renderProcessDetails(const atm::ProcessDetailsInfo &info,
+                                 const std::string *maps_filter = nullptr) {
   std::ostringstream out;
   out << "Process Details\n"
          "────────────────────────────────\n\n";
@@ -1760,6 +1846,13 @@ std::string renderProcessDetails(const atm::ProcessDetailsInfo &info) {
     renderLimit(out, "Realtime Timeout", info.limits.realtime_timeout, false);
     out << "Resource limits are read-only and not modified by this "
            "application.\n";
+  }
+
+  out << "\n## Memory Maps\n\n";
+  if (!info.memory_maps.has_value()) {
+    out << "Loading memory maps...\n";
+  } else {
+    renderMemoryMapsSection(out, *info.memory_maps, maps_filter);
   }
 
   return out.str();
@@ -2718,6 +2811,10 @@ void interactProcessDetail(atm::ProcessDetails &details,
   const int pid = selected->pid;
   const std::string name = selected->name;
 
+  // Optional path filter for the read-only memory-maps section; local to this
+  // inspection session, applied only to the displayed mapping rows.
+  std::string maps_filter;
+
   for (;;) {
     // Reuse the Process Monitor's CPU figure for this PID (the snapshot is at
     // most ~1 s old) rather than building a second CPU tracker.
@@ -2745,7 +2842,7 @@ void interactProcessDetail(atm::ProcessDetails &details,
     std::cout << "========================================\n"
                  "ARCH TASK MANAGER — Process Details\n"
                  "========================================\n\n"
-              << renderProcessDetails(*info) << "\n\n"
+              << renderProcessDetails(*info, &maps_filter) << "\n\n"
               << "[1] Refresh\n"
                  "[2] Terminate\n"
                  "[3] Kill\n"
@@ -2753,6 +2850,8 @@ void interactProcessDetail(atm::ProcessDetails &details,
                  "[5] Continue (Resume)\n"
                  "[6] Change Nice Priority\n"
                  "[7] Change CPU Affinity\n"
+                 "[8] Filter Memory Maps\n"
+                 "[9] Clear Memory Maps Filter\n"
                  "[0] Back\n\n"
                  "Select action:\n> "
               << std::flush;
@@ -2784,6 +2883,18 @@ void interactProcessDetail(atm::ProcessDetails &details,
     if (action_text == "7") {
       runChangeCpuAffinity(scheduling, input, pid, name);
       continue;  // redraw details: the refresh shows the kernel-confirmed value
+    }
+    if (action_text == "8") {  // filter the memory-maps rows by path
+      std::cout << "\nFilter memory maps by mapped path (Enter to clear):\n> "
+                << std::flush;
+      const std::optional<std::string> filter_line = input.readLine();
+      maps_filter =
+          filter_line ? trimWhitespace(*filter_line) : std::string{};
+      continue;  // redraw with the new filter
+    }
+    if (action_text == "9") {  // clear the memory-maps filter
+      maps_filter.clear();
+      continue;
     }
     std::cout << "Invalid action.\n";
   }

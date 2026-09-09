@@ -14,6 +14,7 @@
 #include <string_view>
 #include <unistd.h>
 
+#include "process_memory_map.hpp"
 #include "process_resources.hpp"
 #include "process_scheduling.hpp"
 
@@ -547,6 +548,17 @@ ProcessDetails::getProcessDetails(pid_t pid, std::uint64_t system_total_kib,
       info.allowed_cpus = affinity;
     }
     info.system_cpu_count = ProcessSchedulingManager::systemCpuCount();
+  }
+
+  // Memory mappings (read-only metadata) from /proc/<pid>/maps, collected on
+  // this same refresh pass and gated by the process identity (PID + start
+  // time) so a reused PID never shows another process's mappings. Reading the
+  // maps belongs to the inspector refresh lifecycle only: the process monitor
+  // never scans /proc/*/maps.
+  if (info.starttime_ticks.has_value()) {
+    const ProcessMemoryMapManager memory_maps;
+    info.memory_maps = memory_maps.inspect(
+        ProcessIdentity{pid, *info.starttime_ticks});
   }
 
   // Start time: boot wall-clock + (starttime ticks / USER_HZ). Running time =
