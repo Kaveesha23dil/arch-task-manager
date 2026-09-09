@@ -42,6 +42,7 @@ add_executable(arch-task-manager
   src/process_resources.cpp
   src/process_memory_map.cpp
   src/process_network.cpp
+  src/process_namespace.cpp
   src/process_scheduling.cpp
   src/process_tree.cpp
   src/disk_monitor.cpp
@@ -160,3 +161,17 @@ target_include_directories(process-network-tests PRIVATE include)
 target_link_libraries(process-network-tests PRIVATE Threads::Threads)
 
 add_test(NAME process-network COMMAND process-network-tests)
+
+add_executable(process-namespace-tests
+  tests/process_namespace_tests.cpp
+  src/process_namespace.cpp
+  src/process_resources.cpp
+  src/process_scheduling.cpp
+  src/logger.cpp
+)
+
+target_include_directories(process-namespace-tests PRIVATE include)
+
+target_link_libraries(process-namespace-tests PRIVATE Threads::Threads)
+
+add_test(NAME process-namespace COMMAND process-namespace-tests)

@@ -9,6 +9,7 @@
 
 #include "process_memory_map.hpp"
 #include "process_monitor.hpp"
+#include "process_namespace.hpp"
 #include "process_network.hpp"
 #include "process_resources.hpp"
 
@@ -111,6 +112,13 @@ struct ProcessDetailsInfo {
   // Read-only network connections from /proc/<pid>/fd + /proc/net/*. Nullopt
   // only when no process identity was available; otherwise always present.
   std::optional<ProcessNetworkConnectionsResult> network_connections;
+
+  // Read-only namespaces from /proc/<pid>/ns. Nullopt only when no process
+  // identity was available so the read was never attempted; otherwise always
+  // present (Success with zero or more entries, or a distinct error state such
+  // as permission denied or process disappeared). Entries whose targets could
+  // not be read are reported as unavailable, never as fabricated IDs.
+  std::optional<ProcessNamespaceResult> namespaces;
 
   // Start wall-clock time derived from the starttime tick, boot uptime and the
   // current clock. process_uptime_seconds is how long the process has been
