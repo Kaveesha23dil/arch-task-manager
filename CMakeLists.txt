@@ -40,6 +40,7 @@ add_executable(arch-task-manager
   src/process_actions.cpp
   src/process_details.cpp
   src/process_resources.cpp
+  src/process_scheduling.cpp
   src/process_tree.cpp
   src/disk_monitor.cpp
   src/network_monitor.cpp
@@ -116,3 +117,16 @@ target_include_directories(process-resources-tests PRIVATE include)
 target_link_libraries(process-resources-tests PRIVATE Threads::Threads)
 
 add_test(NAME process-resources COMMAND process-resources-tests)
+
+add_executable(process-scheduling-tests
+  tests/process_scheduling_tests.cpp
+  src/process_scheduling.cpp
+  src/process_resources.cpp
+  src/logger.cpp
+)
+
+target_include_directories(process-scheduling-tests PRIVATE include)
+
+target_link_libraries(process-scheduling-tests PRIVATE Threads::Threads)
+
+add_test(NAME process-scheduling COMMAND process-scheduling-tests)

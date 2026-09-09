@@ -5,15 +5,16 @@ Linux. It reads system information **directly from Linux interfaces** such as
 `/proc/stat`, `/proc/meminfo`, and `/proc/<pid>/` — no shelling out to `ps`,
 `free`, `top`, `htop`, or other external tools.
 
-> Stage: **Step 22** — CPU, RAM, swap, process monitoring, process actions, the
+> Stage: **Step 23** — CPU, RAM, swap, process monitoring, process actions, the
 > process tree, disk/storage monitoring, network monitoring, GPU monitoring,
 > temperature & hardware sensor monitoring, systemd service management,
 > startup application management, system information / hardware overview,
 > real-time resource history & graphs, resource alerts & threshold monitoring,
 > desktop notifications via D-Bus, Arch Linux package update detection,
 > application settings with persistent configuration, XDG desktop
-> autostart for the application itself, and per-process resource monitoring
-> with read-only resource limits.
+> autostart for the application itself, per-process resource monitoring
+> with read-only resource limits, and per-process CPU affinity & nice
+> priority management (confirmed, identity-checked scheduling changes).
 > Everything else on the roadmap is intentionally **not** implemented yet, but
 > the code is structured so future modules can be added without rewriting the
 > existing ones.
@@ -67,8 +68,20 @@ feature per milestone, hosted on GitHub.
       pending signals, POSIX message queues, realtime priority and timeout)
       with `unlimited` rendered as text rather than `RLIM_INFINITY`. Everything
       here is **read-only observation**: limits are displayed, never modified
-      (`setrlimit`, cgroups, priorities, CPU affinity and rejoining sessions
-      are all out of scope).
+      (`setrlimit`, cgroups and rejoining sessions are all out of scope;
+      niceness and CPU affinity are covered by the scheduling feature below).
+- [x] **Process scheduling & priority management** — the inspector's
+      **Scheduling** section shows the kernel-confirmed nice value and the
+      allowed CPU list, and keys `6`/`7` change a single running process's nice
+      priority (`setpriority(2)`) or CPU affinity (`sched_setaffinity(2)`) —
+      natively, identity-checked and never via `renice`/`taskset`. Every change
+      is gated by an explicit confirmation showing process name, PID, current
+      and new values, values are validated against the kernel's nice range
+      (−20…19) and the online CPU range, PID reuse is detected through the
+      start-time identity and cancels the operation, equal values make no
+      syscall, and `EPERM`/`EACCES` surfaces as a plain permission message
+      (never auto-elevated). Changes are not persisted and only affect the
+      running process.
 - [x] **Disk / storage monitoring** — physical filesystem capacities via
       `statvfs(2)` over the mounts listed in `/proc/mounts`, real-time
       read/write throughput from two samples of `/proc/diskstats`, and whole
@@ -758,10 +771,13 @@ The details screen is its own little loop:
 | 3   | Kill                                 | `kill(pid, SIGKILL)` + confirmation|
 | 4   | Stop (Pause)                         | `kill(pid, SIGSTOP)` + confirmation|
 | 5   | Continue (Resume)                    | `kill(pid, SIGCONT)` + confirmation|
+| 6   | Change Nice Priority                 | `setpriority(PRIO_PROCESS)` + confirmation|
+| 7   | Change CPU Affinity                  | `sched_setaffinity(2)` + confirmation|
 | 0   | Back                                 | return to the live view           |
 
 Control actions 2–5 reuse the existing `ProcessActions` wrappers (no signal
-logic is re-implemented) and are blocked for PID `1` / the monitor's own PID.
+logic is re-implemented) and scheduling actions 6–7 go through the dedicated
+scheduling manager; all of them are blocked for PID `1` / the monitor's own PID.
 
 ### Information displayed
 
@@ -771,13 +787,14 @@ selected process's `/proc/<pid>` directory directly — never by shelling out to
 
 | Section            | Source                                        | Fields                                                       |
 | ------------------ | --------------------------------------------- | ------------------------------------------------------------ |
-| Basic              | `/proc/<pid>/stat`, `/proc/<pid>/status`, `getpwuid_r` | name, PID, state, user, UID, GID, parent PID, threads, priority, nice, start time, running time |
+| Basic              | `/proc/<pid>/stat`, `/proc/<pid>/status`, `getpwuid_r` | name, PID, state, user, UID, GID, parent PID, threads, priority, start time, running time |
 | Location           | `/proc/<pid>/exe` (readlink), `/proc/<pid>/cwd` (readlink), `/proc/<pid>/cmdline` | executable path, working directory, command line |
 | Memory             | `/proc/<pid>/status` (`VmSize`, `VmRSS`, `VmExe`, `VmData`, `VmStk`), `/proc/<pid>/statm` | virtual, resident, shared, text, data, stack, memory % |
 | CPU                | `/proc/<pid>/stat` (`utime`, `stime`) + the process table's CPU % | user time, system time, CPU %, thread count |
 | Context switches   | `/proc/<pid>/status` (voluntary/nonvoluntary) | voluntary, non-voluntary counts |
 | I/O statistics     | `/proc/<pid>/io`                              | read bytes, written bytes, read/write syscalls, cancelled writes, read/write **rates** |
 | Resource limits    | `/proc/<pid>/limits`                          | open files, processes, stack size, locked memory, address space, core file size, pending signals, POSIX message queues, realtime priority, realtime timeout |
+| Scheduling         | `getpriority(2)`, `sched_getaffinity(2)`, `/proc/<pid>/stat` | nice value, allowed CPU list, allowed CPU count |
 
 Start time is derived from the `starttime` tick in `/proc/<pid>/stat`, the
 system uptime (`/proc/uptime`) and the current clock; "Running For" reports the
@@ -793,6 +810,12 @@ negative throughput. The **Resource limits** table reflects the kernel's
 `/proc/<pid>/limits` verbatim: `unlimited` is rendered as `Unlimited` (not the
 `RLIM_INFINITY` sentinel), and everything is read-only — the limits are never
 changed from the application.
+
+The **Scheduling** section shows what the kernel currently applies: the process's
+nice value (via `getpriority(2)`) and the exact CPU set it may run on (via
+`sched_getaffinity(2)`, rendered as a compact list such as `0,2,3` plus an
+"Allowed CPU Count"). Both values are re-read each refresh, so the screen always
+reflects the kernel-confirmed state.
 
 ### Permission limitations
 
@@ -819,6 +842,74 @@ screen reports **"Process no longer exists."** and returns to the process list.
 Zombie processes are reported with state `Z` / `Zombie`, malformed files are
 skipped, broken `/proc` links are shown as such, and none of these conditions
 ever crashes the application or spawns an extra thread or update loop.
+
+## Process scheduling (nice & CPU affinity)
+
+`6` (**Change Nice Priority**) and `7` (**Change CPU Affinity**) in the process
+details screen modify the scheduling of a single already-running process. Both
+go through the dedicated scheduling manager, which calls the kernel directly:
+
+| Operation                 | System call                       |
+| ------------------------- | --------------------------------- |
+| Read nice value           | `getpriority(PRIO_PROCESS, pid)`  |
+| Change nice value         | `setpriority(PRIO_PROCESS, pid, nice)` |
+| Read CPU affinity         | `sched_getaffinity(2)`            |
+| Change CPU affinity       | `sched_setaffinity(2)`            |
+
+No shell command (`taskset`, `renice`, `chrt`, `nice`, `ps`, ...) is ever run:
+an operation is either performed by the application itself or reported as not
+permitted. The application never uses `sudo`/`su`, never asks for a password,
+and never auto-elevates privileges.
+
+### Common safeguards (both operations)
+
+- **Explicit confirmation every time.** Before anything is applied, the screen
+  shows the process name, PID, the current value and the proposed new value and
+  asks "Apply this change?". Refusing or cancelling the input discards the
+  pending change; the process is left untouched. There is no setting that turns
+  this confirmation off.
+- **PID-reuse protection.** When the user selects an operation, the manager
+  captures a `ProcessIdentity` — the PID plus the kernel start-time tick from
+  `/proc/<pid>/stat`. Immediately before the system call it re-reads the
+  identity. If the PID has been reassigned to a different process in between,
+  the change is refused ("process identity changed") and no syscall happens.
+- **Protected processes.** Like the signal actions, niceness/affinity changes
+  are refused for PID `1` and the monitor's own PID.
+- **No-op detection.** If the requested value equals the current one, no system
+  call is made and the operation simply reports "No change".
+- **Validation before the syscall.** The nice value must be within `-20…19`
+  (the kernel's documented range) and every CPU id must be `0 … online−1`.
+- **Logging.** Every request, success and failure is written via the existing
+  logger (e.g. `Nice change requested PID: … Current nice: 0 New nice: 10`
+  followed by the success or failure line).
+- **Live-only.** Changes affect the running process right now; they are not
+  persisted anywhere (no SettingsManager rules), apply to that process only,
+  and are lost when the process exits.
+
+### Nice priority
+
+Affects how the CPU scheduler weighs the process. Lower values = higher
+priority. A normal (non-root) user may only raise their own processes' nice
+values (within the kernel range and the user's `RLIMIT_NICE`); lowering it
+(which would make a process run *faster* than other ordinary processes)
+requires being root or `CAP_SYS_NICE`. Such a denial surfaces as a clear
+"Permission denied" message — the application does not ask for elevation.
+
+### CPU affinity
+
+The set of CPU cores the process is allowed to run on, entered as a list of
+ids or ranges, e.g. `0,2`, `0 2`, `0-3`, or `0-1, 3-4`. It is validated and
+sorted before any system call, and an empty mask is never produced or
+submitted ("At least one CPU must remain selected."). After a successful
+change the details screen refreshes automatically to show the kernel-confirmed
+value.
+
+### Out of scope by design
+
+Real-time scheduling classes (`SCHED_FIFO`/`SCHED_RR`/`SCHED_DEADLINE` via
+`chrt`), I/O priority, cgroups/CPU quotas, memory/disk throttling, automatic
+prioritization and any persistent per-process scheduling rules are **not**
+implemented.
 
 ## Application Settings & Persistent Configuration
 

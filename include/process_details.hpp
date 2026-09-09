@@ -1,11 +1,11 @@
 #pragma once
 
 #include <chrono>
-#include <chrono>
 #include <cstdint>
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 #include "process_monitor.hpp"
 #include "process_resources.hpp"
@@ -85,6 +85,19 @@ struct ProcessDetailsInfo {
   // Read-only resource limits parsed from /proc/<pid>/limits. Values are
   // intentionally never modified by the application.
   ProcessResourceLimits limits;
+
+  // Process identity: the kernel start-time tick from /proc/<pid>/stat, used
+  // by the scheduling editor to verify the selected process is still the same
+  // one before applying a change (guards against PID reuse).
+  std::optional<std::uint64_t> starttime_ticks;
+
+  // Scheduling state, read-only observation via ProcessSchedulingManager.
+  // `allowed_cpus` is the process's current CPU affinity from
+  // sched_getaffinity(2); `system_cpu_count` is the online CPU count used to
+  // validate/format the allowed list. Neither is ever modified by the
+  // collector.
+  std::optional<std::vector<int>> allowed_cpus;
+  int system_cpu_count = 0;
 
   // Start wall-clock time derived from the starttime tick, boot uptime and the
   // current clock. process_uptime_seconds is how long the process has been
