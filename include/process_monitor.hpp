@@ -40,7 +40,9 @@ struct Process {
   std::uint32_t thread_count = 0;  // threads from status (or stat, as fallback)
   std::uint64_t memory_kib = 0;    // VmRSS from /proc/<pid>/status, in kB
   double memory_percent = 0.0;     // RSS / total system RAM × 100
-  std::uint64_t cpu_ticks = 0;     // utime + stime, in USER_HZ ticks
+  std::uint64_t cpu_ticks = 0;         // utime + stime, in USER_HZ ticks
+  std::uint64_t user_cpu_ticks = 0;    // utime alone, in USER_HZ ticks
+  std::uint64_t system_cpu_ticks = 0;  // stime alone, in USER_HZ ticks
   double cpu_percent = 0.0;        // usage since the previous scan
   std::string command_line;        // argv from cmdline; empty for kernel threads
 

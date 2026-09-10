@@ -42,6 +42,7 @@
 #include "process_io_details.hpp"
 #include "process_memory_map.hpp"
 #include "process_monitor.hpp"
+#include "process_statistics.hpp"
 #include "process_namespace.hpp"
 #include "process_network.hpp"
 #include "process_resources.hpp"
@@ -1507,6 +1508,9 @@ std::string buildInterfaceDetail(const atm::NetworkInterfaceStats &iface) {
   return out.str();
 }
 
+/// Converts a CPU time in USER_HZ ticks to a human-readable duration.
+std::string formatTicks(std::uint64_t ticks);
+
 /// Renders the process table, sorted by `sort`.
 void renderProcessTable(std::ostringstream &out,
                         const std::vector<atm::Process> &processes) {
@@ -1517,15 +1521,51 @@ void renderProcessTable(std::ostringstream &out,
   }
 }
 
-/// Renders the total/running/sleeping/stopped/zombie counters.
+/// Renders the aggregated system-wide process statistics.
 void renderProcessStats(std::ostringstream &out,
-                        const atm::ProcessStats &stats) {
+                        const atm::SystemProcessStatistics &stats) {
   out << "\n## Process Statistics\n\n";
   appendLabeled(out, "Total:", std::to_string(stats.total));
   appendLabeled(out, "Running:", std::to_string(stats.running));
   appendLabeled(out, "Sleeping:", std::to_string(stats.sleeping));
+  appendLabeled(out, "Disk sleep:", std::to_string(stats.disk_sleep));
   appendLabeled(out, "Stopped:", std::to_string(stats.stopped));
   appendLabeled(out, "Zombie:", std::to_string(stats.zombie));
+  appendLabeled(out, "Idle:", std::to_string(stats.idle));
+  appendLabeled(out, "Unknown:", std::to_string(stats.unknown));
+  appendLabeled(out, "Threads:", std::to_string(stats.total_threads));
+  appendLabeled(out, "Aggregate CPU:",
+                formatPercent(stats.aggregate_cpu_percent) + "%");
+  appendLabeled(out, "CPU user time:",
+                formatTicks(stats.total_user_cpu_ticks));
+  appendLabeled(out, "CPU system time:",
+                formatTicks(stats.total_system_cpu_ticks));
+  appendLabeled(out, "Total CPU time:",
+                formatTicks(stats.total_cpu_ticks));
+  appendLabeled(out, "Resident memory:",
+                formatKibibytes(stats.total_rss_kib));
+  appendLabeled(out, "Shared memory:",
+                formatKibibytes(stats.total_shared_kib));
+  appendLabeled(out, "Memory usage:",
+                formatPercent(stats.aggregate_memory_percent) + "%");
+
+  std::ostringstream io;
+  io << atm::GraphRenderer::formatRate(stats.total_read_rate) << " read, "
+     << atm::GraphRenderer::formatRate(stats.total_write_rate) << " write";
+  appendLabeled(out, "Process I/O:", io.str());
+
+  std::ostringstream activity;
+  activity << "+" << stats.process_creations << " created / -"
+           << stats.process_exits << " exited";
+  appendLabeled(out, "Activity:", activity.str());
+  appendLabeled(out, "Created last scan:",
+                std::to_string(stats.process_creations));
+  appendLabeled(out, "Exited last scan:",
+                std::to_string(stats.process_exits));
+  appendLabeled(out, "Creation rate:",
+                formatPercent(stats.creation_rate_per_second) + "/s");
+  appendLabeled(out, "Exit rate:",
+                formatPercent(stats.exit_rate_per_second) + "/s");
 }
 
 /// Renders a time_point as a "YYYY-MM-DD HH:MM:SS" local-time string.
@@ -1562,6 +1602,12 @@ std::string formatDuration(std::uint64_t seconds) {
   }
   out << secs << "s";
   return out.str();
+}
+
+/// Formats a CPU time in USER_HZ ticks as a human-readable duration.
+/// USER_HZ is 100 clock ticks per second on Linux (see /proc/<pid>/stat).
+std::string formatTicks(std::uint64_t ticks) {
+  return formatDuration(ticks / 100);
 }
 
 /// Human-readable label for the <value> or the `<optional>` value, showing
@@ -2625,7 +2671,7 @@ std::string renderTreeFrame(double cpu_usage, const atm::MemoryInfo &memory,
 /// self-contained 1 s snapshot.
 std::string renderFrame(double cpu_usage, const atm::MemoryInfo &memory,
                         const std::vector<atm::Process> &processes,
-                        const atm::ProcessStats &stats, atm::ProcessSort sort,
+                        const atm::SystemProcessStatistics &stats, atm::ProcessSort sort,
                         ViewMode view, const atm::ProcessTree &tree,
                         const atm::DiskSnapshot &disk,
                         const atm::NetworkSnapshot &network,
@@ -2697,7 +2743,7 @@ std::string renderFrame(double cpu_usage, const atm::MemoryInfo &memory,
 /// Clears the terminal and redraws the whole view in place.
 void renderView(double cpu_usage, const atm::MemoryInfo &memory,
                 const std::vector<atm::Process> &processes,
-                const atm::ProcessStats &stats, atm::ProcessSort sort,
+                const atm::SystemProcessStatistics &stats, atm::ProcessSort sort,
                 ViewMode view, const atm::ProcessTree &tree,
                 const atm::DiskSnapshot &disk,
                 const atm::NetworkSnapshot &network,
@@ -4950,6 +4996,7 @@ int main() {
   atm::CpuMonitor cpu_monitor;
   atm::MemoryMonitor memory_monitor;
   atm::ProcessMonitor process_monitor;
+  atm::ProcessStatisticsAggregator process_statistics;
   atm::DiskMonitor disk_monitor;
   atm::NetworkMonitor network_monitor;
   atm::GpuMonitor gpu_monitor;
@@ -5066,6 +5113,8 @@ int main() {
   auto snapshot = process_monitor.read(first_memory->total);
   atm::sortProcesses(snapshot.processes, sort);
   atm::ProcessTree tree = atm::buildProcessTree(snapshot.processes);
+  const atm::SystemProcessStatistics proc_stats =
+      process_statistics.update(snapshot);
 
   // Seed the resource history with the first sample so graphs show data from
   // the very first frame.
@@ -5084,11 +5133,12 @@ int main() {
                    static_cast<double>(first_network.total_rx_bytes_per_second),
                    static_cast<double>(first_network.total_tx_bytes_per_second),
                    gpu_utils, gpu_vrams, temps);
+    history.updateProcessStats(proc_stats);
     updateAlerts(alerts, *first_cpu, *first_memory, first_disk, first_network,
                  first_gpu, first_sensors, history);
   }
 
-  renderView(*first_cpu, *first_memory, snapshot.processes, snapshot.stats,
+  renderView(*first_cpu, *first_memory, snapshot.processes, proc_stats,
              sort, view, tree, first_disk, first_network, first_gpu,
              first_sensors, first_systemd, first_startup, sysinfo, history,
              show_history, alerts, alert_filter, service_search, service_sort,
@@ -5154,6 +5204,8 @@ int main() {
             snapshot = process_monitor.read(memory->total);
             atm::sortProcesses(snapshot.processes, sort);
             tree = atm::buildProcessTree(snapshot.processes);
+            const atm::SystemProcessStatistics proc_stats =
+                process_statistics.update(snapshot);
             {
               std::vector<std::pair<std::string, double>> gpu_utils;
               std::vector<std::pair<std::string, double>> gpu_vrams;
@@ -5169,10 +5221,11 @@ int main() {
                              static_cast<double>(network.total_rx_bytes_per_second),
                              static_cast<double>(network.total_tx_bytes_per_second),
                              gpu_utils, gpu_vrams, temps);
+              history.updateProcessStats(proc_stats);
               updateAlerts(alerts, *cpu, *memory, disk, network, gpu, sensors,
                            history);
             }
-            renderView(*cpu, *memory, snapshot.processes, snapshot.stats,
+            renderView(*cpu, *memory, snapshot.processes, proc_stats,
                        sort, view, tree, disk, network, gpu, sensors,
                        systemd, startup, sysinfo, history, show_history,
                        alerts, alert_filter, service_search, service_sort,
@@ -5271,6 +5324,8 @@ int main() {
     snapshot = process_monitor.read(memory->total);
     atm::sortProcesses(snapshot.processes, sort);
     tree = atm::buildProcessTree(snapshot.processes);
+    const atm::SystemProcessStatistics proc_stats =
+        process_statistics.update(snapshot);
     const atm::DiskSnapshot disk = disk_monitor.read();
     network = network_monitor.read();
     gpu = gpu_monitor.read();
@@ -5293,10 +5348,11 @@ int main() {
                      static_cast<double>(network.total_rx_bytes_per_second),
                      static_cast<double>(network.total_tx_bytes_per_second),
                      gpu_utils, gpu_vrams, temps);
+      history.updateProcessStats(proc_stats);
       updateAlerts(alerts, *cpu, *memory, disk, network, gpu, sensors, history);
     }
 
-    renderView(*cpu, *memory, snapshot.processes, snapshot.stats, sort, view,
+    renderView(*cpu, *memory, snapshot.processes, proc_stats, sort, view,
                tree, disk, network, gpu, sensors, systemd, startup, sysinfo,
                history, show_history, alerts, alert_filter, service_search,
                service_sort, startup_search, startup_sort, packages,

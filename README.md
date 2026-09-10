@@ -5,7 +5,7 @@ Linux. It reads system information **directly from Linux interfaces** such as
 `/proc/stat`, `/proc/meminfo`, and `/proc/<pid>/` — no shelling out to `ps`,
 `free`, `top`, `htop`, or other external tools.
 
-> Stage: **Step 33** — CPU, RAM, swap, process monitoring, process actions, the
+> Stage: **Step 34** — CPU, RAM, swap, process monitoring, process actions, the
 > process tree, disk/storage monitoring, network monitoring, GPU monitoring,
 > temperature & hardware sensor monitoring, systemd service management,
 > startup application management, system information / hardware overview,
@@ -25,9 +25,13 @@ Linux. It reads system information **directly from Linux interfaces** such as
 > TracerPid, optional security context and loginuid), and a
 > read-only per-process I/O details inspector (character I/O,
 > storage I/O, syscall counts, cancelled writes, read/write rates),
-> and a user-triggered process details export that writes a bounded,
+> a user-triggered process details export that writes a bounded,
 > deterministic, plain-text report with secret masking and PID-reuse
-> protection.
+> protection, and a system-wide process statistics overview that
+> aggregates the whole process population (counts by state, threads,
+> CPU time, resident memory, I/O throughput, plus process
+> creation/exit rates tracked across refreshes) in a single O(N)
+> pass over the existing process snapshot.
 > Everything else on the roadmap is intentionally **not** implemented yet, but
 > the code is structured so future modules can be added without rewriting the
 > existing ones.
@@ -624,11 +628,28 @@ Startup apps: press 'a' (then Enter) to manage autostart
 
 ## Process Statistics
 
-Total:               186
-Running:               3
-Sleeping:            178
-Stopped:               1
-Zombie:                4
+Total:                 186
+Running:                 3
+Sleeping:              178
+Disk sleep:              0
+Stopped:                 1
+Zombie:                  4
+Idle:                    0
+Unknown:                 0
+Threads:              1784
+Aggregate CPU:         12.3%
+CPU user time:           2h 31m 40s
+CPU system time:         41m 8s
+Total CPU time:          3h 12m 48s
+Resident memory:       3.4 GB
+Shared memory:           1.2 GB
+Memory usage:          31.2%
+Process I/O:          1.2 MB/s read, 680 kB/s write
+Activity:            +2 created / -1 exited
+Created last scan:            2
+Exited last scan:             1
+Creation rate:               0.0/s
+Exit rate:                   0.0/s
 
 ---
 
@@ -1862,6 +1883,7 @@ arch-task-manager/
 │   ├── process_environment.hpp # ProcessEnvironmentManager, masked /proc/<pid>/environ parser
 │   ├── process_io_details.hpp  # ProcessIoDetailsManager, /proc/<pid>/io detailed parser + I/O details
 │   ├── process_report.hpp      # Process report generation, filename sanitization, atomic write
+│   ├── process_statistics.hpp   # SystemProcessStatistics, aggregateSystemProcessStatistics, aggregator
 │   ├── process_tree.hpp        # ProcessTreeNode, ProcessTree, build/render
 │   ├── disk_monitor.hpp        # DiskUsage, BlockDevice, DiskSnapshot, DiskMonitor
 │   ├── network_monitor.hpp     # NetworkInterfaceStats, NetworkSnapshot, NetworkMonitor
@@ -1891,6 +1913,7 @@ arch-task-manager/
 │   ├── process_actions.cpp     # kill(2)/setpriority(2) wrappers + errno mapping
 │   ├── process_details.cpp     # per-PID /proc read + parse into ProcessDetailsInfo
 │   ├── process_report.cpp      # report generation, section renderers, atomic write
+│   ├── process_statistics.cpp  # O(N) aggregation, creation/exit rate tracking across snapshots
 │   ├── process_resources.cpp   # process /proc parsers (io/stat/status/limits) + rate math
 │   ├── process_scheduling.cpp  # getpriority/setpriority + sched_get/setaffinity, identity gate
 │   ├── process_memory_map.cpp  # /proc/<pid>/maps parse, classify, identity-gated inspect
@@ -2036,9 +2059,37 @@ disappeared. The only fatal errors are a missing `/proc/stat` or
 
 ### Process statistics
 
-The counters are derived from the state mapped above: `Running` = `R`,
-`Sleeping` = `S`/`I`/`D`, `Stopped` = `T`/`t`, `Zombie` = `Z`/`X`. Unreadable
-or unrecognized states count toward `Total` only.
+The system-wide process statistics overview aggregates the whole process
+population in a **single O(N) pass** over the existing `ProcessSnapshot` —
+it never scans `/proc` itself. Per state the aggregator counts: `Running` =
+`R`, `Sleeping` = `S`, `Disk sleep` = `D`, `Stopped` = `T`/`t`, `Zombie` =
+`Z`/`X`, `Idle` = `I`, and `Unknown` = unreadable or unrecognized state
+characters. It also sums:
+
+- **Threads** — every process's `thread_count` from `/proc/<pid>/status`.
+- **Aggregate CPU** — the per-process `cpu_percent` values as computed by
+  the monitor's two-sample delta (sum can exceed 100% on multi-core).
+- **CPU user/system/total time** — per-process `utime`/`stime` tick sums
+  from `/proc/<pid>/stat`, rendered as human-readable durations (100 ticks
+  per second).
+- **Resident & shared memory** — per-process `VmRSS` and the resident
+  shared portion (`RssShmem` + `RssFile`) from `/proc/<pid>/status`, plus
+  the summed memory percentage.
+- **Process I/O** — the summed per-process read/write rates (bytes/sec).
+
+Process **creation/exit rates** are measured between consecutive refreshes:
+the aggregator keeps the previous snapshot's process identities (PID +
+`/proc/<pid>/stat` start-time — the same identity `ProcessMonitor` guards its
+deltas with). A process new to the set counts as one creation; a process no
+longer present counts as one exit; a reused PID with a different start time
+counts as one of each. Rates divide the counts by the wall time between the
+two snapshots. The very first update only establishes a baseline, so it
+reports zero activity.
+
+The same statistics feed a set of bounded history buffers (process count,
+running count, zombie count, thread count, aggregate CPU, aggregate RSS,
+creation rate, exit rate) that respect the configured `max_samples` and the
+history pause setting.
 
 ## How RAM / swap usage is obtained
 
