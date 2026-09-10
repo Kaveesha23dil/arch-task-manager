@@ -16,6 +16,7 @@
 #include <poll.h>
 #include <sstream>
 #include <string>
+#include <sys/stat.h>
 #include <thread>
 #include <unistd.h>
 #include <unordered_map>
@@ -47,6 +48,7 @@
 #include "process_scheduling.hpp"
 #include "process_security.hpp"
 #include "process_tree.hpp"
+#include "process_report.hpp"
 #include "resource_history.hpp"
 #include "sensor_monitor.hpp"
 #include "settings.hpp"
@@ -3591,6 +3593,7 @@ void interactProcessDetail(atm::ProcessDetails &details,
                  "[7] Change CPU Affinity\n"
                  "[8] Filter Sections (Memory Maps / Environment)\n"
                  "[9] Clear Section Filter\n"
+                 "[E] Export Process Details\n"
                  "[0] Back\n\n"
                  "Select action:\n> "
               << std::flush;
@@ -3634,6 +3637,59 @@ void interactProcessDetail(atm::ProcessDetails &details,
     }
     if (action_text == "9") {  // clear the section filter
       section_filter.clear();
+      continue;
+    }
+    if (action_text == "e" || action_text == "E") {
+      if (!info->starttime_ticks.has_value() || *info->starttime_ticks == 0) {
+        std::cout << "\nCannot export: process identity is not available.\n"
+                  << "Press Enter to continue.\n"
+                  << std::flush;
+        static_cast<void>(input.readLine());
+        continue;
+      }
+      const atm::ProcessIdentity identity{pid, *info->starttime_ticks};
+      const std::string default_name =
+          atm::defaultReportFilename(pid, info->name);
+      std::cout << "\nExport destination (blank for \"" << default_name
+                << "\"):\n> " << std::flush;
+      const auto dest_line = input.readLine();
+      if (!dest_line) {
+        continue;
+      }
+      std::string destination = trimWhitespace(*dest_line);
+      if (destination.empty()) {
+        destination = default_name;
+      }
+      // Overwrite protection: ask before replacing an existing file.
+      {
+        struct stat st {};
+        if (::stat(destination.c_str(), &st) == 0) {
+          std::cout << "File \"" << destination
+                    << "\" already exists. Overwrite? [y/N]: " << std::flush;
+          const auto confirm = input.readLine();
+          if (!confirm || trimWhitespace(*confirm) != "y") {
+            std::cout << "\nExport cancelled.\nPress Enter to continue.\n"
+                      << std::flush;
+            static_cast<void>(input.readLine());
+            continue;
+          }
+        }
+      }
+      const auto result = atm::exportProcessReport(destination, *info, identity);
+      if (result.status == atm::ReportStatus::Success ||
+          result.status == atm::ReportStatus::SuccessProcessGone) {
+        std::cout << "\nReport written: " << result.path << " ("
+                  << result.bytes << " bytes)\n";
+        if (result.status == atm::ReportStatus::SuccessProcessGone) {
+          std::cout << "(The process exited during export; some sections may "
+                       "be incomplete.)\n";
+        }
+      } else {
+        std::cout << "\nFailed to write process report: "
+                  << atm::reportStatusMessage(result.status) << "\n";
+      }
+      std::cout << "Press Enter to continue.\n" << std::flush;
+      static_cast<void>(input.readLine());
       continue;
     }
     std::cout << "Invalid action.\n";

@@ -49,6 +49,7 @@ add_executable(arch-task-manager
   src/process_scheduling.cpp
   src/process_security.cpp
   src/process_tree.cpp
+  src/process_report.cpp
   src/disk_monitor.cpp
   src/network_monitor.cpp
   src/gpu_monitor.cpp
@@ -235,3 +236,25 @@ target_include_directories(process-io-details-tests PRIVATE include)
 target_link_libraries(process-io-details-tests PRIVATE Threads::Threads)
 
 add_test(NAME process-io-details COMMAND process-io-details-tests)
+
+add_executable(process-report-tests
+  tests/process_report_tests.cpp
+  src/process_report.cpp
+  src/process_monitor.cpp
+  src/cpu_monitor.cpp
+  src/process_resources.cpp
+  src/process_scheduling.cpp
+  src/process_network.cpp
+  src/process_namespace.cpp
+  src/process_cgroup.cpp
+  src/process_security.cpp
+  src/process_io_details.cpp
+  src/process_environment.cpp
+  src/logger.cpp
+)
+
+target_include_directories(process-report-tests PRIVATE include)
+
+target_link_libraries(process-report-tests PRIVATE Threads::Threads)
+
+add_test(NAME process-report COMMAND process-report-tests)
