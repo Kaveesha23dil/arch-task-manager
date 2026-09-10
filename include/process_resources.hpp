@@ -73,11 +73,13 @@ parseProcessLimits(std::string_view contents);
  */
 struct ProcessIoCounters {
   bool available = false;
-  std::uint64_t read_bytes = 0;
-  std::uint64_t write_bytes = 0;
+  std::uint64_t read_bytes = 0;   // rchar: characters read via syscalls
+  std::uint64_t write_bytes = 0;  // wchar: characters written via syscalls
   std::uint64_t read_syscalls = 0;
   std::uint64_t write_syscalls = 0;
   std::uint64_t cancelled_write_bytes = 0;
+  std::uint64_t storage_read_bytes = 0;   // read_bytes: actual storage I/O
+  std::uint64_t storage_write_bytes = 0;  // write_bytes: actual storage I/O
 };
 
 /// Parses /proc/<pid>/io text into ProcessIoCounters. Only recognizes the
@@ -88,6 +90,8 @@ struct ProcessIoCounters {
 struct IoRates {
   double read_rate = 0.0;
   double write_rate = 0.0;
+  double storage_read_rate = 0.0;
+  double storage_write_rate = 0.0;
 };
 
 /**

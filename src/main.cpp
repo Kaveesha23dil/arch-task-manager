@@ -38,6 +38,7 @@
 #include "process_cgroup.hpp"
 #include "process_details.hpp"
 #include "process_environment.hpp"
+#include "process_io_details.hpp"
 #include "process_memory_map.hpp"
 #include "process_monitor.hpp"
 #include "process_namespace.hpp"
@@ -1567,21 +1568,6 @@ std::string orNa(const std::string &value) {
   return value.empty() ? std::string("N/A") : value;
 }
 
-/// Formats an I/O throughput value (bytes/second). Zero rates are rendered as
-/// "0 B/s" (or "N/A" when no I/O data is available); otherwise the network
-/// rate formatter produces a human-readable unit such as "12.3 MB/s".
-/// Returns "N/A" when `available` is false (permission-denied I/O).
-std::string formatIoRate(double bytes_per_second, bool available) {
-  if (!available) {
-    return "N/A";
-  }
-  if (bytes_per_second < 0.0) {
-    return "N/A";
-  }
-  return atm::formatNetworkRate(
-      static_cast<std::uint64_t>(bytes_per_second + 0.5));
-}
-
 /// Renders one resource-limit row as "Label: soft / hard", where either side
 /// shows "Unlimited" or a formatted value and the whole row is "N/A" when the
 /// limit could not be parsed. `as_count` selects a plain count (files,
@@ -2325,6 +2311,105 @@ void renderSecuritySection(std::ostringstream &out,
          "subject to kernel and permission availability.\n";
 }
 
+/// Formats a rate value with a descriptive suffix. Returns "N/A" when the rate
+/// is unavailable or negative.
+std::string formatIoDetailsRate(double bytes_per_second, bool available) {
+  if (!available || bytes_per_second < 0.0) {
+    return "N/A";
+  }
+  return atm::formatNetworkRate(
+      static_cast<std::uint64_t>(bytes_per_second + 0.5));
+}
+
+/// Renders the I/O Details section of the Detailed Process Inspector (Step 31).
+/// This is a strictly read-only display of the selected process's I/O
+/// accounting from /proc/<pid>/io. Nothing here modifies the process.
+void renderIoDetailsSection(std::ostringstream &out,
+                            const atm::ProcessIoDetailsResult &io) {
+  switch (io.status) {
+    case atm::IoDetailsStatus::Success:
+      break;
+    case atm::IoDetailsStatus::PermissionDenied:
+      out << "I/O information unavailable: permission denied.\n";
+      return;
+    case atm::IoDetailsStatus::ProcessNotFound:
+    case atm::IoDetailsStatus::IdentityUnknown:
+      out << "Process no longer exists.\n";
+      return;
+    case atm::IoDetailsStatus::ProcessReused:
+      out << "The process identity changed (the PID was reused); I/O data "
+             "was discarded.\n";
+      return;
+    case atm::IoDetailsStatus::InvalidPid:
+      out << "Invalid PID.\n";
+      return;
+    case atm::IoDetailsStatus::ReadError:
+      out << "I/O information unavailable: "
+          << (io.errno_value != 0 ? std::strerror(io.errno_value)
+                                  : std::string("read failed"))
+          << ".\n";
+      return;
+  }
+
+  const atm::ProcessIoDetailsInfo &info = io.info;
+
+  // Character I/O: bytes counted at the system-call level (rchar / wchar).
+  // These include page-cache hits and are NOT direct storage I/O.
+  out << "### Character I/O\n\n";
+  appendLabeled(out, "Characters Read:",
+                info.chars_read.has_value()
+                    ? atm::formatBytes(*info.chars_read)
+                    : std::string("N/A"));
+  appendLabeled(out, "Characters Written:",
+                info.chars_written.has_value()
+                    ? atm::formatBytes(*info.chars_written)
+                    : std::string("N/A"));
+  appendLabeled(out, "Read System Calls:",
+                info.read_syscalls.has_value()
+                    ? formatThousands(*info.read_syscalls)
+                    : std::string("N/A"));
+  appendLabeled(out, "Write System Calls:",
+                info.write_syscalls.has_value()
+                    ? formatThousands(*info.write_syscalls)
+                    : std::string("N/A"));
+
+  // Storage I/O: bytes actually fetched from / sent to the storage layer.
+  // These reflect real disk I/O and are always <= the character I/O counts.
+  out << "\n### Storage I/O\n\n";
+  appendLabeled(out, "Bytes Read:",
+                info.bytes_read.has_value()
+                    ? atm::formatBytes(*info.bytes_read)
+                    : std::string("N/A"));
+  appendLabeled(out, "Bytes Written:",
+                info.bytes_written.has_value()
+                    ? atm::formatBytes(*info.bytes_written)
+                    : std::string("N/A"));
+  appendLabeled(out, "Cancelled Write:",
+                info.cancelled_write_bytes.has_value()
+                    ? atm::formatBytes(*info.cancelled_write_bytes)
+                    : std::string("N/A"));
+
+  // Current Activity: derived rates from counter deltas.
+  out << "\n### Current Activity\n\n";
+  const bool has_chars =
+      info.chars_read.has_value() || info.chars_written.has_value();
+  const bool has_storage =
+      info.bytes_read.has_value() || info.bytes_written.has_value();
+  appendLabeled(out, "Char Read Rate:",
+                formatIoDetailsRate(info.chars_read_rate, has_chars));
+  appendLabeled(out, "Char Write Rate:",
+                formatIoDetailsRate(info.chars_written_rate, has_chars));
+  appendLabeled(out, "Storage Read Rate:",
+                formatIoDetailsRate(info.bytes_read_rate, has_storage));
+  appendLabeled(out, "Storage Write Rate:",
+                formatIoDetailsRate(info.bytes_written_rate, has_storage));
+
+  out << "\nI/O data is read-only and based on /proc. Character I/O (rchar/"
+         "wchar) includes page-cache hits; storage I/O (read_bytes/write_bytes) "
+         "reflects actual disk activity. Rates are derived from counter deltas "
+         "between consecutive samples of the same process.\n";
+}
+
 /// Renders the full detailed breakdown for one process (Step 13). Every
 /// field degrades to "N/A" when it could not be read; nothing here re-reads
 /// /proc — the data was already collected by ProcessDetails.
@@ -2441,31 +2526,12 @@ std::string renderProcessDetails(const atm::ProcessDetailsInfo &info,
   out << "Scheduling edits (keys 6/7) change the running process only and are "
          "never applied without confirmation; they are not persisted.\n";
 
-  out << "\n## I/O Statistics\n\n";
-  appendLabeled(out, "Read:",
-                info.read_bytes.has_value()
-                    ? atm::formatBytes(*info.read_bytes)
-                    : std::string("N/A"));
-  appendLabeled(out, "Written:",
-                info.write_bytes.has_value()
-                    ? atm::formatBytes(*info.write_bytes)
-                    : std::string("N/A"));
-  appendLabeled(out, "Read Rate:",
-                formatIoRate(info.read_rate, info.read_bytes.has_value()));
-  appendLabeled(out, "Write Rate:",
-                formatIoRate(info.write_rate, info.write_bytes.has_value()));
-  appendLabeled(out, "Read Calls:",
-                info.read_syscalls.has_value()
-                    ? formatThousands(*info.read_syscalls)
-                    : std::string("N/A"));
-  appendLabeled(out, "Write Calls:",
-                info.write_syscalls.has_value()
-                    ? formatThousands(*info.write_syscalls)
-                    : std::string("N/A"));
-  appendLabeled(out, "Cancelled Write:",
-                info.cancelled_write_bytes.has_value()
-                    ? atm::formatBytes(*info.cancelled_write_bytes)
-                    : std::string("N/A"));
+  out << "\n## I/O Details\n\n";
+  if (!info.io_details.has_value()) {
+    out << "Loading I/O information...\n";
+  } else {
+    renderIoDetailsSection(out, *info.io_details);
+  }
 
   out << "\n## Resource Limits\n\n";
   if (info.limits.empty()) {

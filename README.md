@@ -5,7 +5,7 @@ Linux. It reads system information **directly from Linux interfaces** such as
 `/proc/stat`, `/proc/meminfo`, and `/proc/<pid>/` — no shelling out to `ps`,
 `free`, `top`, `htop`, or other external tools.
 
-> Stage: **Step 30** — CPU, RAM, swap, process monitoring, process actions, the
+> Stage: **Step 31** — CPU, RAM, swap, process monitoring, process actions, the
 > process tree, disk/storage monitoring, network monitoring, GPU monitoring,
 > temperature & hardware sensor monitoring, systemd service management,
 > startup application management, system information / hardware overview,
@@ -19,10 +19,12 @@ Linux. It reads system information **directly from Linux interfaces** such as
 > per-process network-connections inspector, a read-only
 > per-process namespaces inspector, a read-only per-process
 > cgroups inspector, a read-only, security-conscious per-process
-> environment inspector (potentially sensitive values masked), and a
+> environment inspector (potentially sensitive values masked), a
 > read-only per-process security & credentials inspector (UID/GID,
 > supplementary groups, Linux capabilities, NoNewPrivs, Seccomp,
-> TracerPid, optional security context and loginuid).
+> TracerPid, optional security context and loginuid), and a
+> read-only per-process I/O details inspector (character I/O,
+> storage I/O, syscall counts, cancelled writes, read/write rates).
 > Everything else on the roadmap is intentionally **not** implemented yet, but
 > the code is structured so future modules can be added without rewriting the
 > existing ones.
@@ -910,7 +912,7 @@ selected process's `/proc/<pid>` directory directly — never by shelling out to
 | Memory             | `/proc/<pid>/status` (`VmSize`, `VmRSS`, `VmExe`, `VmData`, `VmStk`), `/proc/<pid>/statm` | virtual, resident, shared, text, data, stack, memory % |
 | CPU                | `/proc/<pid>/stat` (`utime`, `stime`) + the process table's CPU % | user time, system time, CPU %, thread count |
 | Context switches   | `/proc/<pid>/status` (voluntary/nonvoluntary) | voluntary, non-voluntary counts |
-| I/O statistics     | `/proc/<pid>/io`                              | read bytes, written bytes, read/write syscalls, cancelled writes, read/write **rates** |
+| I/O details        | `/proc/<pid>/io`                              | **Character I/O**: rchar (characters read via syscalls), wchar (characters written), syscr (read syscalls), syscw (write syscalls); **Storage I/O**: read_bytes (bytes fetched from storage), write_bytes (bytes sent to storage), cancelled_write_bytes; **Rates**: char read/write rate, storage read/write rate (bytes/sec, from counter deltas); permission-denied / process disappeared / PID-reused states |
 | Resource limits    | `/proc/<pid>/limits`                          | open files, processes, stack size, locked memory, address space, core file size, pending signals, POSIX message queues, realtime priority, realtime timeout |
 | Scheduling         | `getpriority(2)`, `sched_getaffinity(2)`, `/proc/<pid>/stat` | nice value, allowed CPU list, allowed CPU count |
 | Memory maps        | `/proc/<pid>/maps`                       | per-mapping start/end address, size, permission string, file offset, device, inode, pathname; summary counts |
@@ -1718,6 +1720,7 @@ arch-task-manager/
 │   ├── process_namespace.hpp   # ProcessNamespace + /proc/<pid>/ns readlink enumerator
 │   ├── process_cgroup.hpp      # ProcessCgroup + /proc/<pid>/cgroup + mountinfo resolver
 │   ├── process_environment.hpp # ProcessEnvironmentManager, masked /proc/<pid>/environ parser
+│   ├── process_io_details.hpp  # ProcessIoDetailsManager, /proc/<pid>/io detailed parser + I/O details
 │   ├── process_tree.hpp        # ProcessTreeNode, ProcessTree, build/render
 │   ├── disk_monitor.hpp        # DiskUsage, BlockDevice, DiskSnapshot, DiskMonitor
 │   ├── network_monitor.hpp     # NetworkInterfaceStats, NetworkSnapshot, NetworkMonitor

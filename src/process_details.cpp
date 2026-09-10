@@ -623,6 +623,17 @@ ProcessDetails::getProcessDetails(pid_t pid, std::uint64_t system_total_kib,
         ProcessIdentity{pid, *info.starttime_ticks});
   }
 
+  // I/O accounting details (read-only) from /proc/<pid>/io, collected on this
+  // same refresh pass and gated by the process identity so a reused PID never
+  // shows another process's I/O counters. The detailed I/O data provides all
+  // seven standard Linux I/O counters (rchar, wchar, syscr, syscw, read_bytes,
+  // write_bytes, cancelled_write_bytes) with no subprocesses and no root.
+  if (info.starttime_ticks.has_value()) {
+    const ProcessIoDetailsManager io_details;
+    info.io_details = io_details.inspect(
+        ProcessIdentity{pid, *info.starttime_ticks});
+  }
+
   // Start time: boot wall-clock + (starttime ticks / USER_HZ). Running time =
   // system uptime − (starttime ticks / USER_HZ).
   if (stat_data->starttime_ticks.has_value()) {
