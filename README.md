@@ -5,7 +5,7 @@ Linux. It reads system information **directly from Linux interfaces** such as
 `/proc/stat`, `/proc/meminfo`, and `/proc/<pid>/` — no shelling out to `ps`,
 `free`, `top`, `htop`, or other external tools.
 
-> Stage: **Step 31** — CPU, RAM, swap, process monitoring, process actions, the
+> Stage: **Step 34** — CPU, RAM, swap, process monitoring, process actions, the
 > process tree, disk/storage monitoring, network monitoring, GPU monitoring,
 > temperature & hardware sensor monitoring, systemd service management,
 > startup application management, system information / hardware overview,
@@ -24,7 +24,14 @@ Linux. It reads system information **directly from Linux interfaces** such as
 > supplementary groups, Linux capabilities, NoNewPrivs, Seccomp,
 > TracerPid, optional security context and loginuid), and a
 > read-only per-process I/O details inspector (character I/O,
-> storage I/O, syscall counts, cancelled writes, read/write rates).
+> storage I/O, syscall counts, cancelled writes, read/write rates),
+> a user-triggered process details export that writes a bounded,
+> deterministic, plain-text report with secret masking and PID-reuse
+> protection, and a system-wide process statistics overview that
+> aggregates the whole process population (counts by state, threads,
+> CPU time, resident memory, I/O throughput, plus process
+> creation/exit rates tracked across refreshes) in a single O(N)
+> pass over the existing process snapshot.
 > Everything else on the roadmap is intentionally **not** implemented yet, but
 > the code is structured so future modules can be added without rewriting the
 > existing ones.
@@ -189,7 +196,23 @@ feature per milestone, hosted on GitHub.
       every read, all reads are bounded, and the feature is strictly read-only:
       no UID/GID/capability changes, no ptrace, no privilege escalation, no
       namespace entry, no security-context modification, and credentials are
-      never logged or persisted.
+> never logged or persisted.
+- [x] **Process details export** — a user-triggered, read-only export (press
+      `E` in the process inspector) that writes the currently selected
+      process's inspector snapshot to a deterministic, UTF-8 plain-text report
+      (`process-<pid>-<sanitized-name>.txt`). The generator reuses the
+      existing inspector models — it never reads `/proc` directly — and
+      re-masks sensitive environment variables by name (case-insensitive) so
+      plaintext secrets can never reach the file. An identity gate
+      (`ProcessIdentity` = PID + start-time tick) is verified before and
+      after generation; a reused PID refuses to write, and a disappeared
+      process writes with an explicit incompleteness note. Output is bounded
+      (4 MiB total, 2048 rows/section) with clear truncation markers, and
+      written atomically via a temporary file and `rename(2)`. A destination
+      prompt with a sensible default and a manual overwrite confirmation
+      (y/N) protect existing files. The report includes notes about sections
+      that are unavailable because of the running kernel's permission model or
+      the absence of an installed handles/locks inspector.
 - [x] **Disk / storage monitoring** — physical filesystem capacities via
       `statvfs(2)` over the mounts listed in `/proc/mounts`, real-time
       read/write throughput from two samples of `/proc/diskstats`, and whole
@@ -605,11 +628,28 @@ Startup apps: press 'a' (then Enter) to manage autostart
 
 ## Process Statistics
 
-Total:               186
-Running:               3
-Sleeping:            178
-Stopped:               1
-Zombie:                4
+Total:                 186
+Running:                 3
+Sleeping:              178
+Disk sleep:              0
+Stopped:                 1
+Zombie:                  4
+Idle:                    0
+Unknown:                 0
+Threads:              1784
+Aggregate CPU:         12.3%
+CPU user time:           2h 31m 40s
+CPU system time:         41m 8s
+Total CPU time:          3h 12m 48s
+Resident memory:       3.4 GB
+Shared memory:           1.2 GB
+Memory usage:          31.2%
+Process I/O:          1.2 MB/s read, 680 kB/s write
+Activity:            +2 created / -1 exited
+Created last scan:            2
+Exited last scan:             1
+Creation rate:               0.0/s
+Exit rate:                   0.0/s
 
 ---
 
@@ -890,14 +930,17 @@ The details screen is its own little loop:
 | 7   | Change CPU Affinity                  | `sched_setaffinity(2)` + confirmation|
 | 8   | Filter Sections (Memory Maps / Environment)      | substring filter: maps by path, environment by variable name |
 | 9   | Clear Section Filter             | show the full memory-maps / environment tables       |
+| E   | Export Process Details              | write a plain-text report to disk                   |
 | 0   | Back                                 | return to the live view           |
 
 Control actions 2–5 reuse the existing `ProcessActions` wrappers (no signal
 logic is re-implemented) and scheduling actions 6–7 go through the dedicated
 scheduling manager; all of them are blocked for PID `1` / the monitor's own PID.
 Actions 8–9 are read-only display filters for the Memory Maps and Environment
-sections and need no confirmation. The Network Connections, Namespaces, Cgroups
-and Environment sections (below) are purely read-only and have no action keys.
+sections and need no confirmation. Action **E** exports the process details to
+a bounded, deterministic plain-text report file (see the *Process details
+export* section below). The Network Connections, Namespaces, Cgroups and
+Environment sections (below) are purely read-only and have no action keys.
 
 ### Information displayed
 
@@ -1499,6 +1542,124 @@ optional files degrade to per-field states instead of aborting the inspection.
 This is not a security enforcement mechanism — it is a viewer, and it is
 subject to kernel and permission availability.
 
+## Process details export
+
+Pressing **E** in the process inspector exports the selected process's
+inspector snapshot to a bounded, deterministic, UTF-8 plain-text report file.
+This is a **read-only export**: the target process is never modified, no
+descriptors are opened or intercepted, no signals are sent, no `/proc` is read
+during the export itself — the report is generated entirely from the
+`ProcessDetailsInfo` model already collected by the inspector.
+
+### What is exported
+
+The report is a structured plain-text file with these sections:
+
+- **Process** — PID, name, state, user, UID/GID, parent PID, threads,
+  priority/nice, start time, running for, executable path, working directory,
+  command line.
+- **CPU & Memory** — CPU %, user/system CPU time, virtual/resident/shared/
+  text/data/stack memory, memory %, context switches.
+- **I/O** — character I/O (rchar/wchar), storage I/O (read_bytes/write_bytes),
+  syscall counts, cancelled writes, read/write rates, top-level per-process
+  counters.
+- **Scheduling** — nice, CPU affinity, allowed CPU count.
+- **Resource Limits** — open files, max processes, stack size, locked memory,
+  address space, core file size, pending signals, POSIX message queues,
+  realtime priority/timeout (soft/hard, with "Unlimited" rendering).
+- **Security & Credentials** — real/effective/saved/filesystem UID and GID,
+  supplementary groups, five Linux capability sets (raw hex + decoded
+  `CAP_*` names), `NoNewPrivs`, `Seccomp` mode and filter count, `TracerPid`,
+  `Umask`, `CoreDumping`, security/exec context, login UID.
+- **Environment** — all collected variables (sensitive values re-masked by name,
+  case-insensitive). Variables with names containing `PASSWORD`, `TOKEN`,
+  `SECRET`, `API_KEY`, `PRIVATE_KEY`, `CREDENTIAL`, `AUTH`, `SESSION`,
+  `COOKIE`, `ACCESS_KEY`, `APIKEY`, `BEARER` are always rendered as
+  `********` regardless of the stored value.
+- **File Descriptors** — socket file descriptors (fd, protocol, address/port,
+  state, inode) derived from the network-connections inspector, plus the open-
+  files limit. A note is included that full fdinfo (position, flags, mount ID)
+  is not available without a dedicated handles inspector.
+- **Locks** — explicitly notes that no kernel lock information is collected by
+  any installed inspector, so no `/proc/locks` data is exported.
+- **Memory Maps** — virtual mapping statistics (total mapped, executable/
+  writable/file-backed/anonymous counts) plus per-mapping rows (start/end
+  address, permissions, offset, device, inode, pathname, size).
+- **Network Connections** — TCP/UDP/Unix/listening/established counts, plus
+  per-connection rows (fd, protocol, local/remote address:port, TCP state,
+  inode).
+- **Namespaces** — detected count, distinct IDs, unreadable count, plus
+  per-namespace rows (type, name, target, ID).
+- **Cgroups** — cgroup version, hierarchy paths/controllers, and for cgroup v2
+  the process's resource values (cpu.weight, cpu.max, memory.current/max/high,
+  pids.current/max, readable file count).
+- **Summary** — environment variable count with masked count, socket
+  descriptor count, mapping count, namespace counts, cgroup hierarchy count.
+
+### Security & secret masking
+
+The generator applies **defense-in-depth** masking: even though the inspector
+already masks sensitive values at collection time, the report generator
+re-classifies every entry by its variable name using a case-insensitive
+substring match (`isSensitiveVariableName`). Any variable whose name contains
+a known secret-bearing token is rendered as `********` regardless of the stored
+value, so plaintext secrets can never reach the report text even if an upstream
+model were ever mis-populated.
+
+### Identity protection
+
+An identity gate (`ProcessIdentity` = PID + kernel start-time tick) is
+verified before and after report generation:
+
+- **Same identity** — the report is written with status `Success`.
+- **Process disappeared** — the report is still written (it contains data
+  collected while the process was alive) with an explicit "process exited
+  during export" note and status `SuccessProcessGone`.
+- **PID reused** — the report is **refused** (status `ProcessReused`); a
+  different process is never presented as the selected one.
+- **Identity unreadable** — the report is refused (status `IdentityUnknown`).
+
+### Bounded output
+
+- Total report size is capped at **4 MiB** (`kDefaultMaxReportBytes`).
+- Each list section (environment, file descriptors, memory maps, network
+  connections, namespaces, cgroups) is capped at **2048 rows**
+  (`kDefaultMaxReportRows`).
+- Overruns produce an explicit truncation marker with the omitted count, never
+  a silent partial report.
+
+### Atomic write & overwrite protection
+
+Reports are written atomically: a temporary file in the same directory is
+written, flushed, closed and then `rename(2)`'d to the final path. A crash
+never leaves a partially written report on disk.
+
+The destination prompt shows a default filename
+`process-<pid>-<sanitized-name>.txt` and asks for overwrite confirmation (y/N)
+before replacing an existing file.
+
+### Filename sanitization
+
+Process names are sanitized before appearing in filenames: only ASCII letters,
+digits, `_` and `-` survive; every other byte (including `/`, `\`, `:`, `.`,
+`*`, `"`, `<`, `>`, `|`, control bytes, multibyte sequences) becomes `_`. Runs
+of `_` are collapsed and leading/trailing `_` trimmed. The result never contains
+a path separator, a `.` (so it can never form `..` or hide a file extension),
+or any byte that could escape the destination directory. An empty result falls
+back to `"process"`.
+
+### What is never exported
+
+- Clipboard contents, desktop notifications, external commands (`date`, `ps`,
+  `ls`, ...).
+- Plaintext environment variable values for any variable classified as
+  sensitive.
+- Network packet contents, file descriptors, memory contents, or any writable
+  state of the target process.
+- Kernel lock information (no installed handles/locks inspector exists), full
+  fdinfo (position, flags, mount ID), or any data not already collected by the
+  existing inspector models.
+
 ## Application Settings & Persistent Configuration
 
 Press `o` (then Enter) in the list view to open the settings page. It edits the
@@ -1721,6 +1882,8 @@ arch-task-manager/
 │   ├── process_cgroup.hpp      # ProcessCgroup + /proc/<pid>/cgroup + mountinfo resolver
 │   ├── process_environment.hpp # ProcessEnvironmentManager, masked /proc/<pid>/environ parser
 │   ├── process_io_details.hpp  # ProcessIoDetailsManager, /proc/<pid>/io detailed parser + I/O details
+│   ├── process_report.hpp      # Process report generation, filename sanitization, atomic write
+│   ├── process_statistics.hpp   # SystemProcessStatistics, aggregateSystemProcessStatistics, aggregator
 │   ├── process_tree.hpp        # ProcessTreeNode, ProcessTree, build/render
 │   ├── disk_monitor.hpp        # DiskUsage, BlockDevice, DiskSnapshot, DiskMonitor
 │   ├── network_monitor.hpp     # NetworkInterfaceStats, NetworkSnapshot, NetworkMonitor
@@ -1749,6 +1912,8 @@ arch-task-manager/
 │   ├── process_monitor.cpp     # /proc scanning + per-process parsing
 │   ├── process_actions.cpp     # kill(2)/setpriority(2) wrappers + errno mapping
 │   ├── process_details.cpp     # per-PID /proc read + parse into ProcessDetailsInfo
+│   ├── process_report.cpp      # report generation, section renderers, atomic write
+│   ├── process_statistics.cpp  # O(N) aggregation, creation/exit rate tracking across snapshots
 │   ├── process_resources.cpp   # process /proc parsers (io/stat/status/limits) + rate math
 │   ├── process_scheduling.cpp  # getpriority/setpriority + sched_get/setaffinity, identity gate
 │   ├── process_memory_map.cpp  # /proc/<pid>/maps parse, classify, identity-gated inspect
@@ -1894,9 +2059,37 @@ disappeared. The only fatal errors are a missing `/proc/stat` or
 
 ### Process statistics
 
-The counters are derived from the state mapped above: `Running` = `R`,
-`Sleeping` = `S`/`I`/`D`, `Stopped` = `T`/`t`, `Zombie` = `Z`/`X`. Unreadable
-or unrecognized states count toward `Total` only.
+The system-wide process statistics overview aggregates the whole process
+population in a **single O(N) pass** over the existing `ProcessSnapshot` —
+it never scans `/proc` itself. Per state the aggregator counts: `Running` =
+`R`, `Sleeping` = `S`, `Disk sleep` = `D`, `Stopped` = `T`/`t`, `Zombie` =
+`Z`/`X`, `Idle` = `I`, and `Unknown` = unreadable or unrecognized state
+characters. It also sums:
+
+- **Threads** — every process's `thread_count` from `/proc/<pid>/status`.
+- **Aggregate CPU** — the per-process `cpu_percent` values as computed by
+  the monitor's two-sample delta (sum can exceed 100% on multi-core).
+- **CPU user/system/total time** — per-process `utime`/`stime` tick sums
+  from `/proc/<pid>/stat`, rendered as human-readable durations (100 ticks
+  per second).
+- **Resident & shared memory** — per-process `VmRSS` and the resident
+  shared portion (`RssShmem` + `RssFile`) from `/proc/<pid>/status`, plus
+  the summed memory percentage.
+- **Process I/O** — the summed per-process read/write rates (bytes/sec).
+
+Process **creation/exit rates** are measured between consecutive refreshes:
+the aggregator keeps the previous snapshot's process identities (PID +
+`/proc/<pid>/stat` start-time — the same identity `ProcessMonitor` guards its
+deltas with). A process new to the set counts as one creation; a process no
+longer present counts as one exit; a reused PID with a different start time
+counts as one of each. Rates divide the counts by the wall time between the
+two snapshots. The very first update only establishes a baseline, so it
+reports zero activity.
+
+The same statistics feed a set of bounded history buffers (process count,
+running count, zombie count, thread count, aggregate CPU, aggregate RSS,
+creation rate, exit rate) that respect the configured `max_samples` and the
+history pause setting.
 
 ## How RAM / swap usage is obtained
 

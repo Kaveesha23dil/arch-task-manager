@@ -91,6 +91,8 @@ std::optional<Process> readProcess(const std::string &dir, int pid,
   process.parent_pid = stat_data->ppid;
   process.thread_count = stat_data->num_threads;
   process.cpu_ticks = stat_data->utime + stat_data->stime;
+  process.user_cpu_ticks = stat_data->utime;
+  process.system_cpu_ticks = stat_data->stime;
   process.starttime_ticks = stat_data->starttime_ticks;
   process.command_line = readCommandLine(dir);
 

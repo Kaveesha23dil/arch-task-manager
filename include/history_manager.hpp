@@ -12,6 +12,8 @@
 
 namespace atm {
 
+struct SystemProcessStatistics;
+
 /// Compile-time default history length. With a 1-second refresh interval this
 /// holds ~2 minutes (120 samples) of history.
 inline constexpr std::size_t kDefaultHistorySamples = 120;
@@ -45,6 +47,10 @@ class HistoryManager {
               const std::vector<std::pair<std::string, double>>& gpu_vram_usages,
               const std::vector<std::pair<std::string, double>>& temperatures);
 
+  /// Appends the system-wide process statistics to the process histories.
+  /// Respects the same pause / max-samples behavior as update().
+  void updateProcessStats(const SystemProcessStatistics &stats);
+
   /// Resets all history buffers.
   void clearAll();
 
@@ -67,6 +73,16 @@ class HistoryManager {
   const ResourceHistory<TimedSample>& networkRxHistory() const { return network_rx_; }
   const ResourceHistory<TimedSample>& networkTxHistory() const { return network_tx_; }
 
+  // System-wide process statistics histories.
+  const ResourceHistory<TimedSample>& processCountHistory() const { return process_count_; }
+  const ResourceHistory<TimedSample>& runningCountHistory() const { return running_count_; }
+  const ResourceHistory<TimedSample>& zombieCountHistory() const { return zombie_count_; }
+  const ResourceHistory<TimedSample>& threadCountHistory() const { return thread_count_; }
+  const ResourceHistory<TimedSample>& aggregateCpuHistory() const { return aggregate_cpu_; }
+  const ResourceHistory<TimedSample>& aggregateRssHistory() const { return aggregate_rss_; }
+  const ResourceHistory<TimedSample>& creationRateHistory() const { return creation_rate_; }
+  const ResourceHistory<TimedSample>& exitRateHistory() const { return exit_rate_; }
+
   const std::vector<GpuHistory>& gpuHistories() const { return gpus_; }
   const std::vector<SensorHistory>& sensorHistories() const { return sensors_; }
 
@@ -84,6 +100,16 @@ class HistoryManager {
   ResourceHistory<TimedSample> disk_write_;
   ResourceHistory<TimedSample> network_rx_;
   ResourceHistory<TimedSample> network_tx_;
+
+  // System-wide process statistics histories.
+  ResourceHistory<TimedSample> process_count_;
+  ResourceHistory<TimedSample> running_count_;
+  ResourceHistory<TimedSample> zombie_count_;
+  ResourceHistory<TimedSample> thread_count_;
+  ResourceHistory<TimedSample> aggregate_cpu_;
+  ResourceHistory<TimedSample> aggregate_rss_;
+  ResourceHistory<TimedSample> creation_rate_;
+  ResourceHistory<TimedSample> exit_rate_;
 
   std::vector<GpuHistory> gpus_;
   std::vector<SensorHistory> sensors_;

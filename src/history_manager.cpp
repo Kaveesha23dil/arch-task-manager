@@ -4,6 +4,8 @@
 #include <chrono>
 #include <cmath>
 
+#include "process_statistics.hpp"
+
 namespace atm {
 
 HistoryManager::HistoryManager(std::size_t max_samples)
@@ -16,7 +18,15 @@ HistoryManager::HistoryManager(std::size_t max_samples)
       disk_read_(max_samples),
       disk_write_(max_samples),
       network_rx_(max_samples),
-      network_tx_(max_samples) {}
+      network_tx_(max_samples),
+      process_count_(max_samples),
+      running_count_(max_samples),
+      zombie_count_(max_samples),
+      thread_count_(max_samples),
+      aggregate_cpu_(max_samples),
+      aggregate_rss_(max_samples),
+      creation_rate_(max_samples),
+      exit_rate_(max_samples) {}
 
 void HistoryManager::syncGpuHistories(
     const std::vector<std::pair<std::string, double>>& utilizations) {
@@ -85,6 +95,14 @@ void HistoryManager::clearAll() {
   disk_write_.clear();
   network_rx_.clear();
   network_tx_.clear();
+  process_count_.clear();
+  running_count_.clear();
+  zombie_count_.clear();
+  thread_count_.clear();
+  aggregate_cpu_.clear();
+  aggregate_rss_.clear();
+  creation_rate_.clear();
+  exit_rate_.clear();
   for (auto& g : gpus_) {
     g.utilization.clear();
     g.vram_usage.clear();
@@ -143,6 +161,31 @@ void HistoryManager::update(
       sensors_[i].temperature.addSample(TimedSample{now, temperatures[i].second});
     }
   }
+}
+
+void HistoryManager::updateProcessStats(const SystemProcessStatistics &stats) {
+  if (paused_) {
+    return;
+  }
+
+  const auto now = std::chrono::steady_clock::now();
+
+  process_count_.addSample(
+      TimedSample{now, static_cast<double>(stats.total)});
+  running_count_.addSample(
+      TimedSample{now, static_cast<double>(stats.running)});
+  zombie_count_.addSample(
+      TimedSample{now, static_cast<double>(stats.zombie)});
+  thread_count_.addSample(
+      TimedSample{now, static_cast<double>(stats.total_threads)});
+  aggregate_cpu_.addSample(
+      TimedSample{now, stats.aggregate_cpu_percent});
+  aggregate_rss_.addSample(
+      TimedSample{now, static_cast<double>(stats.total_rss_kib)});
+  creation_rate_.addSample(
+      TimedSample{now, stats.creation_rate_per_second});
+  exit_rate_.addSample(
+      TimedSample{now, stats.exit_rate_per_second});
 }
 
 }  // namespace atm
