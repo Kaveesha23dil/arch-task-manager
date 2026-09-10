@@ -9,6 +9,7 @@
 
 #include "process_cgroup.hpp"
 #include "process_environment.hpp"
+#include "process_io_details.hpp"
 #include "process_memory_map.hpp"
 #include "process_monitor.hpp"
 #include "process_namespace.hpp"
@@ -146,6 +147,15 @@ struct ProcessDetailsInfo {
   // or a distinct error state). This data is never logged, persisted, or used
   // to modify the target process.
   std::optional<ProcessSecurityResult> security;
+
+  // Read-only I/O accounting details from /proc/<pid>/io, collected on the
+  // inspector refresh only. Provides the seven standard Linux I/O counters
+  // (character I/O, storage I/O, syscall counts, cancelled writes) and
+  // derived rates. Nullopt only when no process identity was available;
+  // otherwise always present (Success with partially or fully populated data,
+  // or a distinct error state). This data is never logged, persisted, or
+  // used to modify the target process.
+  std::optional<ProcessIoDetailsResult> io_details;
 
   // Start wall-clock time derived from the starttime tick, boot uptime and the
   // current clock. process_uptime_seconds is how long the process has been

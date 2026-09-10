@@ -156,6 +156,12 @@ ProcessIoCounters parseProcessIo(std::string_view contents) {
     } else if (key == "cancelled_write_bytes:" && head >> value) {
       counters.cancelled_write_bytes = value;
       counters.available = true;
+    } else if (key == "read_bytes:" && head >> value) {
+      counters.storage_read_bytes = value;
+      counters.available = true;
+    } else if (key == "write_bytes:" && head >> value) {
+      counters.storage_write_bytes = value;
+      counters.available = true;
     }
   }
   return counters;
@@ -282,6 +288,14 @@ IoRates computeIoRates(bool same_process, const ProcessIoCounters &previous,
   rates.write_rate = static_cast<double>(delta(previous.write_bytes,
                                                current.write_bytes)) /
                      elapsed_seconds;
+  rates.storage_read_rate =
+      static_cast<double>(delta(previous.storage_read_bytes,
+                                current.storage_read_bytes)) /
+      elapsed_seconds;
+  rates.storage_write_rate =
+      static_cast<double>(delta(previous.storage_write_bytes,
+                                current.storage_write_bytes)) /
+      elapsed_seconds;
   return rates;
 }
 

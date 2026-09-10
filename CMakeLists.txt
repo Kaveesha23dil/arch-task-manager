@@ -41,6 +41,7 @@ add_executable(arch-task-manager
   src/process_cgroup.cpp
   src/process_details.cpp
   src/process_environment.cpp
+  src/process_io_details.cpp
   src/process_resources.cpp
   src/process_memory_map.cpp
   src/process_network.cpp
@@ -220,3 +221,17 @@ target_include_directories(process-security-tests PRIVATE include)
 target_link_libraries(process-security-tests PRIVATE Threads::Threads)
 
 add_test(NAME process-security COMMAND process-security-tests)
+
+add_executable(process-io-details-tests
+  tests/process_io_details_tests.cpp
+  src/process_io_details.cpp
+  src/process_resources.cpp
+  src/process_scheduling.cpp
+  src/logger.cpp
+)
+
+target_include_directories(process-io-details-tests PRIVATE include)
+
+target_link_libraries(process-io-details-tests PRIVATE Threads::Threads)
+
+add_test(NAME process-io-details COMMAND process-io-details-tests)
