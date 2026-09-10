@@ -5,7 +5,7 @@ Linux. It reads system information **directly from Linux interfaces** such as
 `/proc/stat`, `/proc/meminfo`, and `/proc/<pid>/` — no shelling out to `ps`,
 `free`, `top`, `htop`, or other external tools.
 
-> Stage: **Step 29** — CPU, RAM, swap, process monitoring, process actions, the
+> Stage: **Step 30** — CPU, RAM, swap, process monitoring, process actions, the
 > process tree, disk/storage monitoring, network monitoring, GPU monitoring,
 > temperature & hardware sensor monitoring, systemd service management,
 > startup application management, system information / hardware overview,
@@ -18,8 +18,11 @@ Linux. It reads system information **directly from Linux interfaces** such as
 > a read-only per-process memory-maps inspector, a read-only
 > per-process network-connections inspector, a read-only
 > per-process namespaces inspector, a read-only per-process
-> cgroups inspector, and a read-only, security-conscious per-process
-> environment inspector (potentially sensitive values masked).
+> cgroups inspector, a read-only, security-conscious per-process
+> environment inspector (potentially sensitive values masked), and a
+> read-only per-process security & credentials inspector (UID/GID,
+> supplementary groups, Linux capabilities, NoNewPrivs, Seccomp,
+> TracerPid, optional security context and loginuid).
 > Everything else on the roadmap is intentionally **not** implemented yet, but
 > the code is structured so future modules can be added without rewriting the
 > existing ones.
@@ -165,6 +168,26 @@ feature per milestone, hosted on GitHub.
       environment is only shown for the selected process, only on refresh; it
       is never persisted, never logged, never exported, and the section is
       strictly read-only (no environment editing or process launching).
+- [x] **Process security & credentials inspection** — a read-only
+      **Security & Credentials** section in the process inspector (Linux-only)
+      built from `/proc/<pid>/status`, `/proc/<pid>/attr/current`,
+      `/proc/<pid>/attr/exec` and `/proc/<pid>/loginuid` — never from `ps`,
+      `capsh`, `id`, `groups`, `aa-status`, `getenforce` or any subprocess.
+      It shows the real/effective/saved-set/filesystem UID and GID, the
+      supplementary groups (count + IDs, names resolved via `getgrgid_r` when
+      available), the five Linux capability sets (`CapInh`/`CapPrm`/`CapEff`/
+      `CapBnd`/`CapAmb`) as raw hex masks plus decoded `CAP_*` names (unknown
+      bits reported, never dropped), `NoNewPrivs` (with a true "Unavailable"
+      state, never guessed as 0), `Seccomp` (0/1/2/unknown),
+      `Seccomp_filters`, `TracerPid` (None/PID), and the optional `Umask` and
+      `CoreDumping` fields. Best-effort LSM security context (`Current`/`Exec`)
+      and the audit `Login UID` degrade to *available / permission denied /
+      process disappeared / unavailable* per-field states without failing the
+      section. Results are identity-gated against PID reuse before and after
+      every read, all reads are bounded, and the feature is strictly read-only:
+      no UID/GID/capability changes, no ptrace, no privilege escalation, no
+      namespace entry, no security-context modification, and credentials are
+      never logged or persisted.
 - [x] **Disk / storage monitoring** — physical filesystem capacities via
       `statvfs(2)` over the mounts listed in `/proc/mounts`, real-time
       read/write throughput from two samples of `/proc/diskstats`, and whole
@@ -428,6 +451,13 @@ cmake --build .
 ```
 
 The compiler runs with `-Wall -Wextra -Wpedantic` enabled.
+
+Run the test suite (standalone `ctest` targets including the dedicated security
+inspector tests `process-security-tests`):
+
+```bash
+ctest --test-dir build --output-on-failure
+```
 
 ## Run
 
@@ -888,6 +918,7 @@ selected process's `/proc/<pid>` directory directly — never by shelling out to
 | Namespaces          | `/proc/<pid>/ns` (readlink)                 | per-namespace type (with kernel short name), numeric ID, raw symlink target; availability/partial states; summary counts |
 | Cgroups             | `/proc/<pid>/cgroup` + `/proc/self/mountinfo` + the selected cgroup v2 directory's read-only control files | cgroup version (v1/v2), per-hierarchy id/controllers/path/mount point; v2: CPU weight, `cpu.max` quota/period, memory current/max/high, pids current/max, controllers, `cgroup.type`; current-vs-limit-vs-unlimited distinction |
 | Environment         | `/proc/<pid>/environ` (NUL-separated, native parse) | sorted `NAME`/value pairs parsed at the first `=`; filtered by the shared section filter (key 8/9) on variable name; total size (KiB), variable count, sensitive-variable count; entries whose name matches conservative secret signals are masked (`********`) and the plaintext value never enters the model; duplicate names collapse to the first value (counted), malformed records are skipped (counted), byte- and variable-count limits report truncation; permission-denied / disappeared / empty / malformed states are distinct |
+| Security & Credentials | `/proc/<pid>/status`, `/proc/<pid>/attr/current`, `/proc/<pid>/attr/exec`, `/proc/<pid>/loginuid`, `getgrgid_r` | real / effective / saved-set / filesystem UID and GID; supplementary groups (group-count + IDs, names resolved via `getgrgid_r` when available); the five Linux capability sets (`CapInh`/`CapPrm`/`CapEff`/`CapBnd`/`CapAmb`) shown as raw hex masks plus decoded `CAP_*` names (unknown bits reported as "Unknown capability bit N"); `NoNewPrivs`, `Seccomp` (0/1/2/unknown), `Seccomp_filters`, `TracerPid` (None / PID); optional `Umask` and `CoreDumping`; best-effort LSM security context (`Current`/`Exec`) and audit `Login UID` (with the `4294967295` "unset" sentinel handled); per-section *available / permission denied / process disappeared / unavailable* states |
 
 Start time is derived from the `starttime` tick in `/proc/<pid>/stat`, the
 system uptime (`/proc/uptime`) and the current clock; "Running For" reports the
@@ -1407,6 +1438,64 @@ an unrelated name.
   crash the application.
 
 Each state is distinct and never crashes the application.
+
+## Process security & credentials inspection
+
+The details screen ends with a **Security & Credentials** section showing the
+selected process's credential and security metadata. The data comes natively and
+exclusively from `/proc`:
+
+- `/proc/<pid>/status` — UID/GID quadruples, supplementary groups, the five
+  capability sets, `NoNewPrivs`, `Seccomp`, `Seccomp_filters`, `TracerPid`, and
+  (when the kernel exposes them) `Umask` and `CoreDumping`.
+- `/proc/<pid>/attr/current` and `/proc/<pid>/attr/exec` — the LSM security
+  context, read as a bounded string when the kernel/filesystem provides them.
+- `/proc/<pid>/loginuid` — the audit login UID, with the kernel's `4294967295`
+  sentinel rendered as **"Unset"** rather than a bogus user ID.
+
+No external command is used (`ps`, `capsh`, `getcap`, `getenforce`, `aa-status`,
+`lsns`, `systemctl`, `id`, `groups`, shells, or any subprocess) and no privilege
+escalation, ptrace attach, namespace entry, or credential modification of any
+kind is performed.
+
+### Read-only, always
+
+- **Linux-specific and read-only.** The inspector only ever displays values the
+  kernel exposes. It never changes UID/GID, supplementary groups, capabilities,
+  `NoNewPrivs`, seccomp, security context, `loginuid`, or anything else.
+- Credential and capability metadata is never logged, never persisted, never
+  exported, and never sent to notifications; it exists only on the details
+  screen for as long as it is shown.
+- `Seccomp_filters` and `TracerPid` are displayed only — no tracer is inspected,
+  attached to, or signalled, and no seccomp state is altered.
+
+### Capability decoding
+
+Each of the five capability sets (`Inheritable`, `Permitted`, `Effective`,
+`Bounding`, `Ambient`) is shown as its raw 64-bit hexadecimal mask together with
+its decoded `CAP_*` names. Capability bits that are set but not named by the
+current kernel are reported as "Unknown capability bit N" rather than silently
+discarded or fabricated — parsing never fails because of an unexpected bit.
+
+### Availability, permission, and lifetime
+
+Individual fields degrade gracefully and never break the rest of the section:
+
+- An unavailable `NoNewPrivs` is reported as **"Unavailable"**, never guessed
+  as `0`.
+- An unrecognised `Seccomp` value is shown as **"Unknown (&lt;value&gt;)"**.
+- A security context that cannot be read (no LSM, permission denied, or the
+  process disappeared) is shown as **"Unavailable"**, **"Permission denied"** or
+  **"Process disappeared"** without failing the whole inspection.
+
+The inspection is gated on the process identity (PID + the kernel start-time
+tick from `/proc/<pid>/stat`, the same mechanism used by the scheduling editor
+and the other inspectors) both immediately before and immediately after the
+read, so a reused PID never shows another process's credentials. Bounded reads
+guard every file against oversized or malformed input, and permission errors on
+optional files degrade to per-field states instead of aborting the inspection.
+This is not a security enforcement mechanism — it is a viewer, and it is
+subject to kernel and permission availability.
 
 ## Application Settings & Persistent Configuration
 

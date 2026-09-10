@@ -14,6 +14,7 @@
 #include "process_namespace.hpp"
 #include "process_network.hpp"
 #include "process_resources.hpp"
+#include "process_security.hpp"
 
 namespace atm {
 
@@ -137,6 +138,14 @@ struct ProcessDetailsInfo {
   // Values of potentially sensitive variables are masked in the result itself;
   // raw secrets are never stored, logged, copied or persisted.
   std::optional<ProcessEnvironmentResult> environment;
+
+  // Read-only security/credential information from /proc/<pid>/status,
+  // /proc/<pid>/attr/*, and /proc/<pid>/loginuid, collected on the inspector
+  // refresh only. Nullopt only when no process identity was available;
+  // otherwise always present (Success with partially or fully populated data,
+  // or a distinct error state). This data is never logged, persisted, or used
+  // to modify the target process.
+  std::optional<ProcessSecurityResult> security;
 
   // Start wall-clock time derived from the starttime tick, boot uptime and the
   // current clock. process_uptime_seconds is how long the process has been

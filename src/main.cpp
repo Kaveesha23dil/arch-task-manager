@@ -44,6 +44,7 @@
 #include "process_network.hpp"
 #include "process_resources.hpp"
 #include "process_scheduling.hpp"
+#include "process_security.hpp"
 #include "process_tree.hpp"
 #include "resource_history.hpp"
 #include "sensor_monitor.hpp"
@@ -2131,6 +2132,199 @@ void renderEnvironmentSection(std::ostringstream &out,
          "detection is a heuristic and may not identify every secret.\n";
 }
 
+/// Formats a security context value; a short reason when unavailable.
+std::string securityContextString(const std::string &context, bool available,
+                                  int errno_value) {
+  if (!available) {
+    if (errno_value == EACCES || errno_value == EPERM) {
+      return std::string("Permission denied");
+    }
+    if (errno_value == ENOENT || errno_value == ESRCH) {
+      return std::string("Process disappeared");
+    }
+    return std::string("Unavailable");
+  }
+  if (context.empty()) {
+    return std::string("Unavailable");
+  }
+  return context;
+}
+
+/// Formats the login UID status when the value could not be read.
+std::string loginUidUnavailableMessage(int errno_value) {
+  if (errno_value == EACCES || errno_value == EPERM) {
+    return std::string("Permission denied");
+  }
+  return std::string("Unavailable");
+}
+
+/// Renders the Security & Credentials section of the Detailed Process
+/// Inspector (Step 30). This is a strictly read-only display of the selected
+/// process's credentials and security flags from /proc. Nothing here modifies
+/// the process.
+void renderSecuritySection(std::ostringstream &out,
+                           const atm::ProcessSecurityResult &security) {
+  switch (security.status) {
+    case atm::SecurityStatus::Success:
+      break;
+    case atm::SecurityStatus::PermissionDenied:
+      out << "Security information unavailable: permission denied.\n";
+      return;
+    case atm::SecurityStatus::ProcessNotFound:
+    case atm::SecurityStatus::IdentityUnknown:
+      out << "Process no longer exists.\n";
+      return;
+    case atm::SecurityStatus::ProcessReused:
+      out << "The process identity changed (the PID was reused); security "
+             "data was discarded.\n";
+      return;
+    case atm::SecurityStatus::InvalidPid:
+      out << "Invalid PID.\n";
+      return;
+    case atm::SecurityStatus::ReadError:
+      out << "Security information unavailable: "
+          << (security.errno_value != 0
+                  ? std::strerror(security.errno_value)
+                  : std::string("read failed"))
+          << ".\n";
+      return;
+  }
+
+  const atm::ProcessSecurityInfo &info = security.info;
+
+  // Credentials: UID / GID / supplementary groups.
+  out << "### Credentials\n\n";
+  out << "UID\n";
+  appendLabeled(out, "  Real:", info.uid.real.has_value()
+                                  ? std::to_string(*info.uid.real)
+                                  : std::string("N/A"));
+  appendLabeled(out, "  Effective:", info.uid.effective.has_value()
+                                       ? std::to_string(*info.uid.effective)
+                                       : std::string("N/A"));
+  appendLabeled(out, "  Saved:", info.uid.saved.has_value()
+                                   ? std::to_string(*info.uid.saved)
+                                   : std::string("N/A"));
+  appendLabeled(out, "  Filesystem:", info.uid.filesystem.has_value()
+                                        ? std::to_string(*info.uid.filesystem)
+                                        : std::string("N/A"));
+
+  out << "GID\n";
+  appendLabeled(out, "  Real:", info.gid.real.has_value()
+                                  ? std::to_string(*info.gid.real)
+                                  : std::string("N/A"));
+  appendLabeled(out, "  Effective:", info.gid.effective.has_value()
+                                       ? std::to_string(*info.gid.effective)
+                                       : std::string("N/A"));
+  appendLabeled(out, "  Saved:", info.gid.saved.has_value()
+                                   ? std::to_string(*info.gid.saved)
+                                   : std::string("N/A"));
+  appendLabeled(out, "  Filesystem:", info.gid.filesystem.has_value()
+                                        ? std::to_string(*info.gid.filesystem)
+                                        : std::string("N/A"));
+
+  if (info.groups_available) {
+    appendLabeled(out, "Supplementary Groups:",
+                  std::to_string(info.supplementary_groups.size()));
+    if (!info.supplementary_groups.empty()) {
+      std::ostringstream groups;
+      bool first = true;
+      for (const atm::SupplementaryGroup &group : info.supplementary_groups) {
+        if (!first) {
+          groups << "  ";
+        }
+        first = false;
+        if (!group.name.empty()) {
+          groups << group.name << " (" << group.gid << ")";
+        } else {
+          groups << group.gid;
+        }
+      }
+      appendLabeled(out, "       Groups:", groups.str());
+    }
+  } else {
+    appendLabeled(out, "Supplementary Groups:", "Unavailable");
+  }
+
+  // Capabilities.
+  out << "\n### Capabilities\n";
+  if (info.capabilities.empty()) {
+    out << "Unavailable\n";
+  } else {
+    for (const atm::CapabilitySet &set : info.capabilities) {
+      out << "\n" << atm::capabilitySetTypeName(set.type) << ":\n";
+      if (!set.available) {
+        out << "Unavailable\n";
+        continue;
+      }
+      std::ostringstream hex_mask;
+      hex_mask << "0x" << std::hex << std::setfill('0') << std::setw(16)
+               << set.raw_mask;
+      out << hex_mask.str() << "\n";
+      if (set.decoded_names.empty() && set.unknown_bits.empty()) {
+        out << "None\n";
+      } else {
+        for (const std::string &name : set.decoded_names) {
+          out << name << "\n";
+        }
+        for (const std::uint32_t bit : set.unknown_bits) {
+          out << "Unknown capability bit " << bit << "\n";
+        }
+      }
+    }
+  }
+
+  // Security flags.
+  out << "\n### Security\n";
+  appendLabeled(out, "No New Privileges:",
+                atm::noNewPrivsName(info.no_new_privs));
+  appendLabeled(out, "Seccomp:", atm::seccompModeName(info.seccomp));
+  appendLabeled(out, "Seccomp Filters:",
+                info.seccomp_filters.has_value()
+                    ? std::to_string(*info.seccomp_filters)
+                    : std::string("Unavailable"));
+  if (info.tracer_pid.has_value() && *info.tracer_pid != 0U) {
+    appendLabeled(out, "Tracer PID:", std::to_string(*info.tracer_pid));
+  } else {
+    appendLabeled(out, "Tracer PID:", "None");
+  }
+  if (info.umask.has_value()) {
+    std::ostringstream umask;
+    umask << "0" << std::oct << std::setfill('0') << std::setw(4)
+          << *info.umask;
+    appendLabeled(out, "Umask:", umask.str());
+  }
+  if (info.core_dumping.has_value()) {
+    appendLabeled(out, "Core Dumping:", *info.core_dumping ? "Yes" : "No");
+  }
+
+  // Security context.
+  out << "\n### Security Context\n";
+  appendLabeled(out, "Current:", securityContextString(
+                                     info.security_context,
+                                     info.security_context_available,
+                                     info.security_context_errno));
+  appendLabeled(out, "Exec:", securityContextString(info.exec_context,
+                                                    info.exec_context_available,
+                                                    info.exec_context_errno));
+
+  // Audit.
+  out << "\n### Audit\n";
+  if (info.login_uid_available && info.login_uid.has_value()) {
+    if (*info.login_uid == atm::kLoginUidUnset) {
+      appendLabeled(out, "Login UID:", "Unset");
+    } else {
+      appendLabeled(out, "Login UID:", std::to_string(*info.login_uid));
+    }
+  } else {
+    appendLabeled(out, "Login UID:",
+                  loginUidUnavailableMessage(info.login_uid_errno));
+  }
+
+  out << "\nSecurity information is read-only and based on /proc. The "
+         "inspector never modifies credentials or capabilities; values are "
+         "subject to kernel and permission availability.\n";
+}
+
 /// Renders the full detailed breakdown for one process (Step 13). Every
 /// field degrades to "N/A" when it could not be read; nothing here re-reads
 /// /proc — the data was already collected by ProcessDetails.
@@ -2325,6 +2519,13 @@ std::string renderProcessDetails(const atm::ProcessDetailsInfo &info,
     out << "Loading environment...\n";
   } else {
     renderEnvironmentSection(out, *info.environment, section_filter);
+  }
+
+  out << "\n## Security & Credentials\n\n";
+  if (!info.security.has_value()) {
+    out << "Loading security information...\n";
+  } else {
+    renderSecuritySection(out, *info.security);
   }
 
   return out.str();
