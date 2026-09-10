@@ -19,6 +19,7 @@
 #include "process_network.hpp"
 #include "process_resources.hpp"
 #include "process_scheduling.hpp"
+#include "process_security.hpp"
 
 namespace atm {
 
@@ -607,6 +608,18 @@ ProcessDetails::getProcessDetails(pid_t pid, std::uint64_t system_total_kib,
   if (info.starttime_ticks.has_value()) {
     const ProcessEnvironmentManager environment;
     info.environment = environment.inspect(
+        ProcessIdentity{pid, *info.starttime_ticks});
+  }
+
+  // Security / credentials (read-only) from /proc/<pid>/status,
+  // /proc/<pid>/attr/*, and /proc/<pid>/loginuid, collected on this same
+  // refresh pass and gated by the process identity so a reused PID never shows
+  // another process's credentials. No credentials are ever modified, no
+  // capabilities are changed, no ptrace is used, no shell commands are
+  // executed.
+  if (info.starttime_ticks.has_value()) {
+    const ProcessSecurityManager security;
+    info.security = security.inspect(
         ProcessIdentity{pid, *info.starttime_ticks});
   }
 
