@@ -58,6 +58,7 @@ add_executable(arch-task-manager
   src/gpu_monitor.cpp
   src/sensor_monitor.cpp
   src/systemd_manager.cpp
+  src/system_load_monitor.cpp
   src/system_pressure_monitor.cpp
   src/startup_manager.cpp
   src/system_info.cpp
@@ -322,3 +323,17 @@ target_include_directories(system-pressure-monitor-tests PRIVATE include)
 target_link_libraries(system-pressure-monitor-tests PRIVATE Threads::Threads)
 
 add_test(NAME system-pressure-monitor COMMAND system-pressure-monitor-tests)
+
+add_executable(system-load-monitor-tests
+  tests/system_load_monitor_tests.cpp
+  src/system_load_monitor.cpp
+  src/resource_history.cpp
+  src/history_manager.cpp
+  src/logger.cpp
+)
+
+target_include_directories(system-load-monitor-tests PRIVATE include)
+
+target_link_libraries(system-load-monitor-tests PRIVATE Threads::Threads)
+
+add_test(NAME system-load-monitor COMMAND system-load-monitor-tests)

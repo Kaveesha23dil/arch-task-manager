@@ -60,6 +60,7 @@
 #include "app_autostart_manager.hpp"
 #include "startup_manager.hpp"
 #include "system_info.hpp"
+#include "system_load_monitor.hpp"
 #include "system_pressure_monitor.hpp"
 #include "systemd_manager.hpp"
 
@@ -487,6 +488,39 @@ atm::PressureMetrics buildPressureMetrics(
   return metrics;
 }
 
+/// The number of logical CPUs currently online, from the advanced CPU
+/// monitor's cached topology. 0 when the kernel did not report a usable online
+/// mask; load normalization is skipped in that case rather than guessed.
+std::uint32_t onlineLogicalCpuCount(const atm::AdvancedCpuSnapshot &cpu) {
+  if (!cpu.topology.online_available) {
+    return 0;
+  }
+  return static_cast<std::uint32_t>(cpu.topology.online.size());
+}
+
+/// Builds the system-load history sample for a snapshot. Raw 1/5/15-minute
+/// averages are recorded whenever the file was readable; per-CPU normalized
+/// averages are recorded only when an online CPU count is known. Unavailable
+/// values stay unset so the history manager skips them for that refresh
+/// instead of plotting garbage.
+atm::LoadMetrics buildLoadMetrics(const atm::SystemLoadSnapshot &load,
+                                  std::uint32_t online_cpus) {
+  atm::LoadMetrics metrics;
+  if (!load.load.readable) {
+    return metrics;
+  }
+  metrics.load1 = load.load.load1;
+  metrics.load5 = load.load.load5;
+  metrics.load15 = load.load.load15;
+  metrics.normalized_load1 =
+      atm::normalizeLoad(load.load.load1, online_cpus);
+  metrics.normalized_load5 =
+      atm::normalizeLoad(load.load.load5, online_cpus);
+  metrics.normalized_load15 =
+      atm::normalizeLoad(load.load.load15, online_cpus);
+  return metrics;
+}
+
 /// Renders the ADVANCED CPU section of the live view: the total-CPU time
 /// breakdown followed by one row per logical CPU. Frequencies are the values
 /// the kernel currently reports and may be shared by CPUs on the same policy;
@@ -810,6 +844,43 @@ void renderResourceHistorySection(std::ostringstream &out,
   if (!history.commitmentPercentHistory().empty()) {
     out << "\n[COMMITMENT Usage]\n" << atm::GraphRenderer::renderText(
         history.commitmentPercentHistory(), percent, "", "%") << '\n';
+  }
+
+  // System load — raw load averages and per-CPU normalized averages. These are
+  // counts (not percentages) so they auto-scale; a missing dataset simply has
+  // no graph. The normalized graphs only appear once an online CPU count is
+  // known.
+  {
+    atm::GraphConfig load_scale;
+    load_scale.width = 40;
+    load_scale.height = 6;
+    load_scale.dynamic_scale = true;
+    const auto renderLoadHist =
+        [&](const char *title,
+            const atm::ResourceHistory<atm::TimedSample> &h) {
+          if (!h.empty()) {
+            out << "\n" << title << "\n"
+                << atm::GraphRenderer::renderText(h, load_scale, "", "")
+                << '\n';
+          }
+        };
+    if (!history.load1History().empty()) {
+      out << "\n[SYSTEM LOAD]\n";
+      renderLoadHist("Load Average (1 min)", history.load1History());
+      renderLoadHist("Load Average (5 min)", history.load5History());
+      renderLoadHist("Load Average (15 min)", history.load15History());
+    }
+    if (!history.normalizedLoad1History().empty() ||
+        !history.normalizedLoad5History().empty() ||
+        !history.normalizedLoad15History().empty()) {
+      out << "\n[NORMALIZED LOAD]\n";
+      renderLoadHist("Normalized Load (1 min)",
+                     history.normalizedLoad1History());
+      renderLoadHist("Normalized Load (5 min)",
+                     history.normalizedLoad5History());
+      renderLoadHist("Normalized Load (15 min)",
+                     history.normalizedLoad15History());
+    }
   }
 
   // System pressure (PSI) — 10-second averages. Only metrics that have data
@@ -1367,6 +1438,96 @@ void renderPressureSections(std::ostringstream &out,
     renderRow("I/O", "Full", pressure.io.full);
   }
   out << '\n';
+}
+
+/// Formats a load average with two decimals, e.g. "0.42".
+std::string formatLoadAverage(double load) {
+  std::ostringstream out;
+  out << std::fixed << std::setprecision(2) << load;
+  return out.str();
+}
+
+/// Small glyph for a load-severity indicator in the summary view.
+const char *loadSeverityGlyph(atm::LoadSeverity severity) {
+  switch (severity) {
+    case atm::LoadSeverity::Normal:   return "\u25cb";  // ○
+    case atm::LoadSeverity::Elevated: return "\u25b2";  // ▲
+    case atm::LoadSeverity::High:     return "\u26a0";   // ⚠
+    case atm::LoadSeverity::Critical: return "\U0001f534";  // 🔴
+  }
+  return "?";
+}
+
+/// Formats a wall-clock time point as "YYYY-MM-DD HH:MM:SS" in local time.
+std::string formatDateTime(std::chrono::system_clock::time_point when) {
+  const std::time_t tt = std::chrono::system_clock::to_time_t(when);
+  std::tm local{};
+  ::localtime_r(&tt, &local);
+  char buffer[64];
+  std::strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", &local);
+  return buffer;
+}
+
+/// Renders the SYSTEM LOAD AND UPTIME section: load averages (raw and per-CPU
+/// normalized), a heuristic severity, running/total tasks, last PID, uptime,
+/// idle time and the wall-clock boot estimate. Everything is read-only;
+/// unavailable values show "N/A" instead of faked zeros.
+void renderSystemLoadSections(std::ostringstream &out,
+                              const atm::SystemLoadSnapshot &load,
+                              std::uint32_t online_cpus) {
+  out << "\n## SYSTEM LOAD AND UPTIME\n\n";
+  if (!load.load.readable) {
+    out << "Load averages unavailable (/proc/loadavg could not be read).\n";
+  } else {
+    appendLabeled(out, "Load Average (1 min):",
+                  formatLoadAverage(load.load.load1));
+    appendLabeled(out, "Load Average (5 min):",
+                  formatLoadAverage(load.load.load5));
+    appendLabeled(out, "Load Average (15 min):",
+                  formatLoadAverage(load.load.load15));
+    const std::optional<double> normalized =
+        atm::normalizeLoad(load.load.load1, online_cpus);
+    if (online_cpus > 0) {
+      appendLabeled(out, "Normalized (per CPU):",
+                    formatLoadAverage(*normalized) + " / " +
+                        std::to_string(online_cpus) + " logical CPU" +
+                        (online_cpus == 1 ? "" : "s"));
+      const atm::LoadSeverity severity =
+          atm::classifyLoadSeverity(*normalized);
+      appendLabeled(out, "Load Severity:",
+                    std::string(loadSeverityGlyph(severity)) + " " +
+                        atm::loadSeverityName(severity));
+    } else {
+      appendLabeled(out, "Normalized (per CPU):", "N/A (CPU count unknown)");
+      appendLabeled(out, "Load Severity:", "N/A");
+    }
+    appendLabeled(
+        out, "Running/Total:",
+        load.load.running_total_available
+            ? std::to_string(static_cast<std::uint64_t>(load.load.running)) +
+                  "/" +
+                  std::to_string(static_cast<std::uint64_t>(load.load.total))
+            : std::string("N/A"));
+    appendLabeled(out, "Last PID:",
+                  load.load.last_pid_available
+                      ? formatThousands(load.load.last_pid)
+                      : std::string("N/A"));
+  }
+
+  if (!load.uptime.readable) {
+    out << "Uptime unavailable (/proc/uptime could not be read).\n";
+  } else {
+    appendLabeled(out, "Uptime:",
+                  atm::formatUptime(static_cast<std::uint64_t>(
+                      load.uptime.uptime_seconds)));
+    appendLabeled(out, "Idle time:",
+                  atm::formatUptime(static_cast<std::uint64_t>(
+                      load.uptime.idle_seconds)));
+    appendLabeled(out, "Boot time:",
+                  load.boot_time.has_value()
+                      ? formatDateTime(*load.boot_time)
+                      : std::string("N/A"));
+  }
 }
 
 /// Best display name for a GPU temperature sensor: resolves the hwmon device
@@ -3166,6 +3327,7 @@ std::string renderFrame(double cpu_usage, const atm::MemoryInfo &memory,
                         const atm::GpuSnapshot &gpu,
                         const atm::SensorSnapshot &sensors,
                         const atm::SystemPressureSnapshot &pressure,
+                        const atm::SystemLoadSnapshot &load,
                         const atm::SystemdSnapshot &systemd,
                         const atm::StartupSnapshot &startup,
                          const atm::SystemInfo &sysinfo,
@@ -3190,6 +3352,7 @@ std::string renderFrame(double cpu_usage, const atm::MemoryInfo &memory,
   std::ostringstream out;
   renderHeader(out, cpu_usage, memory);
   renderSystemInfoSections(out, sysinfo);
+  renderSystemLoadSections(out, load, onlineLogicalCpuCount(cpu_details));
   renderMemorySections(out, memory, memory_details);
   renderCpuSections(out, cpu_details);
   if (show_history) {
@@ -3240,12 +3403,13 @@ void renderView(double cpu_usage, const atm::MemoryInfo &memory,
                 ViewMode view, const atm::ProcessTree &tree,
                 const atm::DiskSnapshot &disk,
                 const atm::NetworkSnapshot &network,
-                const atm::GpuSnapshot &gpu,
-                const atm::SensorSnapshot &sensors,
-                const atm::SystemPressureSnapshot &pressure,
-                const atm::SystemdSnapshot &systemd,
-                const atm::StartupSnapshot &startup,
-                 const atm::SystemInfo &sysinfo,
+const atm::GpuSnapshot &gpu,
+                 const atm::SensorSnapshot &sensors,
+                 const atm::SystemPressureSnapshot &pressure,
+                 const atm::SystemLoadSnapshot &load,
+                 const atm::SystemdSnapshot &systemd,
+                 const atm::StartupSnapshot &startup,
+                  const atm::SystemInfo &sysinfo,
                  const atm::HistoryManager &history,
                  bool show_history,
                  const atm::AlertManager &alerts,
@@ -3262,11 +3426,11 @@ void renderView(double cpu_usage, const atm::MemoryInfo &memory,
   // refreshes in place instead of scrolling the terminal.
   std::cout << "\033[2J\033[H";
   std::cout << renderFrame(cpu_usage, memory, processes, stats, sort, view, tree,
-                           disk, network, gpu, sensors, pressure, systemd, startup,
-                           sysinfo, history, show_history, alerts, alert_filter,
-                           service_search, service_sort, startup_search,
-                           startup_sort, packages, refresh_interval_ms,
-                           cpu_details, memory_details)
+                           disk, network, gpu, sensors, pressure, load, systemd,
+                           startup, sysinfo, history, show_history, alerts,
+                           alert_filter, service_search, service_sort,
+                           startup_search, startup_sort, packages,
+                           refresh_interval_ms, cpu_details, memory_details)
             << std::flush;
 }
 
@@ -5499,6 +5663,7 @@ int main() {
   atm::GpuMonitor gpu_monitor;
   atm::SensorMonitor sensor_monitor;
   atm::SystemPressureMonitor pressure_monitor;
+  atm::SystemLoadMonitor load_monitor;
   atm::SystemdManager systemd_manager;
   atm::StartupManager startup_manager;
   atm::SystemInfoProvider system_info;
@@ -5587,6 +5752,7 @@ int main() {
   static_cast<void>(sensor_monitor.read());
   systemd_manager.discover();
   static_cast<void>(pressure_monitor.read());
+  static_cast<void>(load_monitor.read());
   std::this_thread::sleep_for(std::chrono::milliseconds(refresh_interval_ms));
 
   atm::AdvancedCpuSnapshot cpu = cpu_details.read();
@@ -5607,6 +5773,7 @@ int main() {
   const atm::GpuSnapshot first_gpu = gpu_monitor.read();
   const atm::SensorSnapshot first_sensors = sensor_monitor.read();
   const atm::SystemPressureSnapshot first_pressure = pressure_monitor.read();
+  const atm::SystemLoadSnapshot first_load = load_monitor.read();
   const atm::SystemdSnapshot first_systemd = systemd_manager.read();
   const atm::StartupSnapshot first_startup = startup_manager.read();
   system_info.load(first_gpu);
@@ -5637,6 +5804,7 @@ int main() {
     history.updateCpuHistories(cpuHistoryVector(cpu));
     history.updateAdvancedMemory(buildAdvancedMemoryMetrics(memory));
     history.updatePressure(buildPressureMetrics(first_pressure));
+    history.updateLoad(buildLoadMetrics(first_load, onlineLogicalCpuCount(cpu)));
     history.updateProcessStats(proc_stats);
     updateAlerts(alerts, aggregateCpuPercent(cpu), first_memory, first_disk,
                  first_network, first_gpu, first_sensors, history);
@@ -5644,8 +5812,8 @@ int main() {
 
   renderView(aggregateCpuPercent(cpu), first_memory, snapshot.processes,
              proc_stats, sort, view, tree, first_disk, first_network, first_gpu,
-             first_sensors, first_pressure, first_systemd, first_startup,
-             sysinfo, history, show_history, alerts, alert_filter,
+             first_sensors, first_pressure, first_load, first_systemd,
+             first_startup, sysinfo, history, show_history, alerts, alert_filter,
              service_search, service_sort, startup_search, startup_sort,
              packages, refresh_interval_ms, cpu, memory);
 
@@ -5653,6 +5821,7 @@ int main() {
   atm::GpuSnapshot gpu = first_gpu;
   atm::SensorSnapshot sensors = first_sensors;
   atm::SystemPressureSnapshot pressure = first_pressure;
+  atm::SystemLoadSnapshot load = first_load;
   atm::SystemdSnapshot systemd = first_systemd;
   atm::StartupSnapshot startup = first_startup;
 
@@ -5736,10 +5905,11 @@ int main() {
             }
             renderView(aggregateCpuPercent(cpu), mem_info, snapshot.processes,
                        proc_stats, sort, view, tree, disk, network, gpu,
-                       sensors, pressure, systemd, startup, sysinfo, history,
-                       show_history, alerts, alert_filter, service_search,
-                       service_sort, startup_search, startup_sort, packages,
-                       refresh_interval_ms, cpu, memory);
+                       sensors, pressure, load, systemd, startup, sysinfo,
+                       history, show_history, alerts, alert_filter,
+                       service_search, service_sort, startup_search,
+                       startup_sort, packages, refresh_interval_ms, cpu,
+                       memory);
           }
         }
         continue;
@@ -5840,6 +6010,7 @@ int main() {
     gpu = gpu_monitor.read();
     sensors = sensor_monitor.read();
     pressure = pressure_monitor.read();
+    load = load_monitor.read();
     systemd = systemd_manager.read();
     startup = startup_manager.read();
 
@@ -5861,16 +6032,17 @@ int main() {
       history.updateCpuHistories(cpuHistoryVector(cpu));
       history.updateAdvancedMemory(buildAdvancedMemoryMetrics(memory));
       history.updatePressure(buildPressureMetrics(pressure));
+      history.updateLoad(buildLoadMetrics(load, onlineLogicalCpuCount(cpu)));
       history.updateProcessStats(proc_stats);
       updateAlerts(alerts, aggregateCpuPercent(cpu), mem_info, disk, network,
                    gpu, sensors, history);
     }
 
     renderView(aggregateCpuPercent(cpu), mem_info, snapshot.processes, proc_stats,
-               sort, view, tree, disk, network, gpu, sensors, pressure, systemd,
-               startup, sysinfo, history, show_history, alerts, alert_filter,
-               service_search, service_sort, startup_search, startup_sort,
-               packages, refresh_interval_ms, cpu, memory);
+               sort, view, tree, disk, network, gpu, sensors, pressure, load,
+               systemd, startup, sysinfo, history, show_history, alerts,
+               alert_filter, service_search, service_sort, startup_search,
+               startup_sort, packages, refresh_interval_ms, cpu, memory);
   }
 
   // Clean shutdown: persist any pending settings changes.

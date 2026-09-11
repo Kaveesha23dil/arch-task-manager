@@ -36,7 +36,13 @@ HistoryManager::HistoryManager(std::size_t max_samples)
       memory_pressure_some_(max_samples),
       memory_pressure_full_(max_samples),
       io_pressure_some_(max_samples),
-      io_pressure_full_(max_samples) {}
+      io_pressure_full_(max_samples),
+      load1_(max_samples),
+      load5_(max_samples),
+      load15_(max_samples),
+      normalized_load1_(max_samples),
+      normalized_load5_(max_samples),
+      normalized_load15_(max_samples) {}
 
 void HistoryManager::syncGpuHistories(
     const std::vector<std::pair<std::string, double>>& utilizations) {
@@ -149,6 +155,12 @@ void HistoryManager::clearAll() {
   memory_pressure_full_.clear();
   io_pressure_some_.clear();
   io_pressure_full_.clear();
+  load1_.clear();
+  load5_.clear();
+  load15_.clear();
+  normalized_load1_.clear();
+  normalized_load5_.clear();
+  normalized_load15_.clear();
   for (auto& g : gpus_) {
     g.utilization.clear();
     g.vram_usage.clear();
@@ -299,6 +311,42 @@ void HistoryManager::updatePressure(const PressureMetrics &metrics) {
   }
   if (metrics.io_full.has_value() && std::isfinite(*metrics.io_full)) {
     io_pressure_full_.addSample(TimedSample{now, *metrics.io_full});
+  }
+}
+
+void HistoryManager::updateLoad(const LoadMetrics &metrics) {
+  if (paused_) {
+    return;
+  }
+  if (!metrics.load1.has_value() && !metrics.load5.has_value() &&
+      !metrics.load15.has_value() && !metrics.normalized_load1.has_value() &&
+      !metrics.normalized_load5.has_value() &&
+      !metrics.normalized_load15.has_value()) {
+    return;  // nothing available this refresh — no empty samples
+  }
+
+  const auto now = std::chrono::steady_clock::now();
+
+  if (metrics.load1.has_value() && std::isfinite(*metrics.load1)) {
+    load1_.addSample(TimedSample{now, *metrics.load1});
+  }
+  if (metrics.load5.has_value() && std::isfinite(*metrics.load5)) {
+    load5_.addSample(TimedSample{now, *metrics.load5});
+  }
+  if (metrics.load15.has_value() && std::isfinite(*metrics.load15)) {
+    load15_.addSample(TimedSample{now, *metrics.load15});
+  }
+  if (metrics.normalized_load1.has_value() &&
+      std::isfinite(*metrics.normalized_load1)) {
+    normalized_load1_.addSample(TimedSample{now, *metrics.normalized_load1});
+  }
+  if (metrics.normalized_load5.has_value() &&
+      std::isfinite(*metrics.normalized_load5)) {
+    normalized_load5_.addSample(TimedSample{now, *metrics.normalized_load5});
+  }
+  if (metrics.normalized_load15.has_value() &&
+      std::isfinite(*metrics.normalized_load15)) {
+    normalized_load15_.addSample(TimedSample{now, *metrics.normalized_load15});
   }
 }
 
