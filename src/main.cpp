@@ -25,6 +25,7 @@
 
 #include "alert_manager.hpp"
 #include "advanced_cpu_monitor.hpp"
+#include "advanced_memory_monitor.hpp"
 #include "cpu_monitor.hpp"
 #include "disk_monitor.hpp"
 #include "format_bytes.hpp"
@@ -139,6 +140,10 @@ constexpr std::size_t kCpuOnlineWidth = 7;
 constexpr std::size_t kCpuPctWidth = 7;
 constexpr std::size_t kCpuFreqWidth = 11;
 constexpr std::size_t kCpuGovernorWidth = 12;
+constexpr std::size_t kSwapAreaNameWidth = 32;
+constexpr std::size_t kSwapAreaTypeWidth = 12;
+constexpr std::size_t kSwapAreaSizeWidth = 12;
+constexpr std::size_t kSwapAreaPriorityWidth = 10;
 constexpr int kMinNice = atm::kMinimumNice;
 constexpr int kMaxNice = atm::kMaximumNice;
 
@@ -216,6 +221,31 @@ std::string formatKibibytes(std::uint64_t kibibytes) {
   return out.str();
 }
 
+/// Formats an optional byte count with the shared binary-unit scheme, or "N/A"
+/// when the field is unavailable. Unavailable fields are never faked as zero.
+std::string formatBytesOptional(const std::optional<std::uint64_t> &bytes) {
+  if (!bytes.has_value()) {
+    return "N/A";
+  }
+  return atm::formatBytes(*bytes);
+}
+
+/// Formats an optional count (e.g. huge-page page counts) or "N/A".
+std::string formatCountOptional(const std::optional<std::uint64_t> &count) {
+  if (!count.has_value()) {
+    return "N/A";
+  }
+  return std::to_string(*count);
+}
+
+/// Formats an optional percentage (0.0–100.0, already clamped) or "N/A".
+std::string formatPercentOptional(const std::optional<double> &percent) {
+  if (!percent.has_value()) {
+    return "N/A";
+  }
+  return formatPercent(*percent) + "%";
+}
+
 /// Truncates a name to kMaxNameWidth characters so columns stay aligned.
 std::string fitName(const std::string &name) {
   if (name.size() <= kMaxNameWidth) {
@@ -254,9 +284,11 @@ void renderHeader(std::ostringstream &out, double cpu_usage,
                 formatPercent(memory.usagePercent()) + "%");
 }
 
-/// Renders the MEMORY and SWAP detail sections (Step 2).
+/// Renders the MEMORY, MEMORY DETAILS (composition), SWAP (+ swap areas),
+/// COMMITMENT and HUGE PAGES sections (Steps 2 and 36).
 void renderMemorySections(std::ostringstream &out,
-                          const atm::MemoryInfo &memory) {
+                          const atm::MemoryInfo &memory,
+                          const atm::AdvancedMemorySnapshot &advanced) {
   out << "\n## MEMORY\n\n";
   appendLabeled(out, "Total:", formatKibibytes(memory.total));
   appendLabeled(out, "Used:", formatKibibytes(memory.used()));
@@ -265,12 +297,129 @@ void renderMemorySections(std::ostringstream &out,
   appendLabeled(out, "Cached:", formatKibibytes(memory.cached));
   appendLabeled(out, "Buffers:", formatKibibytes(memory.buffers));
   appendLabeled(out, "Usage:", formatPercent(memory.usagePercent()) + "%");
+  if (advanced.available_is_estimate) {
+    out << "Available is an estimate (MemFree + Buffers + Cached); "
+           "MemAvailable was not reported by this kernel.\n";
+  }
+
+  out << "\n## MEMORY DETAILS\n\n"
+      << "Memory composition (values from /proc/meminfo; rows overlap and do "
+         "not add up to total RAM - Cached includes Shared/tmpfs, and "
+         "SReclaimable/SUnreclaim are parts of Slab):\n";
+  appendLabeled(out, "Buffers:", formatBytesOptional(advanced.buffers));
+  appendLabeled(out, "Cached:", formatBytesOptional(advanced.cached));
+  appendLabeled(out, "Reclaimable:",
+                formatBytesOptional(advanced.reclaimableKernelBytes()));
+  appendLabeled(out, "Unreclaimable:",
+                formatBytesOptional(advanced.sunreclaim));
+  appendLabeled(out, "Anonymous:",
+                formatBytesOptional(advanced.anonymousBytes()));
+  appendLabeled(out, "File-backed:",
+                formatBytesOptional(advanced.fileBackedBytes()));
+  appendLabeled(out, "Shared:", formatBytesOptional(advanced.shmem));
+  appendLabeled(out, "Active:", formatBytesOptional(advanced.active));
+  appendLabeled(out, "Inactive:", formatBytesOptional(advanced.inactive));
+  appendLabeled(out, "Kernel stack:",
+                formatBytesOptional(advanced.kernel_stack));
+  appendLabeled(out, "Page tables:",
+                formatBytesOptional(advanced.page_tables));
+
+  out << "\nActivity & kernel accounting:\n";
+  appendLabeled(out, "Active(anon):",
+                formatBytesOptional(advanced.active_anon));
+  appendLabeled(out, "Inactive(anon):",
+                formatBytesOptional(advanced.inactive_anon));
+  appendLabeled(out, "Active(file):",
+                formatBytesOptional(advanced.active_file));
+  appendLabeled(out, "Inactive(file):",
+                formatBytesOptional(advanced.inactive_file));
+  appendLabeled(out, "Unevictable:",
+                formatBytesOptional(advanced.unevictable));
+  appendLabeled(out, "Mlocked:", formatBytesOptional(advanced.mlocked));
+  appendLabeled(out, "Slab:", formatBytesOptional(advanced.slab));
+  appendLabeled(out, "Mapped:", formatBytesOptional(advanced.mapped));
+  appendLabeled(out, "Writeback:", formatBytesOptional(advanced.writeback));
+  appendLabeled(out, "WritebackTmp:",
+                formatBytesOptional(advanced.writeback_tmp));
+  if (advanced.kernelMemoryBytes().has_value()) {
+    appendLabeled(out, "Kernel memory estimate:",
+                  atm::formatBytes(*advanced.kernelMemoryBytes()));
+  }
 
   out << "\n## SWAP\n\n";
   appendLabeled(out, "Total:", formatKibibytes(memory.swap_total));
   appendLabeled(out, "Used:", formatKibibytes(memory.swapUsed()));
   appendLabeled(out, "Free:", formatKibibytes(memory.swap_free));
+  appendLabeled(out, "Cached:", formatBytesOptional(advanced.swap_cached));
   appendLabeled(out, "Usage:", formatPercent(memory.swapUsagePercent()) + "%");
+
+  out << "\nSwap areas (" << advanced.swap_areas.size() << " configured):\n";
+  if (advanced.swap_areas.empty()) {
+    out << "None.\n";
+  } else {
+    out << std::left << std::setw(kSwapAreaNameWidth) << "AREA" << std::right
+        << std::setw(kSwapAreaTypeWidth) << "TYPE"
+        << std::setw(kSwapAreaSizeWidth) << "SIZE"
+        << std::setw(kSwapAreaSizeWidth) << "USED"
+        << std::setw(kSwapAreaPriorityWidth) << "PRIORITY" << '\n';
+    for (const atm::SwapAreaInfo &area : advanced.swap_areas) {
+      const std::string name =
+          area.filename.size() <= kSwapAreaNameWidth
+              ? area.filename
+              : area.filename.substr(0, kSwapAreaNameWidth);
+      const std::string priority =
+          area.priority.has_value() ? std::to_string(*area.priority) : "N/A";
+      out << std::left << std::setw(kSwapAreaNameWidth) << name << std::right
+          << std::setw(kSwapAreaTypeWidth) << fitTo(area.type, kSwapAreaTypeWidth)
+          << std::setw(kSwapAreaSizeWidth)
+          << formatBytesOptional(area.size_bytes)
+          << std::setw(kSwapAreaSizeWidth)
+          << formatBytesOptional(area.used_bytes)
+          << std::setw(kSwapAreaPriorityWidth) << priority << '\n';
+    }
+  }
+
+  // Commitment is a virtual-memory figure, never resident RAM.
+  if (advanced.commit_limit.has_value()) {
+    out << "\n## COMMITMENT (virtual memory, not resident RAM)\n\n";
+    appendLabeled(out, "Commit limit:",
+                  formatBytesOptional(advanced.commit_limit));
+    appendLabeled(out, "Committed:",
+                  formatBytesOptional(advanced.committed_as));
+    appendLabeled(out, "Usage:",
+                  formatPercentOptional(advanced.commitPercent()));
+  }
+
+  if (advanced.hasHugePageInfo()) {
+    out << "\n## HUGE PAGES\n\n";
+    appendLabeled(out, "Pages total:",
+                  formatCountOptional(advanced.huge_pages_total));
+    appendLabeled(out, "Pages free:",
+                  formatCountOptional(advanced.huge_pages_free));
+    appendLabeled(out, "Pages reserved:",
+                  formatCountOptional(advanced.huge_pages_rsvd));
+    appendLabeled(out, "Pages surplus:",
+                  formatCountOptional(advanced.huge_pages_surp));
+    appendLabeled(out, "Hugepage size:",
+                  formatBytesOptional(advanced.hugepagesize));
+    appendLabeled(out, "Hugetlb:", formatBytesOptional(advanced.hugetlb));
+    appendLabeled(out, "AnonHugePages:",
+                  formatBytesOptional(advanced.anon_huge_pages));
+    appendLabeled(out, "ShmemHugePages:",
+                  formatBytesOptional(advanced.shmem_huge_pages));
+    appendLabeled(out, "ShmemPmdMapped:",
+                  formatBytesOptional(advanced.shmem_pmd_mapped));
+    appendLabeled(out, "FileHugePages:",
+                  formatBytesOptional(advanced.file_huge_pages));
+    appendLabeled(out, "FilePmdMapped:",
+                  formatBytesOptional(advanced.file_pmd_mapped));
+    appendLabeled(out, "DirectMap4k:",
+                  formatBytesOptional(advanced.direct_map_4k));
+    appendLabeled(out, "DirectMap2M:",
+                  formatBytesOptional(advanced.direct_map_2m));
+    appendLabeled(out, "DirectMap1G:",
+                  formatBytesOptional(advanced.direct_map_1g));
+  }
 }
 
 /// Formats one percentage cell of the per-CPU table: a fixed-width percentage
@@ -301,6 +450,24 @@ std::vector<std::pair<int, double>> cpuHistoryVector(
 /// sample exists yet), used to drive the header, alerts and the history graph.
 double aggregateCpuPercent(const atm::AdvancedCpuSnapshot &cpu) {
   return cpu.aggregate.has_sample ? cpu.aggregate.delta.busy_percent : 0.0;
+}
+
+/// Builds the advanced-memory history sample for a snapshot. Unavailable
+/// metrics stay unset so the history manager simply skips them for that
+/// refresh instead of plotting garbage.
+atm::AdvancedMemoryMetrics buildAdvancedMemoryMetrics(
+    const atm::AdvancedMemorySnapshot &memory) {
+  atm::AdvancedMemoryMetrics metrics;
+  metrics.available_percent = memory.availablePercent();
+  if (memory.cached.has_value()) {
+    metrics.cached_bytes = static_cast<double>(*memory.cached);
+  }
+  if (memory.reclaimableKernelBytes().has_value()) {
+    metrics.reclaimable_bytes =
+        static_cast<double>(*memory.reclaimableKernelBytes());
+  }
+  metrics.commitment_percent = memory.commitPercent();
+  return metrics;
 }
 
 /// Renders the ADVANCED CPU section of the live view: the total-CPU time
@@ -613,6 +780,20 @@ void renderResourceHistorySection(std::ostringstream &out,
   // Swap usage (%).
   out << "\n[SWAP Usage]\n" << atm::GraphRenderer::renderText(
       history.swapHistory(), percent, "", "%") << '\n';
+
+  // Advanced memory (available %, absolute quantities auto-scale).
+  out << "\n[AVAILABLE MEMORY]\n" << atm::GraphRenderer::renderText(
+      history.memoryAvailablePercentHistory(), percent, "", "%") << '\n';
+  out << "\n[USED RAM]\n" << atm::GraphRenderer::renderText(
+      history.usedRamHistory(), rate, "", "kB") << '\n';
+  out << "\n[CACHED]\n" << atm::GraphRenderer::renderText(
+      history.cachedBytesHistory(), rate, "", "B") << '\n';
+  out << "\n[RECLAIMABLE]\n" << atm::GraphRenderer::renderText(
+      history.reclaimableBytesHistory(), rate, "", "B") << '\n';
+  if (!history.commitmentPercentHistory().empty()) {
+    out << "\n[COMMITMENT Usage]\n" << atm::GraphRenderer::renderText(
+        history.commitmentPercentHistory(), percent, "", "%") << '\n';
+  }
 
   // Disk throughput (auto-scaling, MB-scale).
   out << "\n[DISK READ]\n" << atm::GraphRenderer::renderText(
@@ -2815,7 +2996,8 @@ std::string renderFrame(double cpu_usage, const atm::MemoryInfo &memory,
                          atm::StartupSort startup_sort,
                          const atm::PackageManager &packages,
                          int refresh_interval_ms,
-                         const atm::AdvancedCpuSnapshot &cpu_details) {
+                         const atm::AdvancedCpuSnapshot &cpu_details,
+                         const atm::AdvancedMemorySnapshot &memory_details) {
   if (view == ViewMode::Tree) {
     // The tree view stays deliberately focused on the hierarchy; the storage
     // and network sections are part of the table view.
@@ -2825,7 +3007,7 @@ std::string renderFrame(double cpu_usage, const atm::MemoryInfo &memory,
   std::ostringstream out;
   renderHeader(out, cpu_usage, memory);
   renderSystemInfoSections(out, sysinfo);
-  renderMemorySections(out, memory);
+  renderMemorySections(out, memory, memory_details);
   renderCpuSections(out, cpu_details);
   if (show_history) {
     renderResourceHistorySection(out, history);
@@ -2889,7 +3071,8 @@ void renderView(double cpu_usage, const atm::MemoryInfo &memory,
                  atm::StartupSort startup_sort,
                  const atm::PackageManager &packages,
                  int refresh_interval_ms,
-                 const atm::AdvancedCpuSnapshot &cpu_details) {
+                 const atm::AdvancedCpuSnapshot &cpu_details,
+                 const atm::AdvancedMemorySnapshot &memory_details) {
   // ANSI "clear entire screen" + "cursor to home" so the multi-line frame
   // refreshes in place instead of scrolling the terminal.
   std::cout << "\033[2J\033[H";
@@ -2898,7 +3081,7 @@ void renderView(double cpu_usage, const atm::MemoryInfo &memory,
                            sysinfo, history, show_history, alerts, alert_filter,
                            service_search, service_sort, startup_search,
                            startup_sort, packages, refresh_interval_ms,
-                           cpu_details)
+                           cpu_details, memory_details)
             << std::flush;
 }
 
@@ -5123,7 +5306,7 @@ int main() {
   int refresh_interval_ms = settings.settings().general.refresh_interval_ms;
 
   atm::AdvancedCpuMonitor cpu_details;
-  atm::MemoryMonitor memory_monitor;
+  atm::AdvancedMemoryMonitor memory_details;
   atm::ProcessMonitor process_monitor;
   atm::ProcessStatisticsAggregator process_statistics;
   atm::DiskMonitor disk_monitor;
@@ -5225,11 +5408,12 @@ int main() {
     return EXIT_FAILURE;
   }
 
-  const auto first_memory = memory_monitor.read();
-  if (!first_memory.has_value()) {
+  atm::AdvancedMemorySnapshot memory = memory_details.read();
+  if (!memory.meminfo_readable) {
     std::cerr << "Error: Unable to read /proc/meminfo\n";
     return EXIT_FAILURE;
   }
+  const atm::MemoryInfo first_memory = memory.toMemoryInfo();
 
   const atm::DiskSnapshot first_disk = disk_monitor.read();
   const atm::NetworkSnapshot first_network = network_monitor.read();
@@ -5239,7 +5423,7 @@ int main() {
   const atm::StartupSnapshot first_startup = startup_manager.read();
   system_info.load(first_gpu);
   atm::SystemInfo sysinfo = system_info.read();
-  auto snapshot = process_monitor.read(first_memory->total);
+  auto snapshot = process_monitor.read(first_memory.total);
   atm::sortProcesses(snapshot.processes, sort);
   atm::ProcessTree tree = atm::buildProcessTree(snapshot.processes);
   const atm::SystemProcessStatistics proc_stats =
@@ -5253,26 +5437,28 @@ int main() {
     std::vector<std::pair<std::string, double>> temps;
     buildGpuMetricVectors(first_gpu, gpu_utils, gpu_vrams);
     buildTemperatureVector(first_sensors, temps);
-    history.update(aggregateCpuPercent(cpu), first_memory->usagePercent(),
-                   static_cast<double>(first_memory->used()),
-                   static_cast<double>(first_memory->available),
-                   first_memory->swapUsagePercent(),
+    history.update(aggregateCpuPercent(cpu), first_memory.usagePercent(),
+                   static_cast<double>(first_memory.used()),
+                   static_cast<double>(first_memory.available),
+                   first_memory.swapUsagePercent(),
                    static_cast<double>(first_disk.total_read_bytes_per_second),
                    static_cast<double>(first_disk.total_write_bytes_per_second),
                    static_cast<double>(first_network.total_rx_bytes_per_second),
                    static_cast<double>(first_network.total_tx_bytes_per_second),
                    gpu_utils, gpu_vrams, temps);
     history.updateCpuHistories(cpuHistoryVector(cpu));
+    history.updateAdvancedMemory(buildAdvancedMemoryMetrics(memory));
     history.updateProcessStats(proc_stats);
-    updateAlerts(alerts, aggregateCpuPercent(cpu), *first_memory, first_disk,
+    updateAlerts(alerts, aggregateCpuPercent(cpu), first_memory, first_disk,
                  first_network, first_gpu, first_sensors, history);
   }
 
-  renderView(aggregateCpuPercent(cpu), *first_memory, snapshot.processes,
+  renderView(aggregateCpuPercent(cpu), first_memory, snapshot.processes,
              proc_stats, sort, view, tree, first_disk, first_network, first_gpu,
              first_sensors, first_systemd, first_startup, sysinfo, history,
              show_history, alerts, alert_filter, service_search, service_sort,
-             startup_search, startup_sort, packages, refresh_interval_ms, cpu);
+             startup_search, startup_sort, packages, refresh_interval_ms, cpu,
+             memory);
 
   atm::NetworkSnapshot network = first_network;
   atm::GpuSnapshot gpu = first_gpu;
@@ -5323,15 +5509,16 @@ int main() {
         // waiting for the next 1 s tick.
         {
           cpu = cpu_details.read();
-          const auto memory = memory_monitor.read();
-          if (cpu.proc_stat_readable && memory.has_value()) {
+          memory = memory_details.read();
+          if (cpu.proc_stat_readable && memory.meminfo_readable) {
+            const atm::MemoryInfo mem_info = memory.toMemoryInfo();
             const atm::DiskSnapshot disk = disk_monitor.read();
             const atm::NetworkSnapshot network = network_monitor.read();
             gpu = gpu_monitor.read();
             sensors = sensor_monitor.read();
             systemd = systemd_manager.read();
             startup = startup_manager.read();
-            snapshot = process_monitor.read(memory->total);
+            snapshot = process_monitor.read(mem_info.total);
             atm::sortProcesses(snapshot.processes, sort);
             tree = atm::buildProcessTree(snapshot.processes);
             const atm::SystemProcessStatistics proc_stats =
@@ -5342,34 +5529,34 @@ int main() {
               std::vector<std::pair<std::string, double>> temps;
               buildGpuMetricVectors(gpu, gpu_utils, gpu_vrams);
               buildTemperatureVector(sensors, temps);
-              history.update(aggregateCpuPercent(cpu), memory->usagePercent(),
-                             static_cast<double>(memory->used()),
-                             static_cast<double>(memory->available),
-                             memory->swapUsagePercent(),
+              history.update(aggregateCpuPercent(cpu), mem_info.usagePercent(),
+                             static_cast<double>(mem_info.used()),
+                             static_cast<double>(mem_info.available),
+                             mem_info.swapUsagePercent(),
                              static_cast<double>(disk.total_read_bytes_per_second),
                              static_cast<double>(disk.total_write_bytes_per_second),
                              static_cast<double>(network.total_rx_bytes_per_second),
                              static_cast<double>(network.total_tx_bytes_per_second),
                              gpu_utils, gpu_vrams, temps);
               history.updateCpuHistories(cpuHistoryVector(cpu));
+              history.updateAdvancedMemory(buildAdvancedMemoryMetrics(memory));
               history.updateProcessStats(proc_stats);
-              updateAlerts(alerts, aggregateCpuPercent(cpu), *memory, disk,
+              updateAlerts(alerts, aggregateCpuPercent(cpu), mem_info, disk,
                            network, gpu, sensors, history);
             }
-            renderView(aggregateCpuPercent(cpu), *memory, snapshot.processes,
+            renderView(aggregateCpuPercent(cpu), mem_info, snapshot.processes,
                        proc_stats, sort, view, tree, disk, network, gpu,
                        sensors, systemd, startup, sysinfo, history,
                        show_history, alerts, alert_filter, service_search,
                        service_sort, startup_search, startup_sort, packages,
-                       refresh_interval_ms, cpu);
+                       refresh_interval_ms, cpu, memory);
           }
         }
         continue;
       case ConsoleInput::Command::InspectProcess:
         if (view == ViewMode::List) {
-          const std::optional<atm::MemoryInfo> mem = memory_monitor.read();
           const std::uint64_t total_kib =
-              mem.has_value() ? mem->total : 0;
+              memory.mem_total.has_value() ? *memory.mem_total / 1024 : 0;
           interactProcessDetail(process_details, actions, scheduling, input,
                                 snapshot.processes, sort, total_kib);
         }
@@ -5446,13 +5633,14 @@ int main() {
       return EXIT_FAILURE;
     }
 
-    const auto memory = memory_monitor.read();
-    if (!memory.has_value()) {
+    memory = memory_details.read();
+    if (!memory.meminfo_readable) {
       std::cerr << "\nError: Unable to read /proc/meminfo\n";
       return EXIT_FAILURE;
     }
+    const atm::MemoryInfo mem_info = memory.toMemoryInfo();
 
-    snapshot = process_monitor.read(memory->total);
+    snapshot = process_monitor.read(mem_info.total);
     atm::sortProcesses(snapshot.processes, sort);
     tree = atm::buildProcessTree(snapshot.processes);
     const atm::SystemProcessStatistics proc_stats =
@@ -5470,26 +5658,27 @@ int main() {
       std::vector<std::pair<std::string, double>> temps;
       buildGpuMetricVectors(gpu, gpu_utils, gpu_vrams);
       buildTemperatureVector(sensors, temps);
-      history.update(aggregateCpuPercent(cpu), memory->usagePercent(),
-                     static_cast<double>(memory->used()),
-                     static_cast<double>(memory->available),
-                     memory->swapUsagePercent(),
+      history.update(aggregateCpuPercent(cpu), mem_info.usagePercent(),
+                     static_cast<double>(mem_info.used()),
+                     static_cast<double>(mem_info.available),
+                     mem_info.swapUsagePercent(),
                      static_cast<double>(disk.total_read_bytes_per_second),
                      static_cast<double>(disk.total_write_bytes_per_second),
                      static_cast<double>(network.total_rx_bytes_per_second),
                      static_cast<double>(network.total_tx_bytes_per_second),
                      gpu_utils, gpu_vrams, temps);
       history.updateCpuHistories(cpuHistoryVector(cpu));
+      history.updateAdvancedMemory(buildAdvancedMemoryMetrics(memory));
       history.updateProcessStats(proc_stats);
-      updateAlerts(alerts, aggregateCpuPercent(cpu), *memory, disk, network,
+      updateAlerts(alerts, aggregateCpuPercent(cpu), mem_info, disk, network,
                    gpu, sensors, history);
     }
 
-    renderView(aggregateCpuPercent(cpu), *memory, snapshot.processes, proc_stats,
+    renderView(aggregateCpuPercent(cpu), mem_info, snapshot.processes, proc_stats,
                sort, view, tree, disk, network, gpu, sensors, systemd, startup,
                sysinfo, history, show_history, alerts, alert_filter,
                service_search, service_sort, startup_search, startup_sort,
-               packages, refresh_interval_ms, cpu);
+               packages, refresh_interval_ms, cpu, memory);
   }
 
   // Clean shutdown: persist any pending settings changes.
