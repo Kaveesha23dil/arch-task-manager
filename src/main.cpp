@@ -24,6 +24,7 @@
 #include <vector>
 
 #include "alert_manager.hpp"
+#include "advanced_cpu_monitor.hpp"
 #include "cpu_monitor.hpp"
 #include "disk_monitor.hpp"
 #include "format_bytes.hpp"
@@ -133,6 +134,11 @@ constexpr std::size_t kPackageVersionWidth = 16;
 constexpr std::size_t kPackageSrcWidth = 10;
 constexpr std::size_t kPackageDetailRuleWidth = 32;
 constexpr std::size_t kMaxPackageFrameRows = 15;  // main-frame table cap
+constexpr std::size_t kCpuIdWidth = 6;
+constexpr std::size_t kCpuOnlineWidth = 7;
+constexpr std::size_t kCpuPctWidth = 7;
+constexpr std::size_t kCpuFreqWidth = 11;
+constexpr std::size_t kCpuGovernorWidth = 12;
 constexpr int kMinNice = atm::kMinimumNice;
 constexpr int kMaxNice = atm::kMaximumNice;
 
@@ -265,6 +271,104 @@ void renderMemorySections(std::ostringstream &out,
   appendLabeled(out, "Used:", formatKibibytes(memory.swapUsed()));
   appendLabeled(out, "Free:", formatKibibytes(memory.swap_free));
   appendLabeled(out, "Usage:", formatPercent(memory.swapUsagePercent()) + "%");
+}
+
+/// Formats one percentage cell of the per-CPU table: a fixed-width percentage
+/// when a valid sample exists, "N/A" otherwise (offline/new counter baseline).
+std::string formatCpuPctCell(bool valid, double percent) {
+  if (valid) {
+    return formatPercent(percent) + "%";
+  }
+  return "N/A";
+}
+
+/// Builds the (cpu_id, utilization) pairs for a CPU-details snapshot. Only
+/// CPUs with a valid sample are included, so offline or freshly-appeared CPUs
+/// never corrupt the per-CPU history set.
+std::vector<std::pair<int, double>> cpuHistoryVector(
+    const atm::AdvancedCpuSnapshot &cpu) {
+  std::vector<std::pair<int, double>> out;
+  out.reserve(cpu.cpus.size());
+  for (const atm::CpuStatistics &stat : cpu.cpus) {
+    if (stat.has_sample) {
+      out.emplace_back(stat.cpu_id, stat.delta.busy_percent);
+    }
+  }
+  return out;
+}
+
+/// The aggregate busy percentage of a CPU-details snapshot (0 when no valid
+/// sample exists yet), used to drive the header, alerts and the history graph.
+double aggregateCpuPercent(const atm::AdvancedCpuSnapshot &cpu) {
+  return cpu.aggregate.has_sample ? cpu.aggregate.delta.busy_percent : 0.0;
+}
+
+/// Renders the ADVANCED CPU section of the live view: the total-CPU time
+/// breakdown followed by one row per logical CPU. Frequencies are the values
+/// the kernel currently reports and may be shared by CPUs on the same policy;
+/// they are never claimed to be guaranteed hardware clocks.
+void renderCpuSections(std::ostringstream &out,
+                       const atm::AdvancedCpuSnapshot &cpu) {
+  out << "\n## CPU DETAILS\n\n";
+
+  const atm::CpuStatistics &aggregate = cpu.aggregate;
+  if (cpu.proc_stat_readable && aggregate.has_sample) {
+    out << "Total CPU (percent of elapsed CPU time):\n";
+    appendLabeled(out, "Busy:", formatPercent(aggregate.delta.busy_percent) + "%");
+    appendLabeled(out, "User:", formatPercent(aggregate.delta.user_percent) + "%");
+    appendLabeled(out, "Nice:", formatPercent(aggregate.delta.nice_percent) + "%");
+    appendLabeled(out, "System:",
+                  formatPercent(aggregate.delta.system_percent) + "%");
+    appendLabeled(out, "I/O Wait:",
+                  formatPercent(aggregate.delta.iowait_percent) + "%");
+    appendLabeled(out, "IRQ:", formatPercent(aggregate.delta.irq_percent) + "%");
+    appendLabeled(out, "SoftIRQ:",
+                  formatPercent(aggregate.delta.softirq_percent) + "%");
+    appendLabeled(out, "Steal:",
+                  formatPercent(aggregate.delta.steal_percent) + "%");
+    appendLabeled(out, "Idle:", formatPercent(aggregate.delta.idle_percent) + "%");
+  } else if (cpu.proc_stat_readable) {
+    out << "Total CPU: calculating first sample...\n";
+  } else {
+    out << "Total CPU: unavailable (/proc/stat could not be read)\n";
+  }
+
+  out << "\nPer-CPU:\n";
+  out << std::right << std::setw(kCpuIdWidth) << "CPU" << " "
+      << std::left << std::setw(kCpuOnlineWidth) << "Online" << " "
+      << std::right << std::setw(kCpuPctWidth) << "Usage" << " "
+      << std::setw(kCpuPctWidth) << "User" << " " << std::setw(kCpuPctWidth)
+      << "System" << " " << std::setw(kCpuPctWidth) << "I/O Wait" << " "
+      << std::setw(kCpuPctWidth) << "Idle" << " " << std::setw(kCpuFreqWidth)
+      << "Frequency" << " " << std::left << std::setw(kCpuGovernorWidth)
+      << "Governor\n";
+
+  for (const atm::CpuStatistics &stat : cpu.cpus) {
+    const bool valid = stat.has_sample;
+    out << std::right << std::setw(kCpuIdWidth)
+        << fitTo("cpu" + std::to_string(stat.cpu_id), kCpuIdWidth) << " "
+        << std::left << std::setw(kCpuOnlineWidth)
+        << (stat.online ? "online" : "offline") << " " << std::right
+        << std::setw(kCpuPctWidth)
+        << formatCpuPctCell(valid, stat.delta.busy_percent) << " "
+        << std::setw(kCpuPctWidth)
+        << formatCpuPctCell(valid, stat.delta.user_percent) << " "
+        << std::setw(kCpuPctWidth)
+        << formatCpuPctCell(valid, stat.delta.system_percent) << " "
+        << std::setw(kCpuPctWidth)
+        << formatCpuPctCell(valid, stat.delta.iowait_percent) << " "
+        << std::setw(kCpuPctWidth)
+        << formatCpuPctCell(valid, stat.delta.idle_percent) << " "
+        << std::setw(kCpuFreqWidth)
+        << atm::formatCpuFrequency(stat.frequency.current_khz) << " "
+        << std::left << std::setw(kCpuGovernorWidth)
+        << fitTo(atm::formatCpuGovernor(stat.frequency.governor),
+                 kCpuGovernorWidth) << '\n';
+  }
+
+  out << "\nFrequency is the currently reported cpufreq value (kHz); it is not "
+         "a guaranteed hardware clock, and CPUs sharing a frequency policy "
+         "report the same values.\n";
 }
 
 /// Renders the compact SYSTEM INFORMATION overview at the top of the live
@@ -480,6 +584,27 @@ void renderResourceHistorySection(std::ostringstream &out,
   // Overall CPU usage (%).
   out << "[CPU Usage]\n" << atm::GraphRenderer::renderText(
       history.cpuHistory(), percent, "", "%") << '\n';
+
+  // Per-CPU utilization (%). Capped so the frame stays reasonable on systems
+  // with many logical CPUs; the HistoryManager still tracks every CPU.
+  const auto &cpus = history.cpuHistories();
+  if (!cpus.empty()) {
+    out << "\n[Per-CPU Utilization]\n";
+    constexpr std::size_t kPerCpuGraphLimit = 8;
+    for (std::size_t i = 0; i < cpus.size() && i < kPerCpuGraphLimit; ++i) {
+      out << "cpu" << cpus[i].cpu_id << '\n'
+          << atm::GraphRenderer::renderText(cpus[i].utilization, percent, "",
+                                            "%")
+          << '\n';
+    }
+    if (cpus.size() > kPerCpuGraphLimit) {
+      out << "... " << (cpus.size() - kPerCpuGraphLimit)
+          << " more CPUs not shown (per-CPU data is still tracked).\n";
+    }
+  } else {
+    out << "\n[Per-CPU Utilization]\n"
+        << "N/A (no per-CPU data yet).\n";
+  }
 
   // Memory usage (%).
   out << "\n[MEMORY Usage]\n" << atm::GraphRenderer::renderText(
@@ -2689,7 +2814,8 @@ std::string renderFrame(double cpu_usage, const atm::MemoryInfo &memory,
                          const std::string &startup_search,
                          atm::StartupSort startup_sort,
                          const atm::PackageManager &packages,
-                         int refresh_interval_ms) {
+                         int refresh_interval_ms,
+                         const atm::AdvancedCpuSnapshot &cpu_details) {
   if (view == ViewMode::Tree) {
     // The tree view stays deliberately focused on the hierarchy; the storage
     // and network sections are part of the table view.
@@ -2700,6 +2826,7 @@ std::string renderFrame(double cpu_usage, const atm::MemoryInfo &memory,
   renderHeader(out, cpu_usage, memory);
   renderSystemInfoSections(out, sysinfo);
   renderMemorySections(out, memory);
+  renderCpuSections(out, cpu_details);
   if (show_history) {
     renderResourceHistorySection(out, history);
   }
@@ -2761,7 +2888,8 @@ void renderView(double cpu_usage, const atm::MemoryInfo &memory,
                  const std::string &startup_search,
                  atm::StartupSort startup_sort,
                  const atm::PackageManager &packages,
-                 int refresh_interval_ms) {
+                 int refresh_interval_ms,
+                 const atm::AdvancedCpuSnapshot &cpu_details) {
   // ANSI "clear entire screen" + "cursor to home" so the multi-line frame
   // refreshes in place instead of scrolling the terminal.
   std::cout << "\033[2J\033[H";
@@ -2769,7 +2897,8 @@ void renderView(double cpu_usage, const atm::MemoryInfo &memory,
                            disk, network, gpu, sensors, systemd, startup,
                            sysinfo, history, show_history, alerts, alert_filter,
                            service_search, service_sort, startup_search,
-                           startup_sort, packages, refresh_interval_ms)
+                           startup_sort, packages, refresh_interval_ms,
+                           cpu_details)
             << std::flush;
 }
 
@@ -4993,7 +5122,7 @@ int main() {
   }
   int refresh_interval_ms = settings.settings().general.refresh_interval_ms;
 
-  atm::CpuMonitor cpu_monitor;
+  atm::AdvancedCpuMonitor cpu_details;
   atm::MemoryMonitor memory_monitor;
   atm::ProcessMonitor process_monitor;
   atm::ProcessStatisticsAggregator process_statistics;
@@ -5080,7 +5209,7 @@ int main() {
   // Baseline samples so the first printed frame already shows real deltas:
   // CPU usage, per-process CPU, disk, network and GPU (Intel RC6) over the
   // sleep below.
-  static_cast<void>(cpu_monitor.readUsage());
+  static_cast<void>(cpu_details.read());
   static_cast<void>(process_monitor.read(0));
   static_cast<void>(disk_monitor.read());
   static_cast<void>(network_monitor.read());
@@ -5090,8 +5219,8 @@ int main() {
   systemd_manager.discover();
   std::this_thread::sleep_for(std::chrono::milliseconds(refresh_interval_ms));
 
-  const auto first_cpu = cpu_monitor.readUsage();
-  if (!first_cpu.has_value()) {
+  atm::AdvancedCpuSnapshot cpu = cpu_details.read();
+  if (!cpu.proc_stat_readable) {
     std::cerr << "ERROR: could not read CPU usage from /proc/stat\n";
     return EXIT_FAILURE;
   }
@@ -5124,7 +5253,7 @@ int main() {
     std::vector<std::pair<std::string, double>> temps;
     buildGpuMetricVectors(first_gpu, gpu_utils, gpu_vrams);
     buildTemperatureVector(first_sensors, temps);
-    history.update(*first_cpu, first_memory->usagePercent(),
+    history.update(aggregateCpuPercent(cpu), first_memory->usagePercent(),
                    static_cast<double>(first_memory->used()),
                    static_cast<double>(first_memory->available),
                    first_memory->swapUsagePercent(),
@@ -5133,16 +5262,17 @@ int main() {
                    static_cast<double>(first_network.total_rx_bytes_per_second),
                    static_cast<double>(first_network.total_tx_bytes_per_second),
                    gpu_utils, gpu_vrams, temps);
+    history.updateCpuHistories(cpuHistoryVector(cpu));
     history.updateProcessStats(proc_stats);
-    updateAlerts(alerts, *first_cpu, *first_memory, first_disk, first_network,
-                 first_gpu, first_sensors, history);
+    updateAlerts(alerts, aggregateCpuPercent(cpu), *first_memory, first_disk,
+                 first_network, first_gpu, first_sensors, history);
   }
 
-  renderView(*first_cpu, *first_memory, snapshot.processes, proc_stats,
-             sort, view, tree, first_disk, first_network, first_gpu,
+  renderView(aggregateCpuPercent(cpu), *first_memory, snapshot.processes,
+             proc_stats, sort, view, tree, first_disk, first_network, first_gpu,
              first_sensors, first_systemd, first_startup, sysinfo, history,
              show_history, alerts, alert_filter, service_search, service_sort,
-             startup_search, startup_sort, packages, refresh_interval_ms);
+             startup_search, startup_sort, packages, refresh_interval_ms, cpu);
 
   atm::NetworkSnapshot network = first_network;
   atm::GpuSnapshot gpu = first_gpu;
@@ -5192,9 +5322,9 @@ int main() {
         // Refresh immediately so the effect of the action is visible without
         // waiting for the next 1 s tick.
         {
-          const auto cpu = cpu_monitor.readUsage();
+          cpu = cpu_details.read();
           const auto memory = memory_monitor.read();
-          if (cpu.has_value() && memory.has_value()) {
+          if (cpu.proc_stat_readable && memory.has_value()) {
             const atm::DiskSnapshot disk = disk_monitor.read();
             const atm::NetworkSnapshot network = network_monitor.read();
             gpu = gpu_monitor.read();
@@ -5212,7 +5342,7 @@ int main() {
               std::vector<std::pair<std::string, double>> temps;
               buildGpuMetricVectors(gpu, gpu_utils, gpu_vrams);
               buildTemperatureVector(sensors, temps);
-              history.update(*cpu, memory->usagePercent(),
+              history.update(aggregateCpuPercent(cpu), memory->usagePercent(),
                              static_cast<double>(memory->used()),
                              static_cast<double>(memory->available),
                              memory->swapUsagePercent(),
@@ -5221,16 +5351,17 @@ int main() {
                              static_cast<double>(network.total_rx_bytes_per_second),
                              static_cast<double>(network.total_tx_bytes_per_second),
                              gpu_utils, gpu_vrams, temps);
+              history.updateCpuHistories(cpuHistoryVector(cpu));
               history.updateProcessStats(proc_stats);
-              updateAlerts(alerts, *cpu, *memory, disk, network, gpu, sensors,
-                           history);
+              updateAlerts(alerts, aggregateCpuPercent(cpu), *memory, disk,
+                           network, gpu, sensors, history);
             }
-            renderView(*cpu, *memory, snapshot.processes, proc_stats,
-                       sort, view, tree, disk, network, gpu, sensors,
-                       systemd, startup, sysinfo, history, show_history,
-                       alerts, alert_filter, service_search, service_sort,
-                       startup_search, startup_sort, packages,
-                       refresh_interval_ms);
+            renderView(aggregateCpuPercent(cpu), *memory, snapshot.processes,
+                       proc_stats, sort, view, tree, disk, network, gpu,
+                       sensors, systemd, startup, sysinfo, history,
+                       show_history, alerts, alert_filter, service_search,
+                       service_sort, startup_search, startup_sort, packages,
+                       refresh_interval_ms, cpu);
           }
         }
         continue;
@@ -5309,8 +5440,8 @@ int main() {
         break;
     }
 
-    const auto cpu = cpu_monitor.readUsage();
-    if (!cpu.has_value()) {
+    cpu = cpu_details.read();
+    if (!cpu.proc_stat_readable) {
       std::cerr << "\nERROR: could not read CPU usage from /proc/stat\n";
       return EXIT_FAILURE;
     }
@@ -5339,7 +5470,7 @@ int main() {
       std::vector<std::pair<std::string, double>> temps;
       buildGpuMetricVectors(gpu, gpu_utils, gpu_vrams);
       buildTemperatureVector(sensors, temps);
-      history.update(*cpu, memory->usagePercent(),
+      history.update(aggregateCpuPercent(cpu), memory->usagePercent(),
                      static_cast<double>(memory->used()),
                      static_cast<double>(memory->available),
                      memory->swapUsagePercent(),
@@ -5348,15 +5479,17 @@ int main() {
                      static_cast<double>(network.total_rx_bytes_per_second),
                      static_cast<double>(network.total_tx_bytes_per_second),
                      gpu_utils, gpu_vrams, temps);
+      history.updateCpuHistories(cpuHistoryVector(cpu));
       history.updateProcessStats(proc_stats);
-      updateAlerts(alerts, *cpu, *memory, disk, network, gpu, sensors, history);
+      updateAlerts(alerts, aggregateCpuPercent(cpu), *memory, disk, network,
+                   gpu, sensors, history);
     }
 
-    renderView(*cpu, *memory, snapshot.processes, proc_stats, sort, view,
-               tree, disk, network, gpu, sensors, systemd, startup, sysinfo,
-               history, show_history, alerts, alert_filter, service_search,
-               service_sort, startup_search, startup_sort, packages,
-               refresh_interval_ms);
+    renderView(aggregateCpuPercent(cpu), *memory, snapshot.processes, proc_stats,
+               sort, view, tree, disk, network, gpu, sensors, systemd, startup,
+               sysinfo, history, show_history, alerts, alert_filter,
+               service_search, service_sort, startup_search, startup_sort,
+               packages, refresh_interval_ms, cpu);
   }
 
   // Clean shutdown: persist any pending settings changes.
