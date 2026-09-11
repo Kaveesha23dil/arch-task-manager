@@ -5,7 +5,7 @@ Linux. It reads system information **directly from Linux interfaces** such as
 `/proc/stat`, `/proc/meminfo`, and `/proc/<pid>/` — no shelling out to `ps`,
 `free`, `top`, `htop`, or other external tools.
 
-> Stage: **Step 35** — CPU, RAM, swap, process monitoring, process actions, the
+> Stage: **Step 36** — CPU, RAM, swap, process monitoring, process actions, the
 > process tree, disk/storage monitoring, network monitoring, GPU monitoring,
 > temperature & hardware sensor monitoring, systemd service management,
 > startup application management, system information / hardware overview,
@@ -38,7 +38,7 @@ Linux. It reads system information **directly from Linux interfaces** such as
 > and governors, hotplug-safe sampling that re-baselines on counter
 > resets and keeps CPU identity stable across online/offline changes,
 > and per-CPU utilization history fed through the existing graph
-> system.
+> system, and advanced memory monitoring with a detailed RAM breakdown.
 > Everything else on the roadmap is intentionally **not** implemented yet, but
 > the code is structured so future modules can be added without rewriting the
 > existing ones.
@@ -446,6 +446,34 @@ feature per milestone, hosted on GitHub.
       UI) keeps the same identity across online/offline changes. Everything is
       read-only — no frequency or governor changes are ever made — and no shell
       commands are used.
+- [x] **Advanced memory monitoring** — an `AdvancedMemoryMonitor` reads
+      `/proc/meminfo` and `/proc/swaps` once per refresh and derives a detailed
+      RAM breakdown while the existing overview, alerts and process table keep
+      using the same `MemoryInfo` view via `toMemoryInfo()`. A lenient parser
+      records every named field (`MemTotal`, `Cached`, `SReclaimable`,
+      `CommitLimit`, `HugePages_*`, unknown fields kept for forward
+      compatibility) while never conflating a missing field, a present zero, an
+      unknown unit, a unit-less page count (HugePages_*), and a malformed or
+      overflowing value. The `## MEMORY DETAILS` section shows memory
+      composition (buffers, cached, reclaimable, unreclaimable, anonymous,
+      file-backed, shared, active, inactive, kernel stack, page tables) plus
+      activity & kernel accounting (active/inactive by anon/file, unevictable,
+      mlocked, slab, mapped, writeback, and a kernel memory estimate of
+      Slab + KernelStack + PageTables). `## SWAP` extends the existing overview
+      with swap cache and a per-area table (area, type, size, used, priority)
+      parsed from `/proc/swaps` with space-tolerant paths and signed
+      priorities. `## COMMITMENT` (virtual, not resident) shows
+      Committed_AS/CommitLimit usage, and `## HUGE PAGES` shows huge-page,
+      direct-map and THP counters when the kernel reports them. Every derived
+      metric is bounded (clamped to [0, 100] for percentages, never negative,
+      NaN or infinite); available memory falls back to a documented estimate
+      (MemFree + Buffers + Cached) when `MemAvailable` is absent. New history
+      graphs cover available memory %, used RAM (kB), cached (B), reclaimable
+      (B) and commitment %, each skipping samples when the metric is
+      unavailable. Everything is read-only — swap is never enabled/disabled/
+      resized and huge-page configuration is never changed — no shell commands
+      are used, and the monitor never spawns its own thread or reads either
+      file more than once per refresh.
 
 ### Planned
 

@@ -26,7 +26,11 @@ HistoryManager::HistoryManager(std::size_t max_samples)
       aggregate_cpu_(max_samples),
       aggregate_rss_(max_samples),
       creation_rate_(max_samples),
-      exit_rate_(max_samples) {}
+      exit_rate_(max_samples),
+      memory_available_percent_(max_samples),
+      cached_bytes_(max_samples),
+      reclaimable_bytes_(max_samples),
+      commitment_percent_(max_samples) {}
 
 void HistoryManager::syncGpuHistories(
     const std::vector<std::pair<std::string, double>>& utilizations) {
@@ -129,6 +133,10 @@ void HistoryManager::clearAll() {
   aggregate_rss_.clear();
   creation_rate_.clear();
   exit_rate_.clear();
+  memory_available_percent_.clear();
+  cached_bytes_.clear();
+  reclaimable_bytes_.clear();
+  commitment_percent_.clear();
   for (auto& g : gpus_) {
     g.utilization.clear();
     g.vram_usage.clear();
@@ -212,6 +220,41 @@ void HistoryManager::updateCpuHistories(
       cpus_[i].utilization.addSample(
           TimedSample{now, cpu_utilizations[i].second});
     }
+  }
+}
+
+void HistoryManager::updateAdvancedMemory(
+    const AdvancedMemoryMetrics &metrics) {
+  if (paused_) {
+    return;
+  }
+  if (!metrics.available_percent.has_value() &&
+      !metrics.cached_bytes.has_value() &&
+      !metrics.reclaimable_bytes.has_value() &&
+      !metrics.commitment_percent.has_value()) {
+    return;  // nothing available this refresh — no empty samples
+  }
+
+  const auto now = std::chrono::steady_clock::now();
+
+  if (metrics.available_percent.has_value() &&
+      std::isfinite(*metrics.available_percent)) {
+    memory_available_percent_.addSample(
+        TimedSample{now, *metrics.available_percent});
+  }
+  if (metrics.cached_bytes.has_value() &&
+      std::isfinite(*metrics.cached_bytes)) {
+    cached_bytes_.addSample(TimedSample{now, *metrics.cached_bytes});
+  }
+  if (metrics.reclaimable_bytes.has_value() &&
+      std::isfinite(*metrics.reclaimable_bytes)) {
+    reclaimable_bytes_.addSample(
+        TimedSample{now, *metrics.reclaimable_bytes});
+  }
+  if (metrics.commitment_percent.has_value() &&
+      std::isfinite(*metrics.commitment_percent)) {
+    commitment_percent_.addSample(
+        TimedSample{now, *metrics.commitment_percent});
   }
 }
 

@@ -35,6 +35,7 @@ pkg_check_modules(ALPM REQUIRED libalpm)
 add_executable(arch-task-manager
   src/main.cpp
   src/advanced_cpu_monitor.cpp
+  src/advanced_memory_monitor.cpp
   src/cpu_monitor.cpp
   src/memory_monitor.cpp
   src/process_monitor.cpp
@@ -291,3 +292,18 @@ target_include_directories(advanced-cpu-monitor-tests PRIVATE include)
 target_link_libraries(advanced-cpu-monitor-tests PRIVATE Threads::Threads)
 
 add_test(NAME advanced-cpu-monitor COMMAND advanced-cpu-monitor-tests)
+
+add_executable(advanced-memory-monitor-tests
+  tests/advanced_memory_monitor_tests.cpp
+  src/advanced_memory_monitor.cpp
+  src/memory_monitor.cpp
+  src/resource_history.cpp
+  src/history_manager.cpp
+  src/logger.cpp
+)
+
+target_include_directories(advanced-memory-monitor-tests PRIVATE include)
+
+target_link_libraries(advanced-memory-monitor-tests PRIVATE Threads::Threads)
+
+add_test(NAME advanced-memory-monitor COMMAND advanced-memory-monitor-tests)

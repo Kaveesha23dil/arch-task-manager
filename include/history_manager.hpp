@@ -3,6 +3,7 @@
 #include <chrono>
 #include <cstddef>
 #include <deque>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -38,6 +39,16 @@ struct CpuHistory {
   ResourceHistory<TimedSample> utilization{0};
 };
 
+/// Optional advanced-memory metric values for one refresh. `std::nullopt`
+/// means the metric is unavailable for that refresh (missing / unsupported
+/// kernel field), which simply skips the sample instead of recording garbage.
+struct AdvancedMemoryMetrics {
+  std::optional<double> available_percent;
+  std::optional<double> cached_bytes;
+  std::optional<double> reclaimable_bytes;
+  std::optional<double> commitment_percent;
+};
+
 /// Aggregates all system-level resource histories. It stores already-computed
 /// values from the existing monitors; it never reads /proc or /sys itself.
 class HistoryManager {
@@ -64,6 +75,12 @@ class HistoryManager {
   /// idleness/removal. Called once per refresh alongside update().
   void updateCpuHistories(
       const std::vector<std::pair<int, double>>& cpu_utilizations);
+
+  /// Appends one sample for each available advanced-memory metric (available
+  /// percent, cached, reclaimable, commitment). Unavailable metrics contribute
+  /// no sample, so a metric that disappears mid-run simply stops plotting.
+  /// Called once per refresh alongside update(); timestamped consistently.
+  void updateAdvancedMemory(const AdvancedMemoryMetrics& metrics);
 
   /// Resets all history buffers.
   void clearAll();
@@ -101,6 +118,20 @@ class HistoryManager {
   const std::vector<SensorHistory>& sensorHistories() const { return sensors_; }
   const std::vector<CpuHistory>& cpuHistories() const { return cpus_; }
 
+  // Advanced memory histories.
+  const ResourceHistory<TimedSample>& memoryAvailablePercentHistory() const {
+    return memory_available_percent_;
+  }
+  const ResourceHistory<TimedSample>& cachedBytesHistory() const {
+    return cached_bytes_;
+  }
+  const ResourceHistory<TimedSample>& reclaimableBytesHistory() const {
+    return reclaimable_bytes_;
+  }
+  const ResourceHistory<TimedSample>& commitmentPercentHistory() const {
+    return commitment_percent_;
+  }
+
   std::size_t maxSamples() const { return max_samples_; }
 
  private:
@@ -129,6 +160,12 @@ class HistoryManager {
   std::vector<GpuHistory> gpus_;
   std::vector<SensorHistory> sensors_;
   std::vector<CpuHistory> cpus_;
+
+  // Advanced memory histories.
+  ResourceHistory<TimedSample> memory_available_percent_;
+  ResourceHistory<TimedSample> cached_bytes_;
+  ResourceHistory<TimedSample> reclaimable_bytes_;
+  ResourceHistory<TimedSample> commitment_percent_;
 
   bool paused_ = false;
 
