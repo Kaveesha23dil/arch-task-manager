@@ -49,6 +49,21 @@ struct AdvancedMemoryMetrics {
   std::optional<double> commitment_percent;
 };
 
+/// Optional system-pressure values (10-second some/full averages) for one
+/// refresh. `std::nullopt` means that pressure line/metric was unavailable for
+/// that refresh (PSI unsupported, file unreadable, or the kernel did not
+/// report it); such metrics simply skip the sample instead of plotting zeros.
+/// 60/300-second windows and cumulative totals stay in the pressure detail
+/// table; only the 10-second averages are graphed to avoid graph clutter.
+struct PressureMetrics {
+  std::optional<double> cpu_some;
+  std::optional<double> cpu_full;
+  std::optional<double> memory_some;
+  std::optional<double> memory_full;
+  std::optional<double> io_some;
+  std::optional<double> io_full;
+};
+
 /// Aggregates all system-level resource histories. It stores already-computed
 /// values from the existing monitors; it never reads /proc or /sys itself.
 class HistoryManager {
@@ -81,6 +96,13 @@ class HistoryManager {
   /// no sample, so a metric that disappears mid-run simply stops plotting.
   /// Called once per refresh alongside update(); timestamped consistently.
   void updateAdvancedMemory(const AdvancedMemoryMetrics& metrics);
+
+  /// Appends one sample for each available system-pressure 10-second average
+  /// (some/full per category). A missing metric contributes no sample, so a
+  /// metric that disappears mid-run simply stops plotting instead of drawing a
+  /// fake zero. Called once per refresh alongside update(); timestamped
+  /// consistently with a single clock read for the whole batch.
+  void updatePressure(const PressureMetrics& metrics);
 
   /// Resets all history buffers.
   void clearAll();
@@ -132,6 +154,26 @@ class HistoryManager {
     return commitment_percent_;
   }
 
+  // System pressure (PSI) 10-second some/full average histories.
+  const ResourceHistory<TimedSample>& cpuPressureSomeHistory() const {
+    return cpu_pressure_some_;
+  }
+  const ResourceHistory<TimedSample>& cpuPressureFullHistory() const {
+    return cpu_pressure_full_;
+  }
+  const ResourceHistory<TimedSample>& memoryPressureSomeHistory() const {
+    return memory_pressure_some_;
+  }
+  const ResourceHistory<TimedSample>& memoryPressureFullHistory() const {
+    return memory_pressure_full_;
+  }
+  const ResourceHistory<TimedSample>& ioPressureSomeHistory() const {
+    return io_pressure_some_;
+  }
+  const ResourceHistory<TimedSample>& ioPressureFullHistory() const {
+    return io_pressure_full_;
+  }
+
   std::size_t maxSamples() const { return max_samples_; }
 
  private:
@@ -166,6 +208,14 @@ class HistoryManager {
   ResourceHistory<TimedSample> cached_bytes_;
   ResourceHistory<TimedSample> reclaimable_bytes_;
   ResourceHistory<TimedSample> commitment_percent_;
+
+  // System pressure (PSI) histories for the 10-second some/full averages.
+  ResourceHistory<TimedSample> cpu_pressure_some_;
+  ResourceHistory<TimedSample> cpu_pressure_full_;
+  ResourceHistory<TimedSample> memory_pressure_some_;
+  ResourceHistory<TimedSample> memory_pressure_full_;
+  ResourceHistory<TimedSample> io_pressure_some_;
+  ResourceHistory<TimedSample> io_pressure_full_;
 
   bool paused_ = false;
 

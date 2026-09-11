@@ -60,6 +60,7 @@
 #include "app_autostart_manager.hpp"
 #include "startup_manager.hpp"
 #include "system_info.hpp"
+#include "system_pressure_monitor.hpp"
 #include "systemd_manager.hpp"
 
 namespace {
@@ -470,6 +471,22 @@ atm::AdvancedMemoryMetrics buildAdvancedMemoryMetrics(
   return metrics;
 }
 
+/// Builds the system-pressure history sample for a snapshot. Only the
+/// 10-second some/full averages are graphed (60/300-second windows and totals
+/// live in the pressure detail table). Values that are unavailable stay unset
+/// so the history manager skips the sample instead of plotting garbage.
+atm::PressureMetrics buildPressureMetrics(
+    const atm::SystemPressureSnapshot &pressure) {
+  atm::PressureMetrics metrics;
+  metrics.cpu_some = pressure.cpu.some.avg10;
+  metrics.cpu_full = pressure.cpu.full.avg10;
+  metrics.memory_some = pressure.memory.some.avg10;
+  metrics.memory_full = pressure.memory.full.avg10;
+  metrics.io_some = pressure.io.some.avg10;
+  metrics.io_full = pressure.io.full.avg10;
+  return metrics;
+}
+
 /// Renders the ADVANCED CPU section of the live view: the total-CPU time
 /// breakdown followed by one row per logical CPU. Frequencies are the values
 /// the kernel currently reports and may be shared by CPUs on the same policy;
@@ -793,6 +810,41 @@ void renderResourceHistorySection(std::ostringstream &out,
   if (!history.commitmentPercentHistory().empty()) {
     out << "\n[COMMITMENT Usage]\n" << atm::GraphRenderer::renderText(
         history.commitmentPercentHistory(), percent, "", "%") << '\n';
+  }
+
+  // System pressure (PSI) — 10-second averages. Only metrics that have data
+  // are graphed; unavailable categories simply have no graph.
+  {
+    const auto renderPressureHist =
+        [&](const char *title,
+            const atm::ResourceHistory<atm::TimedSample> &h) {
+          if (!h.empty()) {
+            out << "\n" << title << "\n"
+                << atm::GraphRenderer::renderText(h, percent, "", "%")
+                << '\n';
+          }
+        };
+    bool any_pressure = !history.cpuPressureSomeHistory().empty() ||
+                        !history.cpuPressureFullHistory().empty() ||
+                        !history.memoryPressureSomeHistory().empty() ||
+                        !history.memoryPressureFullHistory().empty() ||
+                        !history.ioPressureSomeHistory().empty() ||
+                        !history.ioPressureFullHistory().empty();
+    if (any_pressure) {
+      out << "\n[SYSTEM PRESSURE]\n";
+      renderPressureHist("CPU Pressure Some",
+                         history.cpuPressureSomeHistory());
+      renderPressureHist("CPU Pressure Full",
+                         history.cpuPressureFullHistory());
+      renderPressureHist("Memory Pressure Some",
+                         history.memoryPressureSomeHistory());
+      renderPressureHist("Memory Pressure Full",
+                         history.memoryPressureFullHistory());
+      renderPressureHist("I/O Pressure Some",
+                         history.ioPressureSomeHistory());
+      renderPressureHist("I/O Pressure Full",
+                         history.ioPressureFullHistory());
+    }
   }
 
   // Disk throughput (auto-scaling, MB-scale).
@@ -1185,6 +1237,136 @@ std::string formatCelsius(double celsius) {
   std::ostringstream out;
   out << std::fixed << std::setprecision(1) << celsius << " °C";
   return out.str();
+}
+
+constexpr std::size_t kPressureResourceWidth = 8;
+constexpr std::size_t kPressureTypeWidth = 5;
+constexpr std::size_t kPressureAvgWidth = 6;
+constexpr std::size_t kPressureTotalWidth = 10;
+
+/// Formats a PSI percentage average for display in the pressure table.
+std::string formatPressureAvg(const std::optional<double> &avg) {
+  if (!avg.has_value()) {
+    return "N/A";
+  }
+  return formatPercent(*avg) + "%";
+}
+
+/// Formats a cumulative PSI stalled-time total stored in microseconds.
+/// Values are scaled to the largest human-readable unit for compactness.
+/// PSI `total` is documented by the kernel to be in microseconds and is NOT a
+/// wall-clock second count.
+std::string formatPressureTotalMicroseconds(
+    const std::optional<std::uint64_t> &total) {
+  if (!total.has_value()) {
+    return "N/A";
+  }
+  std::ostringstream out;
+  const std::uint64_t usec = *total;
+  if (usec < 1'000) {
+    out << usec << " \u00b5s";
+  } else if (usec < 1'000'000) {
+    out << std::fixed << std::setprecision(2) << (usec / 1'000.0) << " ms";
+  } else if (usec < 1'000'000ULL * 3'600) {
+    out << std::fixed << std::setprecision(2) << (usec / 1'000'000.0) << " s";
+  } else {
+    out << std::fixed << std::setprecision(1)
+        << (usec / (1'000'000.0 * 3'600)) << " h";
+  }
+  return out.str();
+}
+
+/// Small glyph for a pressure severity indicator in the summary view.
+const char *pressureSeverityGlyph(atm::PressureSeverity severity) {
+  switch (severity) {
+    case atm::PressureSeverity::Normal:   return "\u25cb";  // ○
+    case atm::PressureSeverity::Elevated: return "\u25b2";  // ▲
+    case atm::PressureSeverity::High:     return "\u26a0";   // ⚠
+    case atm::PressureSeverity::Critical: return "\U0001f534";  // 🔴
+  }
+  return "?";
+}
+
+/// Renders one pressure-category summary line showing avg10, severity,
+/// and availability.
+void renderPressureCategorySummary(
+    std::ostringstream &out, const char *name,
+    const atm::PressureCategoryData &data) {
+  out << std::left << std::setw(kPressureResourceWidth) << name << "Some: "
+      << formatPressureAvg(data.some.avg10);
+  if (data.full.line_present) {
+    out << "  Full: " << formatPressureAvg(data.full.avg10);
+  }
+  const std::optional<atm::PressureSeverity> sev =
+      data.some.avg10.has_value()
+          ? atm::classifyPressureSeverity(*data.some.avg10)
+          : (data.full.avg10.has_value()
+                 ? atm::classifyPressureSeverity(*data.full.avg10)
+                 : std::optional<atm::PressureSeverity>{});
+  if (sev.has_value()) {
+    out << "  " << pressureSeverityGlyph(*sev) << " "
+        << atm::pressureSeverityName(*sev);
+  }
+  if (data.status != atm::PressureReadStatus::Read) {
+    out << "  [" << atm::pressureReadStatusName(data.status) << "]";
+  }
+  out << '\n';
+}
+
+/// Renders the SYSTEM PRESSURE section: a three-line summary plus a full
+/// some/full detail table for every category. This section is read-only; PSI
+/// being unavailable shows a soft degradation message.
+void renderPressureSections(std::ostringstream &out,
+                            const atm::SystemPressureSnapshot &pressure) {
+  out << "\n## SYSTEM PRESSURE\n\n";
+  if (!pressure.anyAvailable()) {
+    out << "PSI unavailable — no system pressure data.\n";
+    return;
+  }
+
+  renderPressureCategorySummary(out, "CPU", pressure.cpu);
+  renderPressureCategorySummary(out, "Memory", pressure.memory);
+  renderPressureCategorySummary(out, "I/O", pressure.io);
+
+  out << "\n";
+  out << std::left << std::setw(kPressureResourceWidth) << "Resource"
+      << ' ' << std::left << std::setw(kPressureTypeWidth) << "Type"
+      << std::right << std::setw(kPressureAvgWidth) << "Avg10"
+      << std::setw(kPressureAvgWidth) << "Avg60"
+      << std::setw(kPressureAvgWidth + 1) << "Avg300"
+      << std::setw(kPressureTotalWidth) << "Total\n";
+
+  // Build a row for one metric (some or full) of one category. Rows for
+  // metrics whose line was never present are shown with "N/A" cells.
+  const auto renderRow =
+      [&](const char *resource, const char *type,
+          const atm::PressureMetric &metric) {
+        out << std::left << std::setw(kPressureResourceWidth) << resource
+            << ' ' << std::left << std::setw(kPressureTypeWidth) << type;
+        out << std::right << std::setw(kPressureAvgWidth)
+            << formatPressureAvg(metric.avg10)
+            << std::setw(kPressureAvgWidth)
+            << formatPressureAvg(metric.avg60)
+            << std::setw(kPressureAvgWidth + 1)
+            << formatPressureAvg(metric.avg300)
+            << std::setw(kPressureTotalWidth)
+            << formatPressureTotalMicroseconds(metric.total)
+            << '\n';
+      };
+
+  renderRow("CPU", "Some", pressure.cpu.some);
+  if (pressure.cpu.full.line_present || pressure.cpu.some.line_present) {
+    renderRow("CPU", "Full", pressure.cpu.full);
+  }
+  renderRow("Memory", "Some", pressure.memory.some);
+  if (pressure.memory.full.line_present || pressure.memory.some.line_present) {
+    renderRow("Memory", "Full", pressure.memory.full);
+  }
+  renderRow("I/O", "Some", pressure.io.some);
+  if (pressure.io.full.line_present || pressure.io.some.line_present) {
+    renderRow("I/O", "Full", pressure.io.full);
+  }
+  out << '\n';
 }
 
 /// Best display name for a GPU temperature sensor: resolves the hwmon device
@@ -2983,6 +3165,7 @@ std::string renderFrame(double cpu_usage, const atm::MemoryInfo &memory,
                         const atm::NetworkSnapshot &network,
                         const atm::GpuSnapshot &gpu,
                         const atm::SensorSnapshot &sensors,
+                        const atm::SystemPressureSnapshot &pressure,
                         const atm::SystemdSnapshot &systemd,
                         const atm::StartupSnapshot &startup,
                          const atm::SystemInfo &sysinfo,
@@ -3012,6 +3195,7 @@ std::string renderFrame(double cpu_usage, const atm::MemoryInfo &memory,
   if (show_history) {
     renderResourceHistorySection(out, history);
   }
+  renderPressureSections(out, pressure);
   renderStorageSections(out, disk);
   renderNetworkSections(out, network);
   renderGpuSections(out, gpu);
@@ -3058,6 +3242,7 @@ void renderView(double cpu_usage, const atm::MemoryInfo &memory,
                 const atm::NetworkSnapshot &network,
                 const atm::GpuSnapshot &gpu,
                 const atm::SensorSnapshot &sensors,
+                const atm::SystemPressureSnapshot &pressure,
                 const atm::SystemdSnapshot &systemd,
                 const atm::StartupSnapshot &startup,
                  const atm::SystemInfo &sysinfo,
@@ -3077,7 +3262,7 @@ void renderView(double cpu_usage, const atm::MemoryInfo &memory,
   // refreshes in place instead of scrolling the terminal.
   std::cout << "\033[2J\033[H";
   std::cout << renderFrame(cpu_usage, memory, processes, stats, sort, view, tree,
-                           disk, network, gpu, sensors, systemd, startup,
+                           disk, network, gpu, sensors, pressure, systemd, startup,
                            sysinfo, history, show_history, alerts, alert_filter,
                            service_search, service_sort, startup_search,
                            startup_sort, packages, refresh_interval_ms,
@@ -5313,6 +5498,7 @@ int main() {
   atm::NetworkMonitor network_monitor;
   atm::GpuMonitor gpu_monitor;
   atm::SensorMonitor sensor_monitor;
+  atm::SystemPressureMonitor pressure_monitor;
   atm::SystemdManager systemd_manager;
   atm::StartupManager startup_manager;
   atm::SystemInfoProvider system_info;
@@ -5400,6 +5586,7 @@ int main() {
   sensor_monitor.discover();
   static_cast<void>(sensor_monitor.read());
   systemd_manager.discover();
+  static_cast<void>(pressure_monitor.read());
   std::this_thread::sleep_for(std::chrono::milliseconds(refresh_interval_ms));
 
   atm::AdvancedCpuSnapshot cpu = cpu_details.read();
@@ -5419,6 +5606,7 @@ int main() {
   const atm::NetworkSnapshot first_network = network_monitor.read();
   const atm::GpuSnapshot first_gpu = gpu_monitor.read();
   const atm::SensorSnapshot first_sensors = sensor_monitor.read();
+  const atm::SystemPressureSnapshot first_pressure = pressure_monitor.read();
   const atm::SystemdSnapshot first_systemd = systemd_manager.read();
   const atm::StartupSnapshot first_startup = startup_manager.read();
   system_info.load(first_gpu);
@@ -5448,6 +5636,7 @@ int main() {
                    gpu_utils, gpu_vrams, temps);
     history.updateCpuHistories(cpuHistoryVector(cpu));
     history.updateAdvancedMemory(buildAdvancedMemoryMetrics(memory));
+    history.updatePressure(buildPressureMetrics(first_pressure));
     history.updateProcessStats(proc_stats);
     updateAlerts(alerts, aggregateCpuPercent(cpu), first_memory, first_disk,
                  first_network, first_gpu, first_sensors, history);
@@ -5455,14 +5644,15 @@ int main() {
 
   renderView(aggregateCpuPercent(cpu), first_memory, snapshot.processes,
              proc_stats, sort, view, tree, first_disk, first_network, first_gpu,
-             first_sensors, first_systemd, first_startup, sysinfo, history,
-             show_history, alerts, alert_filter, service_search, service_sort,
-             startup_search, startup_sort, packages, refresh_interval_ms, cpu,
-             memory);
+             first_sensors, first_pressure, first_systemd, first_startup,
+             sysinfo, history, show_history, alerts, alert_filter,
+             service_search, service_sort, startup_search, startup_sort,
+             packages, refresh_interval_ms, cpu, memory);
 
   atm::NetworkSnapshot network = first_network;
   atm::GpuSnapshot gpu = first_gpu;
   atm::SensorSnapshot sensors = first_sensors;
+  atm::SystemPressureSnapshot pressure = first_pressure;
   atm::SystemdSnapshot systemd = first_systemd;
   atm::StartupSnapshot startup = first_startup;
 
@@ -5546,7 +5736,7 @@ int main() {
             }
             renderView(aggregateCpuPercent(cpu), mem_info, snapshot.processes,
                        proc_stats, sort, view, tree, disk, network, gpu,
-                       sensors, systemd, startup, sysinfo, history,
+                       sensors, pressure, systemd, startup, sysinfo, history,
                        show_history, alerts, alert_filter, service_search,
                        service_sort, startup_search, startup_sort, packages,
                        refresh_interval_ms, cpu, memory);
@@ -5649,6 +5839,7 @@ int main() {
     network = network_monitor.read();
     gpu = gpu_monitor.read();
     sensors = sensor_monitor.read();
+    pressure = pressure_monitor.read();
     systemd = systemd_manager.read();
     startup = startup_manager.read();
 
@@ -5669,14 +5860,15 @@ int main() {
                      gpu_utils, gpu_vrams, temps);
       history.updateCpuHistories(cpuHistoryVector(cpu));
       history.updateAdvancedMemory(buildAdvancedMemoryMetrics(memory));
+      history.updatePressure(buildPressureMetrics(pressure));
       history.updateProcessStats(proc_stats);
       updateAlerts(alerts, aggregateCpuPercent(cpu), mem_info, disk, network,
                    gpu, sensors, history);
     }
 
     renderView(aggregateCpuPercent(cpu), mem_info, snapshot.processes, proc_stats,
-               sort, view, tree, disk, network, gpu, sensors, systemd, startup,
-               sysinfo, history, show_history, alerts, alert_filter,
+               sort, view, tree, disk, network, gpu, sensors, pressure, systemd,
+               startup, sysinfo, history, show_history, alerts, alert_filter,
                service_search, service_sort, startup_search, startup_sort,
                packages, refresh_interval_ms, cpu, memory);
   }

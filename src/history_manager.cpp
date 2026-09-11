@@ -30,7 +30,13 @@ HistoryManager::HistoryManager(std::size_t max_samples)
       memory_available_percent_(max_samples),
       cached_bytes_(max_samples),
       reclaimable_bytes_(max_samples),
-      commitment_percent_(max_samples) {}
+      commitment_percent_(max_samples),
+      cpu_pressure_some_(max_samples),
+      cpu_pressure_full_(max_samples),
+      memory_pressure_some_(max_samples),
+      memory_pressure_full_(max_samples),
+      io_pressure_some_(max_samples),
+      io_pressure_full_(max_samples) {}
 
 void HistoryManager::syncGpuHistories(
     const std::vector<std::pair<std::string, double>>& utilizations) {
@@ -137,6 +143,12 @@ void HistoryManager::clearAll() {
   cached_bytes_.clear();
   reclaimable_bytes_.clear();
   commitment_percent_.clear();
+  cpu_pressure_some_.clear();
+  cpu_pressure_full_.clear();
+  memory_pressure_some_.clear();
+  memory_pressure_full_.clear();
+  io_pressure_some_.clear();
+  io_pressure_full_.clear();
   for (auto& g : gpus_) {
     g.utilization.clear();
     g.vram_usage.clear();
@@ -255,6 +267,38 @@ void HistoryManager::updateAdvancedMemory(
       std::isfinite(*metrics.commitment_percent)) {
     commitment_percent_.addSample(
         TimedSample{now, *metrics.commitment_percent});
+  }
+}
+
+void HistoryManager::updatePressure(const PressureMetrics &metrics) {
+  if (paused_) {
+    return;
+  }
+  if (!metrics.cpu_some.has_value() && !metrics.cpu_full.has_value() &&
+      !metrics.memory_some.has_value() && !metrics.memory_full.has_value() &&
+      !metrics.io_some.has_value() && !metrics.io_full.has_value()) {
+    return;  // nothing available this refresh — no empty samples
+  }
+
+  const auto now = std::chrono::steady_clock::now();
+
+  if (metrics.cpu_some.has_value() && std::isfinite(*metrics.cpu_some)) {
+    cpu_pressure_some_.addSample(TimedSample{now, *metrics.cpu_some});
+  }
+  if (metrics.cpu_full.has_value() && std::isfinite(*metrics.cpu_full)) {
+    cpu_pressure_full_.addSample(TimedSample{now, *metrics.cpu_full});
+  }
+  if (metrics.memory_some.has_value() && std::isfinite(*metrics.memory_some)) {
+    memory_pressure_some_.addSample(TimedSample{now, *metrics.memory_some});
+  }
+  if (metrics.memory_full.has_value() && std::isfinite(*metrics.memory_full)) {
+    memory_pressure_full_.addSample(TimedSample{now, *metrics.memory_full});
+  }
+  if (metrics.io_some.has_value() && std::isfinite(*metrics.io_some)) {
+    io_pressure_some_.addSample(TimedSample{now, *metrics.io_some});
+  }
+  if (metrics.io_full.has_value() && std::isfinite(*metrics.io_full)) {
+    io_pressure_full_.addSample(TimedSample{now, *metrics.io_full});
   }
 }
 
