@@ -31,6 +31,13 @@ struct SensorHistory {
   ResourceHistory<TimedSample> temperature{0};
 };
 
+/// Stores a bounded per-logical-CPU utilization history. CPU identity is the
+/// logical CPU ID, so hotplugged/offlined CPUs never alias each other.
+struct CpuHistory {
+  int cpu_id = -1;
+  ResourceHistory<TimedSample> utilization{0};
+};
+
 /// Aggregates all system-level resource histories. It stores already-computed
 /// values from the existing monitors; it never reads /proc or /sys itself.
 class HistoryManager {
@@ -50,6 +57,13 @@ class HistoryManager {
   /// Appends the system-wide process statistics to the process histories.
   /// Respects the same pause / max-samples behavior as update().
   void updateProcessStats(const SystemProcessStatistics &stats);
+
+  /// Appends one per-CPU utilization sample each for every CPU in the vector,
+  /// keyed by logical CPU ID. CPUs not in the vector (offline/newly appearing)
+  /// keep their existing history; a vanished CPU keeps its final sample until
+  /// idleness/removal. Called once per refresh alongside update().
+  void updateCpuHistories(
+      const std::vector<std::pair<int, double>>& cpu_utilizations);
 
   /// Resets all history buffers.
   void clearAll();
@@ -85,6 +99,7 @@ class HistoryManager {
 
   const std::vector<GpuHistory>& gpuHistories() const { return gpus_; }
   const std::vector<SensorHistory>& sensorHistories() const { return sensors_; }
+  const std::vector<CpuHistory>& cpuHistories() const { return cpus_; }
 
   std::size_t maxSamples() const { return max_samples_; }
 
@@ -113,6 +128,7 @@ class HistoryManager {
 
   std::vector<GpuHistory> gpus_;
   std::vector<SensorHistory> sensors_;
+  std::vector<CpuHistory> cpus_;
 
   bool paused_ = false;
 
@@ -121,6 +137,7 @@ class HistoryManager {
       const std::vector<std::pair<std::string, double>>& utilizations);
   void syncSensorHistories(
       const std::vector<std::pair<std::string, double>>& temperatures);
+  void syncCpuHistories(const std::vector<int>& cpu_ids);
 };
 
 }  // namespace atm

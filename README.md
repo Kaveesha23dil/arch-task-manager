@@ -5,7 +5,7 @@ Linux. It reads system information **directly from Linux interfaces** such as
 `/proc/stat`, `/proc/meminfo`, and `/proc/<pid>/` — no shelling out to `ps`,
 `free`, `top`, `htop`, or other external tools.
 
-> Stage: **Step 34** — CPU, RAM, swap, process monitoring, process actions, the
+> Stage: **Step 35** — CPU, RAM, swap, process monitoring, process actions, the
 > process tree, disk/storage monitoring, network monitoring, GPU monitoring,
 > temperature & hardware sensor monitoring, systemd service management,
 > startup application management, system information / hardware overview,
@@ -31,7 +31,14 @@ Linux. It reads system information **directly from Linux interfaces** such as
 > aggregates the whole process population (counts by state, threads,
 > CPU time, resident memory, I/O throughput, plus process
 > creation/exit rates tracked across refreshes) in a single O(N)
-> pass over the existing process snapshot.
+> pass over the existing process snapshot, advanced CPU monitoring with
+> aggregate and per-CPU utilization breakdowns (user, nice, system,
+> I/O wait, IRQ, softirq, steal, idle), online/offline CPU state from
+> the sysfs cpu topology, optional reads of cpufreq scaling frequencies
+> and governors, hotplug-safe sampling that re-baselines on counter
+> resets and keeps CPU identity stable across online/offline changes,
+> and per-CPU utilization history fed through the existing graph
+> system.
 > Everything else on the roadmap is intentionally **not** implemented yet, but
 > the code is structured so future modules can be added without rewriting the
 > existing ones.
@@ -419,6 +426,26 @@ feature per milestone, hosted on GitHub.
       overwritten or deleted. On every launch the persisted preference is
       reconciled with the file on disk, and the current on-disk state is always
       shown on the settings page.
+
+- [x] **Advanced CPU monitoring** — an `AdvancedCpuMonitor` reads `/proc/stat`
+      once per refresh and produces both an aggregate and per-logical-CPU
+      utilization breakdown (Busy, User, Nice, System, I/O Wait, IRQ, SoftIRQ,
+      Steal, Idle) as percentages of the elapsed CPU-time delta between two
+      samples, using the same convention as the existing CPU monitor
+      (`idle_time = idle + iowait`, guest time not double-counted). The
+      `## CPU DETAILS` section shows the aggregate breakdown and a per-CPU
+      table (logical ID, `online`/`offline`, usage, user, system, I/O wait,
+      idle, frequency, governor). Online/offline state and CPU enumeration come
+      from the sysfs cpu topology (`/sys/devices/system/cpu/{online,possible,
+      present}`); optional cpufreq reads reuse `scaling_cur_freq` (falling back
+      to `cpuinfo_cur_freq`, treated as kHz) and the scaling governor, and
+      degrade to "N/A" when unavailable — never failing the refresh. Sampling
+      is hotplug-safe: CPU identity is the logical ID (not a vector index),
+      counters that decrease/reset re-baseline without producing a bogus delta,
+      and per-CPU history (fed through the existing graph system, capped in the
+      UI) keeps the same identity across online/offline changes. Everything is
+      read-only — no frequency or governor changes are ever made — and no shell
+      commands are used.
 
 ### Planned
 

@@ -83,6 +83,32 @@ void HistoryManager::syncSensorHistories(
   }
 }
 
+void HistoryManager::syncCpuHistories(const std::vector<int>& cpu_ids) {
+  // Rebuild only when the CPU set changes; existing samples are preserved.
+  bool changed = false;
+  if (cpu_ids.size() != cpus_.size()) {
+    changed = true;
+  } else {
+    for (std::size_t i = 0; i < cpu_ids.size(); ++i) {
+      if (cpus_[i].cpu_id != cpu_ids[i]) {
+        changed = true;
+        break;
+      }
+    }
+  }
+
+  if (changed) {
+    cpus_.clear();
+    cpus_.reserve(cpu_ids.size());
+    for (int cpu_id : cpu_ids) {
+      CpuHistory h;
+      h.cpu_id = cpu_id;
+      h.utilization = ResourceHistory<TimedSample>(max_samples_);
+      cpus_.push_back(std::move(h));
+    }
+  }
+}
+
 void HistoryManager::setPaused(bool paused) { paused_ = paused; }
 
 void HistoryManager::clearAll() {
@@ -110,6 +136,9 @@ void HistoryManager::clearAll() {
   for (auto& s : sensors_) {
     s.temperature.clear();
   }
+  for (auto& c : cpus_) {
+    c.utilization.clear();
+  }
 }
 
 void HistoryManager::setMaxSamples(std::size_t max_samples) {
@@ -118,6 +147,7 @@ void HistoryManager::setMaxSamples(std::size_t max_samples) {
   // Rebuild per-device histories seeded by the next update() call.
   gpus_.clear();
   sensors_.clear();
+  cpus_.clear();
 }
 
 void HistoryManager::update(
@@ -159,6 +189,28 @@ void HistoryManager::update(
   for (std::size_t i = 0; i < temperatures.size() && i < sensors_.size(); ++i) {
     if (!std::isnan(temperatures[i].second)) {
       sensors_[i].temperature.addSample(TimedSample{now, temperatures[i].second});
+    }
+  }
+}
+
+void HistoryManager::updateCpuHistories(
+    const std::vector<std::pair<int, double>>& cpu_utilizations) {
+  if (paused_) {
+    return;
+  }
+
+  const auto now = std::chrono::steady_clock::now();
+
+  std::vector<int> cpu_ids;
+  cpu_ids.reserve(cpu_utilizations.size());
+  for (const auto& util : cpu_utilizations) {
+    cpu_ids.push_back(util.first);
+  }
+  syncCpuHistories(cpu_ids);
+  for (std::size_t i = 0; i < cpu_utilizations.size() && i < cpus_.size(); ++i) {
+    if (std::isfinite(cpu_utilizations[i].second)) {
+      cpus_[i].utilization.addSample(
+          TimedSample{now, cpu_utilizations[i].second});
     }
   }
 }
