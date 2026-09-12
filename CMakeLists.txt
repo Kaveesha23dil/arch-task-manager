@@ -58,6 +58,7 @@ add_executable(arch-task-manager
   src/process_statistics.cpp
   src/disk_monitor.cpp
   src/disk_health.cpp
+  src/filesystem_monitor.cpp
   src/network_monitor.cpp
   src/gpu_monitor.cpp
   src/sensor_monitor.cpp
@@ -358,3 +359,14 @@ target_include_directories(disk-health-tests PRIVATE ${ATASMART_INCLUDE_DIRS})
 target_link_directories(disk-health-tests PRIVATE ${ATASMART_LIBRARY_DIRS})
 
 add_test(NAME disk-health COMMAND disk-health-tests)
+
+add_executable(filesystem-monitor-tests
+  tests/filesystem_monitor_tests.cpp
+  src/filesystem_monitor.cpp
+)
+
+target_include_directories(filesystem-monitor-tests PRIVATE include)
+
+target_link_libraries(filesystem-monitor-tests PRIVATE Threads::Threads)
+
+add_test(NAME filesystem-monitor COMMAND filesystem-monitor-tests)
