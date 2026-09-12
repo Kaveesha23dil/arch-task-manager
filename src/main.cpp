@@ -36,6 +36,7 @@
 #include "logger.hpp"
 #include "memory_monitor.hpp"
 #include "network_monitor.hpp"
+#include "network_interface_details.hpp"
 #include "notification_manager.hpp"
 #include "package_manager.hpp"
 #include "package_transaction.hpp"
@@ -185,6 +186,16 @@ constexpr std::size_t kFsSizeWidth = 9;
 constexpr std::size_t kFsPercentWidth = 6;
 constexpr std::size_t kFsInodeWidth = 8;
 constexpr std::size_t kNetworkInterfaceWidth = 14;
+constexpr std::size_t kIfDetailNameWidth = 16;
+constexpr std::size_t kIfDetailTypeWidth = 10;
+constexpr std::size_t kIfDetailStateWidth = 8;
+constexpr std::size_t kIfDetailCarrierWidth = 8;
+constexpr std::size_t kIfDetailMacWidth = 18;
+constexpr std::size_t kIfDetailMtuWidth = 6;
+constexpr std::size_t kIfDetailSpeedWidth = 12;
+constexpr std::size_t kIfDetailDuplexWidth = 8;
+constexpr std::size_t kIfDetailRateWidth = 11;
+constexpr std::size_t kIfDetailAddrWidth = 22;
 constexpr std::size_t kNetworkRateWidth = 12;
 constexpr std::size_t kNetworkBytesWidth = 10;
 constexpr std::size_t kNetworkStateWidth = 18;
@@ -827,6 +838,85 @@ void renderNetworkSections(std::ostringstream &out,
       << '\n'
       << "Loopback traffic is excluded from the totals."
       << "\nDetailed stats: press 'i' (then Enter)\n";
+}
+
+/// Compact address list for the table (first two, "..." if more).
+std::string renderAddressList(const std::vector<atm::NetworkAddressInfo> &addresses) {
+  std::ostringstream out;
+  const std::size_t shown = addresses.size() > 2 ? 2 : addresses.size();
+  for (std::size_t i = 0; i < shown; ++i) {
+    if (i != 0) {
+      out << ", ";
+    }
+    out << addresses[i].address;
+  }
+  if (addresses.size() > shown) {
+    out << ", ...";
+  }
+  return out.str();
+}
+
+/// Renders the NETWORK INTERFACES table (link metadata + addresses + the same
+/// traffic rates as the NETWORK section). Loopback floats last, matching the
+/// traffic table; rows are stable across renames because selection keys on the
+/// sysfs ifindex, not the name.
+std::string renderNetworkInterfaceTableText(
+    const atm::NetworkInterfaceSnapshot &snapshot) {
+  std::ostringstream out;
+  if (!snapshot.sysfs_readable) {
+    out << "Interface details unavailable: " << snapshot.error_detail << "\n";
+    return out.str();
+  }
+  out << std::left << std::setw(kIfDetailNameWidth) << "Interface"
+      << std::setw(kIfDetailTypeWidth) << "Type"
+      << std::setw(kIfDetailStateWidth) << "State"
+      << std::setw(kIfDetailCarrierWidth) << "Carrier"
+      << std::setw(kIfDetailMacWidth) << "MAC"
+      << std::setw(kIfDetailMtuWidth) << "MTU"
+      << std::setw(kIfDetailSpeedWidth) << "Speed"
+      << std::setw(kIfDetailDuplexWidth) << "Duplex"
+      << std::right << std::setw(kIfDetailRateWidth) << "RX"
+      << std::setw(kIfDetailRateWidth) << "TX" << std::left
+      << std::setw(kIfDetailAddrWidth) << "  Addresses" << '\n';
+  for (const atm::NetworkInterfaceInfo &info : snapshot.interfaces) {
+    const std::uint64_t rx =
+        info.traffic ? info.traffic->rx_bytes_per_second : 0;
+    const std::uint64_t tx =
+        info.traffic ? info.traffic->tx_bytes_per_second : 0;
+    std::string state = fitTo(toUpperAscii(info.link.operstate.value_or("unknown")),
+                              kIfDetailStateWidth);
+    out << std::left << std::setw(kIfDetailNameWidth)
+        << fitTo(info.name, kIfDetailNameWidth)
+        << std::setw(kIfDetailTypeWidth)
+        << atm::networkInterfaceTypeName(info.type)
+        << std::setw(kIfDetailStateWidth) << state
+        << std::setw(kIfDetailCarrierWidth)
+        << atm::formatNetworkCarrier(info.link.carrier)
+        << std::setw(kIfDetailMacWidth)
+        << fitTo(info.link.mac_address.value_or("N/A"), kIfDetailMacWidth)
+        << std::setw(kIfDetailMtuWidth)
+        << (info.link.mtu.has_value() ? std::to_string(*info.link.mtu) : "-")
+        << std::setw(kIfDetailSpeedWidth)
+        << atm::formatNetworkSpeed(info.link.speed_mbps)
+        << std::setw(kIfDetailDuplexWidth)
+        << atm::formatNetworkDuplex(info.link.duplex) << std::right
+        << std::setw(kIfDetailRateWidth) << atm::formatNetworkRate(rx)
+        << std::setw(kIfDetailRateWidth) << atm::formatNetworkRate(tx) << std::left
+        << std::setw(kIfDetailAddrWidth)
+        << "  " + fitTo(renderAddressList(info.addresses), kIfDetailAddrWidth - 2)
+        << '\n';
+  }
+  return out.str();
+}
+
+/// Renders the NETWORK INTERFACES section. The monitor reads sysfs and
+/// getifaddrs() once per tick (from the monitoring loop), so rendering is a
+/// pure read of the cached snapshot.
+void renderNetworkInterfaceSections(std::ostringstream &out,
+                                    const atm::NetworkInterfaceMonitor &monitor) {
+  out << "\n## NETWORK INTERFACES\n\n"
+      << renderNetworkInterfaceTableText(monitor.current())
+      << "\nDetailed info: press 'i' (then Enter)\n";
 }
 
 /// Renders the RESOURCE HISTORY section: live time-series graphs for CPU,
@@ -3847,9 +3937,10 @@ std::string renderFrame(double cpu_usage, const atm::MemoryInfo &memory,
                          const atm::AdvancedCpuSnapshot &cpu_details,
                          const atm::AdvancedMemorySnapshot &memory_details,
                          const atm::DiskHealthMonitor &disk_health,
-                         const atm::FilesystemMonitor &filesystems,
-                         FilesystemFilter fs_filter) {
-  if (view == ViewMode::Tree) {
+const atm::FilesystemMonitor &filesystems,
+                         FilesystemFilter fs_filter,
+                         const atm::NetworkInterfaceMonitor &network_interfaces) {
+   if (view == ViewMode::Tree) {
     // The tree view stays deliberately focused on the hierarchy; the storage
     // and network sections are part of the table view.
     return renderTreeFrame(cpu_usage, memory, tree, refresh_interval_ms);
@@ -3869,6 +3960,7 @@ std::string renderFrame(double cpu_usage, const atm::MemoryInfo &memory,
   renderFilesystemSections(out, filesystems, fs_filter);
   renderDiskHealthSections(out, disk_health);
   renderNetworkSections(out, network);
+  renderNetworkInterfaceSections(out, network_interfaces);
   renderGpuSections(out, gpu);
   renderSensorSections(out, sensors, gpu);
   renderAlertsSections(out, alerts, alert_filter);
@@ -3934,7 +4026,8 @@ const atm::GpuSnapshot &gpu,
                  const atm::AdvancedMemorySnapshot &memory_details,
                  const atm::DiskHealthMonitor &disk_health,
                  const atm::FilesystemMonitor &filesystems,
-                 FilesystemFilter fs_filter) {
+                 FilesystemFilter fs_filter,
+                 const atm::NetworkInterfaceMonitor &network_interfaces) {
   // ANSI "clear entire screen" + "cursor to home" so the multi-line frame
   // refreshes in place instead of scrolling the terminal.
   std::cout << "\033[2J\033[H";
@@ -3944,7 +4037,7 @@ const atm::GpuSnapshot &gpu,
                            alert_filter, service_search, service_sort,
                            startup_search, startup_sort, packages,
                            refresh_interval_ms, cpu_details, memory_details,
-                           disk_health, filesystems, fs_filter)
+                           disk_health, filesystems, fs_filter, network_interfaces)
             << std::flush;
 }
 
@@ -5084,16 +5177,126 @@ void interactProcessDetail(atm::ProcessDetails &details,
   }
 }
 
-/// "i": shows the network table frozen and inspects one interface in detail.
-/// The snapshot is ~1 s old; reading it is safe because NetworkMonitor owns
-/// all the counter state.
+/// Builds the full per-interface page: link metadata from sysfs, addresses,
+/// wireless status, the traffic detail (shared with the NETWORK table) and the
+/// bounded RX/TX rate histories collected by NetworkInterfaceMonitor.
+std::string buildNetworkInterfacePage(
+    const atm::NetworkInterfaceSnapshot &snapshot,
+    const atm::NetworkInterfaceMonitor &monitor,
+    const atm::NetworkInterfaceStats &traffic) {
+  const auto found = std::find_if(
+      snapshot.interfaces.begin(), snapshot.interfaces.end(),
+      [&](const atm::NetworkInterfaceInfo &info) {
+        return info.name == traffic.name;
+      });
+  if (found == snapshot.interfaces.end()) {
+    return "";  // caller prints the "not found" message
+  }
+
+  std::ostringstream out;
+  const atm::NetworkInterfaceInfo &info = *found;
+  const std::string identity = info.identity();
+
+  out << "Interface: " << info.name << "    (identity " << identity << ")\n\n";
+  appendLabeled(out, "  Type:", atm::networkInterfaceTypeName(info.type));
+  appendLabeled(out, "  Ifindex:",
+                info.link.ifindex.has_value() ? std::to_string(*info.link.ifindex)
+                                               : "unavailable");
+  appendLabeled(out, "  Admin:",
+                info.link.admin_up ? "up" : "down");
+  appendLabeled(out, "  State:", info.link.operstate.value_or("unknown"));
+  appendLabeled(out, "  Carrier:", atm::formatNetworkCarrier(info.link.carrier));
+  if (info.link.mac_address.has_value()) {
+    appendLabeled(out, "  MAC address:", *info.link.mac_address);
+  }
+  if (info.link.mtu.has_value()) {
+    appendLabeled(out, "  MTU:", std::to_string(*info.link.mtu));
+  }
+  appendLabeled(out, "  Link speed:", atm::formatNetworkSpeed(info.link.speed_mbps));
+  appendLabeled(out, "  Duplex:", atm::formatNetworkDuplex(info.link.duplex));
+  if (info.link.flags.has_value()) {
+    appendLabeled(out, "  Flags:",
+                  atm::formatInterfaceFlagsRaw(info.link.flags) + " " +
+                      atm::formatInterfaceFlagNames(*info.link.flags));
+  }
+  if (!info.error.empty()) {
+    appendLabeled(out, "  Note:", info.error);
+  }
+
+  out << "\nAddresses\n";
+  if (info.addresses.empty()) {
+    out << "  none\n";
+  }
+  for (const atm::NetworkAddressInfo &address : info.addresses) {
+    std::ostringstream line;
+    line << "  " << address.address;
+    if (address.prefix_length.has_value()) {
+      line << "/" << *address.prefix_length;
+    }
+    if (address.netmask.has_value()) {
+      line << "  (netmask " << *address.netmask << ")";
+    }
+    if (address.broadcast.has_value()) {
+      line << "  broadcast " << *address.broadcast;
+    }
+    out << line.str() << '\n';
+  }
+
+  out << "\nWireless\n";
+  if (!info.wireless.present) {
+    out << "  not a wireless interface\n";
+  } else {
+    std::ostringstream line;
+    line << "  link ";
+    if (info.wireless.link.has_value()) {
+      line << *info.wireless.link << "%";
+    } else {
+      line << "N/A";
+    }
+    if (info.wireless.level.has_value()) {
+      line << "  signal " << *info.wireless.level << " dBm";
+    }
+    if (info.wireless.noise.has_value()) {
+      line << "  noise " << *info.wireless.noise << " dBm";
+    }
+    out << line.str() << '\n';
+  }
+
+  out << "\nTraffic\n" << buildInterfaceDetail(traffic);
+
+  atm::GraphConfig rate;
+  rate.width = 40;
+  rate.height = 6;
+  rate.dynamic_scale = true;
+
+  const atm::InterfaceHistory *history = monitor.historyFor(identity);
+  if (history != nullptr && !history->rx_bytes_per_second.empty()) {
+    out << "\nRX rate history\n"
+        << atm::GraphRenderer::renderText(history->rx_bytes_per_second, rate,
+                                          "RX rate", "B/s")
+        << '\n'
+        << "\nTX rate history\n"
+        << atm::GraphRenderer::renderText(history->tx_bytes_per_second, rate,
+                                          "TX rate", "B/s")
+        << '\n';
+  } else {
+    out << "\nRate history: not available (no measured traffic yet).\n";
+  }
+  return out.str();
+}
+
+/// "i": shows the network tables frozen and inspects one interface in detail.
+/// The snapshots are ~1 s old; reading them is safe because NetworkMonitor and
+/// NetworkInterfaceMonitor own all the counter/discovery state.
 void interactNetworkDetail(const atm::NetworkSnapshot &network,
+                           const atm::NetworkInterfaceMonitor &interfaces,
                            ConsoleInput &input) {
   std::cout << "\033[2J\033[H";
+  const atm::NetworkInterfaceSnapshot &iface_snapshot = interfaces.current();
   std::cout << "========================================\n"
                "ARCH TASK MANAGER — Network Interface Detail\n"
                "========================================\n\n"
-            << renderNetworkTableText(network) << "\n\n"
+            << renderNetworkInterfaceTableText(iface_snapshot) << "\n\n"
             << "Enter interface name to inspect (blank to cancel):\n> "
             << std::flush;
 
@@ -5119,7 +5322,14 @@ void interactNetworkDetail(const atm::NetworkSnapshot &network,
     return;
   }
 
-  std::cout << '\n' << buildInterfaceDetail(*found)
+  const std::string page = buildNetworkInterfacePage(iface_snapshot, interfaces,
+                                                     *found);
+  if (page.empty()) {
+    std::cout << "Interface does not exist (not found in the current "
+                 "interface list).\n";
+    return;
+  }
+  std::cout << '\n' << page
             << "\n\nPress Enter to return to the live view.\n" << std::flush;
   static_cast<void>(input.readLine());  // wait for the user, EOF cancels
 }
@@ -6342,6 +6552,7 @@ int main() {
   atm::DiskMonitor disk_monitor;
   atm::DiskHealthMonitor disk_health;
   atm::FilesystemMonitor filesystem_monitor;
+  atm::NetworkInterfaceMonitor network_interface_details;
   atm::NetworkMonitor network_monitor;
   atm::GpuMonitor gpu_monitor;
   atm::SensorMonitor sensor_monitor;
@@ -6366,6 +6577,8 @@ int main() {
   atm::cfg::applySettingsToRuntime(settings.settings(), refresh_interval_ms,
                                    history, alerts, notifications);
   filesystem_monitor.setHistoryMaxSamples(
+      static_cast<std::size_t>(settings.settings().history.max_samples));
+  network_interface_details.setHistoryMaxSamples(
       static_cast<std::size_t>(settings.settings().history.max_samples));
 
   // Forward alert state transitions to desktop notifications.
@@ -6470,6 +6683,7 @@ int main() {
 
   const atm::DiskSnapshot first_disk = disk_monitor.read();
   const atm::NetworkSnapshot first_network = network_monitor.read();
+  static_cast<void>(network_interface_details.read(first_network));
   const atm::GpuSnapshot first_gpu = gpu_monitor.read();
   const atm::SensorSnapshot first_sensors = sensor_monitor.read();
   const atm::SystemPressureSnapshot first_pressure = pressure_monitor.read();
@@ -6516,7 +6730,7 @@ int main() {
              first_startup, sysinfo, history, show_history, alerts, alert_filter,
              service_search, service_sort, startup_search, startup_sort,
              packages, refresh_interval_ms, cpu, memory, disk_health,
-             filesystem_monitor, fs_filter);
+             filesystem_monitor, fs_filter, network_interface_details);
 
   atm::NetworkSnapshot network = first_network;
   atm::GpuSnapshot gpu = first_gpu;
@@ -6574,6 +6788,7 @@ int main() {
             const atm::MemoryInfo mem_info = memory.toMemoryInfo();
             const atm::DiskSnapshot disk = disk_monitor.read();
             const atm::NetworkSnapshot network = network_monitor.read();
+            static_cast<void>(network_interface_details.read(network));
             static_cast<void>(filesystem_monitor.read());
             gpu = gpu_monitor.read();
             sensors = sensor_monitor.read();
@@ -6611,7 +6826,8 @@ int main() {
                        history, show_history, alerts, alert_filter,
                        service_search, service_sort, startup_search,
                        startup_sort, packages, refresh_interval_ms, cpu,
-                       memory, disk_health, filesystem_monitor, fs_filter);
+                       memory, disk_health, filesystem_monitor, fs_filter,
+                       network_interface_details);
           }
         }
         continue;
@@ -6625,7 +6841,7 @@ int main() {
         break;
       case ConsoleInput::Command::InspectNetwork:
         if (view == ViewMode::List) {
-          interactNetworkDetail(network, input);
+          interactNetworkDetail(network, network_interface_details, input);
         }
         break;
       case ConsoleInput::Command::InspectDiskHealth:
@@ -6677,6 +6893,8 @@ int main() {
                            notifications, autostart, input);
           filesystem_monitor.setHistoryMaxSamples(
               static_cast<std::size_t>(settings.settings().history.max_samples));
+          network_interface_details.setHistoryMaxSamples(
+              static_cast<std::size_t>(settings.settings().history.max_samples));
         }
         break;
       case ConsoleInput::Command::ToggleHistory:
@@ -6696,6 +6914,8 @@ int main() {
               settings.settings(), refresh_interval_ms, history, alerts,
               notifications);
           filesystem_monitor.setHistoryMaxSamples(
+              static_cast<std::size_t>(settings.settings().history.max_samples));
+          network_interface_details.setHistoryMaxSamples(
               static_cast<std::size_t>(settings.settings().history.max_samples));
         }
         break;
@@ -6723,6 +6943,7 @@ int main() {
         process_statistics.update(snapshot);
     const atm::DiskSnapshot disk = disk_monitor.read();
     network = network_monitor.read();
+    static_cast<void>(network_interface_details.read(network));
     static_cast<void>(filesystem_monitor.read());
     gpu = gpu_monitor.read();
     sensors = sensor_monitor.read();
@@ -6760,7 +6981,7 @@ int main() {
                systemd, startup, sysinfo, history, show_history, alerts,
                alert_filter, service_search, service_sort, startup_search,
                startup_sort, packages, refresh_interval_ms, cpu, memory,
-               disk_health, filesystem_monitor, fs_filter);
+               disk_health, filesystem_monitor, fs_filter, network_interface_details);
   }
 
   // Clean shutdown: persist any pending settings changes.
