@@ -29,6 +29,7 @@
 #include "cpu_monitor.hpp"
 #include "disk_health.hpp"
 #include "disk_monitor.hpp"
+#include "filesystem_monitor.hpp"
 #include "format_bytes.hpp"
 #include "gpu_monitor.hpp"
 #include "history_manager.hpp"
@@ -105,6 +106,61 @@ AlertFilter nextAlertFilter(AlertFilter filter) {
   return AlertFilter::All;
 }
 
+/// Filter controlling which mounts the FILESYSTEMS table shows. The underlying
+/// FilesystemMonitor model never drops mounts; this only affects the view.
+enum class FilesystemFilter {
+  All,        // every discovered mount
+  Physical,   // real on-disk storage only (default — matches the legacy table)
+  Network,    // nfs, cifs, 9p, sshfs, ...
+  Temporary,  // tmpfs / ramfs
+  Virtual,    // pseudo-filesystems (proc, sysfs, cgroup, ...) + overlay/container
+};
+
+/// Human-readable name of a FilesystemFilter.
+const char *filesystemFilterName(FilesystemFilter filter) {
+  switch (filter) {
+    case FilesystemFilter::All:       return "All";
+    case FilesystemFilter::Physical:  return "Physical";
+    case FilesystemFilter::Network:   return "Network";
+    case FilesystemFilter::Temporary: return "Temporary";
+    case FilesystemFilter::Virtual:   return "Virtual";
+  }
+  return "All";
+}
+
+/// Returns the next FilesystemFilter when the cycling key is pressed.
+FilesystemFilter nextFilesystemFilter(FilesystemFilter filter) {
+  switch (filter) {
+    case FilesystemFilter::All:       return FilesystemFilter::Physical;
+    case FilesystemFilter::Physical:  return FilesystemFilter::Network;
+    case FilesystemFilter::Network:   return FilesystemFilter::Temporary;
+    case FilesystemFilter::Temporary: return FilesystemFilter::Virtual;
+    case FilesystemFilter::Virtual:   return FilesystemFilter::All;
+  }
+  return FilesystemFilter::All;
+}
+
+/// True when the filter lets `info` through. Purely a view concern.
+bool filesystemFilterAccepts(FilesystemFilter filter,
+                             const atm::FilesystemInfo &info) {
+  switch (filter) {
+    case FilesystemFilter::All:
+      return true;
+    case FilesystemFilter::Physical:
+      return info.classification == atm::FilesystemClass::Physical;
+    case FilesystemFilter::Network:
+      return info.classification == atm::FilesystemClass::Network;
+    case FilesystemFilter::Temporary:
+      return info.classification == atm::FilesystemClass::Temporary;
+    case FilesystemFilter::Virtual:
+      return info.classification == atm::FilesystemClass::Pseudo ||
+             info.classification == atm::FilesystemClass::Overlay ||
+             info.classification == atm::FilesystemClass::Container ||
+             info.classification == atm::FilesystemClass::Unknown;
+  }
+  return false;
+}
+
 constexpr int kPercentPrecision = 1;
 constexpr int kPercentWidth = 5;
 constexpr int kLabelWidth = 21;
@@ -121,6 +177,13 @@ constexpr std::size_t kHealthTempWidth = 9;
 constexpr std::size_t kHealthPowerOnWidth = 11;
 constexpr std::size_t kHealthRefreshWidth = 20;
 constexpr std::size_t kHealthAttributeNameWidth = 26;
+constexpr std::size_t kFsMountWidth = 24;
+constexpr std::size_t kFsTypeWidth = 10;
+constexpr std::size_t kFsSourceWidth = 18;
+constexpr std::size_t kFsAccessWidth = 12;
+constexpr std::size_t kFsSizeWidth = 9;
+constexpr std::size_t kFsPercentWidth = 6;
+constexpr std::size_t kFsInodeWidth = 8;
 constexpr std::size_t kNetworkInterfaceWidth = 14;
 constexpr std::size_t kNetworkRateWidth = 12;
 constexpr std::size_t kNetworkBytesWidth = 10;
@@ -686,37 +749,13 @@ std::string renderSystemInfoDetail(const atm::SystemInfo &info) {
   return out.str();
 }
 
-/// Renders the STORAGE (physical filesystem capacities), DISK ACTIVITY
-/// (aggregate read/write rates) and DEVICES (whole physical disks) sections.
-/// Only physical mounts are shown; virtual/temporary/network mounts are
-/// counted on one summary line so /proc, /sys, tmpfs etc. are never mistaken
-/// for disk capacity (Step 6).
+/// Renders the DISK ACTIVITY (aggregate read/write rates) and DEVICES (whole
+/// physical disks) sections. Detailed filesystem capacity moved to the
+/// dedicated FILESYSTEMS section (Step 40); the alert feed still uses the
+/// DiskMonitor's own filesystem capacities.
 void renderStorageSections(std::ostringstream &out,
                            const atm::DiskSnapshot &disk) {
-  out << "\n## STORAGE\n\n"
-      << "FILESYSTEMS\n\n"
-      << std::left << std::setw(kStorageMountWidth) << "## Mount Point"
-      << std::right << std::setw(10) << "Total" << std::setw(10) << "Used"
-      << std::setw(10) << "Free" << "   Type\n";
-  if (disk.filesystems.empty()) {
-    out << "No filesystems available.\n";
-  } else {
-    for (const atm::DiskUsage &fs : disk.filesystems) {
-      const std::string mount =
-          fs.mount_point.size() <= kStorageMountWidth
-              ? fs.mount_point
-              : fs.mount_point.substr(0, kStorageMountWidth);
-      out << std::left << std::setw(kStorageMountWidth) << mount << std::right
-          << std::setw(10) << atm::formatBytes(fs.total_bytes) << std::setw(10)
-          << atm::formatBytes(fs.used_bytes) << std::setw(10)
-          << atm::formatBytes(fs.available_bytes) << "   "
-          << atm::diskFsTypeName(fs.type) << '\n';
-    }
-  }
-  out << "Excluded: " << disk.excluded_mounts
-      << " virtual/temporary/network mount(s)\n";
-
-  out << "\n---\n\n## DISK ACTIVITY\n\n";
+  out << "\n## STORAGE\n\n## DISK ACTIVITY\n\n";
   appendLabeled(out, "Read:",
                 atm::formatBytes(disk.total_read_bytes_per_second) + "/s");
   appendLabeled(out, "Write:",
@@ -2477,6 +2516,222 @@ std::string renderDiskHealthDetailText(
   return out.str();
 }
 
+/// Renders a percentage value or "N/A" when the mount reports none (e.g. there
+/// are no inodes to measure). Raw value; the caller pads the column.
+std::string formatFsPercent(const std::optional<double> &percent) {
+  if (!percent.has_value()) {
+    return "N/A";
+  }
+  std::ostringstream o;
+  o << std::fixed << std::setprecision(1) << *percent << '%';
+  return o.str();
+}
+
+/// Renders a byte count or "-" when unavailable. Values are never zeroed; a
+/// missing figure stays visibly unavailable (Step 40).
+std::string formatFsBytes(const std::optional<std::uint64_t> &bytes) {
+  if (!bytes.has_value()) {
+    return "-";
+  }
+  return atm::formatBytes(*bytes);
+}
+
+/// Renders the access (read-only?) column for a mount.
+std::string formatFsAccess(atm::MountAccess access) {
+  switch (access) {
+    case atm::MountAccess::ReadWrite: return "rw";
+    case atm::MountAccess::ReadOnly:  return "ro";
+    case atm::MountAccess::Unknown:   return "?";
+  }
+  return "?";
+}
+
+/// Renders the FILESYSTEMS table into `out`, honoring `filter`. Returns the
+/// number of rows drawn so callers can report "shown of total". Rows are
+/// stable: sorted by (mount ID, mount point) so they never reorder each tick.
+std::size_t renderFilesystemTable(std::ostringstream &out,
+                                  const atm::FilesystemSnapshot &snapshot,
+                                  FilesystemFilter filter) {
+  std::vector<const atm::FilesystemInfo *> rows;
+  for (const atm::FilesystemInfo &info : snapshot.filesystems) {
+    if (!filesystemFilterAccepts(filter, info)) {
+      continue;
+    }
+    rows.push_back(&info);
+  }
+  std::sort(rows.begin(), rows.end(),
+            [](const atm::FilesystemInfo *a, const atm::FilesystemInfo *b) {
+              if (a->mount.mount_id != b->mount.mount_id) {
+                return a->mount.mount_id < b->mount.mount_id;
+              }
+              return a->mount.mount_point < b->mount.mount_point;
+            });
+
+  out << std::left << std::setw(kFsMountWidth) << "MOUNT POINT" << std::right
+      << std::setw(kFsTypeWidth) << "TYPE" << std::setw(kFsSourceWidth)
+      << "SOURCE" << std::setw(kFsAccessWidth) << "READ-ONLY"
+      << std::setw(kFsSizeWidth) << "TOTAL" << std::setw(kFsSizeWidth) << "USED"
+      << std::setw(kFsSizeWidth) << "AVAIL" << std::setw(kFsPercentWidth)
+      << "USED%" << std::setw(kFsInodeWidth) << "INODES%"
+      << "   STATUS\n";
+  for (const atm::FilesystemInfo *info : rows) {
+    out << std::left << std::setw(kFsMountWidth)
+        << fitTo(info->mount.mount_point, kFsMountWidth) << std::right
+        << std::setw(kFsTypeWidth)
+        << fitTo(info->mount.filesystem_type, kFsTypeWidth)
+        << std::setw(kFsSourceWidth)
+        << fitTo(info->mount.mount_source, kFsSourceWidth)
+        << std::setw(kFsAccessWidth) << formatFsAccess(info->access)
+        << std::setw(kFsSizeWidth) << formatFsBytes(info->capacity.total_bytes)
+        << std::setw(kFsSizeWidth) << formatFsBytes(info->capacity.used_bytes)
+        << std::setw(kFsSizeWidth)
+        << formatFsBytes(info->capacity.available_bytes)
+        << std::setw(kFsPercentWidth)
+        << formatFsPercent(info->capacity.usage_percentage)
+        << std::setw(kFsInodeWidth)
+        << formatFsPercent(info->capacity.inode_usage_percentage)
+        << "   "
+        << (info->error == atm::FilesystemError::None
+                ? "ok"
+                : ((std::string)atm::filesystemErrorName(info->error) + " (" +
+                   info->error_detail + ")"))
+        << '\n';
+  }
+  return rows.size();
+}
+
+/// Renders the FILESYSTEMS section of the live view above the process table.
+/// Reads only the already-captured snapshot; never touches /proc here.
+void renderFilesystemSections(std::ostringstream &out,
+                              const atm::FilesystemMonitor &monitor,
+                              FilesystemFilter filter) {
+  out << "\n## FILESYSTEMS\n\n";
+  const atm::FilesystemSnapshot &snapshot = monitor.current();
+  if (!snapshot.mountinfo_readable) {
+    out << "No filesystem data (could not read /proc/self/mountinfo).\n\n";
+    out << "Filter: " << filesystemFilterName(filter)
+        << " (0 shown of 0 mounts)\n"
+        << "Detailed filesystems: press 'w' (then Enter)\n";
+    return;
+  }
+  const std::size_t shown =
+      renderFilesystemTable(out, snapshot, filter);
+  if (shown == 0) {
+    out << "No mounts match this filter.\n";
+  }
+  out << "Filter: " << filesystemFilterName(filter) << " (" << shown
+      << " shown of " << snapshot.filesystems.size() << " mounts)\n"
+      << "Detailed filesystems: press 'w' (then Enter)\n";
+}
+
+/// Formats inode totals as "TOTAL (used free)" or "-" when the mount exposes
+/// no inode accounting (Step 40 never fabricates a zero).
+std::string formatFsInodes(const atm::FilesystemCapacity &capacity) {
+  if (!capacity.total_inodes.has_value()) {
+    return "-";
+  }
+  std::ostringstream o;
+  o << *capacity.total_inodes;
+  if (capacity.used_inodes.has_value()) {
+    o << " (used " << *capacity.used_inodes;
+    if (capacity.free_inodes.has_value()) {
+      o << ", free " << *capacity.free_inodes;
+    }
+    o << ')';
+  }
+  return o.str();
+}
+
+/// Renders the per-mount filesystem detail screen: identification, mount
+/// options, capacity and inode figures, read-only state, classification,
+/// error state and history graphs (Step 40).
+std::string renderFilesystemDetailText(const atm::FilesystemInfo &info,
+                                       const atm::FilesystemMonitor &monitor) {
+  std::ostringstream out;
+  const std::string rule(30, '-');
+  out << "MOUNT\n" << rule << "\n";
+  appendLabeled(out, "Mount point:",
+                info.mount.mount_point.empty() ? "-" : info.mount.mount_point);
+  appendLabeled(out, "Mount ID:", std::to_string(info.mount.mount_id));
+  appendLabeled(out, "Parent ID:", std::to_string(info.mount.parent_id));
+  appendLabeled(out, "Device:",
+                std::to_string(info.mount.major) + ":" +
+                    std::to_string(info.mount.minor));
+  appendLabeled(out, "Root:",
+                info.mount.root.empty() ? "-" : info.mount.root);
+  appendLabeled(out, "Source:",
+                info.mount.mount_source.empty() ? "-" : info.mount.mount_source);
+  appendLabeled(out, "Filesystem type:",
+                info.mount.filesystem_type.empty() ? "-"
+                                                   : info.mount.filesystem_type);
+  appendLabeled(out, "Classification:",
+                atm::filesystemClassName(info.classification));
+  appendLabeled(out, "Access:", atm::mountAccessName(info.access));
+  appendLabeled(out, "Mount options:",
+                info.mount.mount_options.empty() ? "-" : info.mount.mount_options);
+  appendLabeled(out, "Super options:",
+                info.mount.super_options.empty() ? "-" : info.mount.super_options);
+  if (!info.mount.optional_fields.empty()) {
+    std::string joined;
+    for (const std::string &field : info.mount.optional_fields) {
+      if (!joined.empty()) {
+        joined += ", ";
+      }
+      joined += field;
+    }
+    appendLabeled(out, "Optional fields:", joined);
+  }
+
+  out << "\nCAPACITY\n" << rule << "\n";
+  appendLabeled(out, "Total:", formatFsBytes(info.capacity.total_bytes));
+  appendLabeled(out, "Used:", formatFsBytes(info.capacity.used_bytes));
+  appendLabeled(out, "Free:", formatFsBytes(info.capacity.free_bytes));
+  appendLabeled(out, "Available:", formatFsBytes(info.capacity.available_bytes));
+  appendLabeled(out, "Used percentage:", formatFsPercent(info.capacity.usage_percentage));
+  appendLabeled(out, "Available percentage:", formatFsPercent(info.capacity.available_percentage));
+  appendLabeled(out, "Inodes total:", formatFsInodes(info.capacity));
+  appendLabeled(out, "Inode usage:", formatFsPercent(info.capacity.inode_usage_percentage));
+
+  out << "\nREFRESH\n" << rule << "\n";
+  appendLabeled(out, "Refreshed at:", formatTimestamp(info.refreshed_at));
+  if (info.error != atm::FilesystemError::None) {
+    appendLabeled(out, "Error:", atm::filesystemErrorName(info.error));
+    appendLabeled(out, "Detail:", info.error_detail);
+  }
+
+  out << "\nSAMPLE HISTORY\n" << rule << "\n";
+  const atm::FilesystemHistory *history = monitor.historyFor(info.identity());
+  if (history == nullptr) {
+    out << "No history is tracked for this mount.\n";
+  } else {
+    atm::GraphConfig graph;
+    graph.width = 40;
+    graph.height = 5;
+    graph.dynamic_scale = false;
+    if (!history->usage_percent.empty()) {
+      out << "\n[USED %]\n"
+          << atm::GraphRenderer::renderText(history->usage_percent, graph,
+                                            info.mount.mount_point, "%")
+          << '\n';
+    }
+    atm::GraphConfig bytes_graph = graph;
+    bytes_graph.dynamic_scale = true;
+    if (!history->available_bytes.empty()) {
+      out << "\n[AVAILABLE]\n"
+          << atm::GraphRenderer::renderText(history->available_bytes, bytes_graph,
+                                            info.mount.mount_point, "B")
+          << '\n';
+    }
+    if (!history->inode_usage_percent.empty()) {
+      out << "\n[INODES %]\n"
+          << atm::GraphRenderer::renderText(history->inode_usage_percent, graph,
+                                            info.mount.mount_point, "%")
+          << '\n';
+    }
+  }
+  return out.str();
+}
+
 /// Formats a duration in seconds as "Xd Xh Xm Xs" (omitting empty leading
 /// units).
 std::string formatDuration(std::uint64_t seconds) {
@@ -3591,7 +3846,9 @@ std::string renderFrame(double cpu_usage, const atm::MemoryInfo &memory,
                          int refresh_interval_ms,
                          const atm::AdvancedCpuSnapshot &cpu_details,
                          const atm::AdvancedMemorySnapshot &memory_details,
-                         const atm::DiskHealthMonitor &disk_health) {
+                         const atm::DiskHealthMonitor &disk_health,
+                         const atm::FilesystemMonitor &filesystems,
+                         FilesystemFilter fs_filter) {
   if (view == ViewMode::Tree) {
     // The tree view stays deliberately focused on the hierarchy; the storage
     // and network sections are part of the table view.
@@ -3609,6 +3866,7 @@ std::string renderFrame(double cpu_usage, const atm::MemoryInfo &memory,
   }
   renderPressureSections(out, pressure);
   renderStorageSections(out, disk);
+  renderFilesystemSections(out, filesystems, fs_filter);
   renderDiskHealthSections(out, disk_health);
   renderNetworkSections(out, network);
   renderGpuSections(out, gpu);
@@ -3635,6 +3893,7 @@ std::string renderFrame(double cpu_usage, const atm::MemoryInfo &memory,
       << "Details: press 'd' (then Enter) to inspect a process in detail\n"
 << "Network detail: press 'i' (then Enter) to inspect an interface\n"
        << "Disk health: press 'h' (then Enter) to inspect disk health\n"
+       << "Filesystems: press 'w' (then Enter) to inspect filesystems\n"
        << "GPU detail: press 'g' (then Enter) to inspect a GPU\n"
       << "Sensor detail: press 's' (then Enter) to inspect a sensor\n"
 << "Systemd services: press 'u' (then Enter) to manage services\n"
@@ -3673,7 +3932,9 @@ const atm::GpuSnapshot &gpu,
                  int refresh_interval_ms,
                  const atm::AdvancedCpuSnapshot &cpu_details,
                  const atm::AdvancedMemorySnapshot &memory_details,
-                 const atm::DiskHealthMonitor &disk_health) {
+                 const atm::DiskHealthMonitor &disk_health,
+                 const atm::FilesystemMonitor &filesystems,
+                 FilesystemFilter fs_filter) {
   // ANSI "clear entire screen" + "cursor to home" so the multi-line frame
   // refreshes in place instead of scrolling the terminal.
   std::cout << "\033[2J\033[H";
@@ -3683,7 +3944,7 @@ const atm::GpuSnapshot &gpu,
                            alert_filter, service_search, service_sort,
                            startup_search, startup_sort, packages,
                            refresh_interval_ms, cpu_details, memory_details,
-                           disk_health)
+                           disk_health, filesystems, fs_filter)
             << std::flush;
 }
 
@@ -3746,6 +4007,7 @@ class ConsoleInput {
     InspectProcess,
     InspectNetwork,
     InspectDiskHealth,
+    InspectFilesystems,
     InspectGpu,
     InspectSensors,
     InspectSystemd,
@@ -3855,6 +4117,7 @@ class ConsoleInput {
     if (token == "d" || token == "D") return Command::InspectProcess;
     if (token == "i" || token == "I") return Command::InspectNetwork;
     if (token == "h" || token == "H") return Command::InspectDiskHealth;
+    if (token == "w" || token == "W") return Command::InspectFilesystems;
     if (token == "g" || token == "G") return Command::InspectGpu;
     if (token == "s" || token == "S") return Command::InspectSensors;
     if (token == "u" || token == "U") return Command::InspectSystemd;
@@ -3932,6 +4195,96 @@ void interactDiskHealth(atm::DiskHealthMonitor &disk_health,
                 << name << "\n"
                 << "========================================\n\n"
                 << renderDiskHealthDetailText(*entry)
+                << "\n\nPress Enter to return.\n"
+                << std::flush;
+      static_cast<void>(input.readLine());
+      continue;
+    }
+    std::cout << "Invalid action. Press Enter to return.\n" << std::flush;
+    static_cast<void>(input.readLine());
+  }
+}
+
+/// "w": freezes the FILESYSTEMS table, cycles the view filter, and inspects
+/// one mount point in detail (mount/options, capacity/inodes, history graphs).
+/// The snapshot is ~1 s old; reading it is safe because FilesystemMonitor
+/// owns all capture state.
+void interactFilesystems(const atm::FilesystemMonitor &monitor,
+                         FilesystemFilter &filter, ConsoleInput &input) {
+  for (;;) {
+    std::cout << "\033[2J\033[H";
+    std::cout << "========================================\n"
+                 "ARCH TASK MANAGER — Filesystems Detail\n"
+                 "========================================\n\n";
+    const atm::FilesystemSnapshot &snapshot = monitor.current();
+    if (!snapshot.mountinfo_readable) {
+      std::cout << "No filesystem data (could not read "
+                   "/proc/self/mountinfo).\n\n";
+      std::cout << "[0] Cancel\n> " << std::flush;
+      const std::optional<std::string> cancel = input.readLine();
+      if (!cancel || trimWhitespace(*cancel) == "0" ||
+          trimWhitespace(*cancel).empty()) {
+        return;
+      }
+      continue;
+    }
+    std::ostringstream table;
+    const std::size_t shown = renderFilesystemTable(table, snapshot, filter);
+    if (shown == 0) {
+      table << "No mounts match this filter.\n";
+    }
+    table << "Filter: " << filesystemFilterName(filter) << " (" << shown
+          << " shown of " << snapshot.filesystems.size() << " mounts)\n";
+    std::cout << table.str() << "\n"
+              << "[1] Cycle filter (current: "
+              << filesystemFilterName(filter) << ")\n"
+              << "[2] Inspect a mount point\n"
+              << "[0] Cancel\n"
+              << "> " << std::flush;
+
+    const std::optional<std::string> line = input.readLine();
+    if (!line) {
+      std::cout << "\nInput cancelled.\n";
+      return;
+    }
+    const std::string choice = trimWhitespace(*line);
+    if (choice.empty() || choice == "0") {
+      return;
+    }
+    if (choice == "1") {
+      filter = nextFilesystemFilter(filter);
+      continue;
+    }
+    if (choice == "2") {
+      const std::optional<std::string> mount_line = input.readLine();
+      if (!mount_line) {
+        std::cout << "\nInput cancelled.\n";
+        return;
+      }
+      const std::string mount = trimWhitespace(*mount_line);
+      if (mount.empty()) {
+        continue;
+      }
+      const atm::FilesystemInfo *info = nullptr;
+      for (const atm::FilesystemInfo &candidate : snapshot.filesystems) {
+        if (candidate.mount.mount_point == mount) {
+          info = &candidate;
+          break;
+        }
+      }
+      if (info == nullptr) {
+        std::cout << "\nUnknown mount point '" << mount
+                  << "'. Press Enter to return.\n"
+                  << std::flush;
+        static_cast<void>(input.readLine());
+        continue;
+      }
+      std::cout << "\033[2J\033[H";
+      std::cout << "========================================\n"
+                   "ARCH TASK MANAGER — Filesystem: "
+                << mount << "\n"
+                << "========================================\n\n"
+                << renderFilesystemDetailText(*info, monitor)
                 << "\n\nPress Enter to return.\n"
                 << std::flush;
       static_cast<void>(input.readLine());
@@ -5988,6 +6341,7 @@ int main() {
   atm::ProcessStatisticsAggregator process_statistics;
   atm::DiskMonitor disk_monitor;
   atm::DiskHealthMonitor disk_health;
+  atm::FilesystemMonitor filesystem_monitor;
   atm::NetworkMonitor network_monitor;
   atm::GpuMonitor gpu_monitor;
   atm::SensorMonitor sensor_monitor;
@@ -6011,6 +6365,8 @@ int main() {
   // Apply the loaded settings to the runtime components and to the main loop.
   atm::cfg::applySettingsToRuntime(settings.settings(), refresh_interval_ms,
                                    history, alerts, notifications);
+  filesystem_monitor.setHistoryMaxSamples(
+      static_cast<std::size_t>(settings.settings().history.max_samples));
 
   // Forward alert state transitions to desktop notifications.
   g_notification_manager = &notifications;
@@ -6046,6 +6402,7 @@ int main() {
   std::string package_search;
   bool show_history = true;
   AlertFilter alert_filter = AlertFilter::All;
+  FilesystemFilter fs_filter = FilesystemFilter::Physical;
 
   // Choose the starting view. EOF (e.g. /dev/null stdin) defaults to the
   // configured default page. "1"/"2" always win over the setting.
@@ -6090,6 +6447,11 @@ int main() {
   // from the 'h' page only.
   disk_health.setDevices(atm::listWholeDisks());
   static_cast<void>(disk_health.requestRefresh(true));
+
+  // First filesystem capture: parsed /proc/self/mountinfo + statvfs for every
+  // mount. Must happen before the first frame so the FILESYSTEMS section and
+  // history have real data.
+  static_cast<void>(filesystem_monitor.read());
 
   std::this_thread::sleep_for(std::chrono::milliseconds(refresh_interval_ms));
 
@@ -6153,7 +6515,8 @@ int main() {
              first_sensors, first_pressure, first_load, first_systemd,
              first_startup, sysinfo, history, show_history, alerts, alert_filter,
              service_search, service_sort, startup_search, startup_sort,
-             packages, refresh_interval_ms, cpu, memory, disk_health);
+             packages, refresh_interval_ms, cpu, memory, disk_health,
+             filesystem_monitor, fs_filter);
 
   atm::NetworkSnapshot network = first_network;
   atm::GpuSnapshot gpu = first_gpu;
@@ -6211,6 +6574,7 @@ int main() {
             const atm::MemoryInfo mem_info = memory.toMemoryInfo();
             const atm::DiskSnapshot disk = disk_monitor.read();
             const atm::NetworkSnapshot network = network_monitor.read();
+            static_cast<void>(filesystem_monitor.read());
             gpu = gpu_monitor.read();
             sensors = sensor_monitor.read();
             systemd = systemd_manager.read();
@@ -6247,7 +6611,7 @@ int main() {
                        history, show_history, alerts, alert_filter,
                        service_search, service_sort, startup_search,
                        startup_sort, packages, refresh_interval_ms, cpu,
-                       memory, disk_health);
+                       memory, disk_health, filesystem_monitor, fs_filter);
           }
         }
         continue;
@@ -6267,6 +6631,11 @@ int main() {
       case ConsoleInput::Command::InspectDiskHealth:
         if (view == ViewMode::List) {
           interactDiskHealth(disk_health, input);
+        }
+        break;
+      case ConsoleInput::Command::InspectFilesystems:
+        if (view == ViewMode::List) {
+          interactFilesystems(filesystem_monitor, fs_filter, input);
         }
         break;
       case ConsoleInput::Command::InspectGpu:
@@ -6306,6 +6675,8 @@ int main() {
         if (view == ViewMode::List) {
           interactSettings(settings, refresh_interval_ms, history, alerts,
                            notifications, autostart, input);
+          filesystem_monitor.setHistoryMaxSamples(
+              static_cast<std::size_t>(settings.settings().history.max_samples));
         }
         break;
       case ConsoleInput::Command::ToggleHistory:
@@ -6324,6 +6695,8 @@ int main() {
           atm::cfg::applySettingsToRuntime(
               settings.settings(), refresh_interval_ms, history, alerts,
               notifications);
+          filesystem_monitor.setHistoryMaxSamples(
+              static_cast<std::size_t>(settings.settings().history.max_samples));
         }
         break;
       case ConsoleInput::Command::None:
@@ -6350,6 +6723,7 @@ int main() {
         process_statistics.update(snapshot);
     const atm::DiskSnapshot disk = disk_monitor.read();
     network = network_monitor.read();
+    static_cast<void>(filesystem_monitor.read());
     gpu = gpu_monitor.read();
     sensors = sensor_monitor.read();
     pressure = pressure_monitor.read();
@@ -6386,7 +6760,7 @@ int main() {
                systemd, startup, sysinfo, history, show_history, alerts,
                alert_filter, service_search, service_sort, startup_search,
                startup_sort, packages, refresh_interval_ms, cpu, memory,
-               disk_health);
+               disk_health, filesystem_monitor, fs_filter);
   }
 
   // Clean shutdown: persist any pending settings changes.
