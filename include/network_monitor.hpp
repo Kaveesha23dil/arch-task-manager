@@ -2,6 +2,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <iosfwd>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -42,6 +43,16 @@ struct NetworkSnapshot {
 /// column is filled from /sys/class/net/<name>/operstate. Returns an empty
 /// vector when the file is unavailable; malformed lines are skipped.
 [[nodiscard]] std::vector<NetworkInterfaceStats> readNetworkStats();
+
+/// Parses the counter columns of /proc/net/dev from an arbitrary text stream
+/// (two header lines, then one line per interface). Fills `name` and the eight
+/// cumulative counters (rx/tx bytes, packets, errors, drops); the `state` and
+/// `loopback` fields are left untouched because they need sysfs, which
+/// readNetworkStats() applies afterwards. Lines are validated: a line without
+/// ':', sixteen non-numeric fields, or an empty interface name is skipped.
+/// Exposes the exact behavior of readNetworkStats() for hermetic unit tests.
+[[nodiscard]] std::vector<NetworkInterfaceStats> parseNetworkStatsText(
+    std::istream &input);
 
 /// Reads /sys/class/net/<name>/operstate. Returns "unknown" when the file
 /// is missing or unreadable so a vanished interface never breaks a read.

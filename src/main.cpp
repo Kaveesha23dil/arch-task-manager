@@ -37,6 +37,7 @@
 #include "memory_monitor.hpp"
 #include "network_monitor.hpp"
 #include "network_interface_details.hpp"
+#include "network_traffic_history.hpp"
 #include "notification_manager.hpp"
 #include "package_manager.hpp"
 #include "package_transaction.hpp"
@@ -917,6 +918,126 @@ void renderNetworkInterfaceSections(std::ostringstream &out,
   out << "\n## NETWORK INTERFACES\n\n"
       << renderNetworkInterfaceTableText(monitor.current())
       << "\nDetailed info: press 'i' (then Enter)\n";
+}
+
+/// Formats a timestamp as "YYYY-MM-DD HH:MM:SS" for the network traffic
+/// "last update" line (defined later in this file alongside the other
+/// formatters; declared here so the traffic section can use it).
+std::string formatTimestamp(std::chrono::system_clock::time_point timestamp);
+
+/// Renders the NETWORK TRAFFIC HISTORY section: RX/TX byte-rate graphs plus
+/// current/peak/in-window-total/samples/span/last-update for one selected
+/// series (the aggregate or a tracked interface). Everything is read from the
+/// NetworkTrafficHistory ring buffers — the renderer never touches the network
+/// itself and never parses /proc/net/dev again. The 'c' key cycles the
+/// selection; a stale selection (removed interface) falls back to the
+/// aggregate via displayNameFor()/seriesFor() behaviour in the component.
+void renderNetworkTrafficHistorySection(
+    std::ostringstream &out, const atm::NetworkTrafficHistory &traffic,
+    const std::string &selection) {
+  out << "\n## NETWORK TRAFFIC HISTORY\n\n";
+  const atm::NetworkTrafficSeries *series = traffic.seriesFor(selection);
+  if (series == nullptr) {
+    out << "Traffic history: no interfaces sampled yet (waiting for the next "
+           "network read).\n"
+        << "Selection: press 'c' (then Enter) to cycle.\n";
+    return;
+  }
+
+  out << "History: " << series->display_name
+      << "  (press 'c' to cycle)\n";
+
+  atm::GraphConfig rate;
+  rate.width = 40;
+  rate.height = 6;
+  rate.dynamic_scale = true;
+
+  // Current/peak from the derived byte-rate rings (bytes/s).
+  double rx_current = 0.0, rx_peak = 0.0;
+  for (const atm::TimedSample &sample : series->rx_bytes_per_second.samples()) {
+    rx_current = sample.value;
+    rx_peak = std::max(rx_peak, sample.value);
+  }
+  double tx_current = 0.0, tx_peak = 0.0;
+  for (const atm::TimedSample &sample : series->tx_bytes_per_second.samples()) {
+    tx_current = sample.value;
+    tx_peak = std::max(tx_peak, sample.value);
+  }
+
+  const bool has_rates = !series->rx_bytes_per_second.empty() ||
+                         !series->tx_bytes_per_second.empty();
+  if (has_rates) {
+    out << "[RX rate]\n"
+        << atm::GraphRenderer::renderText(series->rx_bytes_per_second, rate, "",
+                                          "B/s")
+        << '\n'
+        << "[TX rate]\n"
+        << atm::GraphRenderer::renderText(series->tx_bytes_per_second, rate, "",
+                                          "B/s")
+        << '\n';
+  } else {
+    out << "[RX rate]      (no samples yet)\n"
+        << "[TX rate]      (no samples yet)\n"
+        << "Waiting for a second network read to measure transfer rates.\n"
+        << '\n';
+  }
+
+  const auto formatWs = [](double value) {
+    return atm::formatNetworkRate(
+        value > 0.0 ? static_cast<std::uint64_t>(value) : 0);
+  };
+
+  // Total transferred during the retained window (last - first cumulative
+  // sample). A counter reset inside the window or an aggregate membership
+  // change makes the delta unreliable: reported as unavailable, never a bogus
+  // negative or a doubled value.
+  const auto windowTotal = [](const atm::ResourceHistory<atm::TimedSample> &ring)
+      -> std::optional<double> {
+    if (ring.size() < 2) {
+      return std::nullopt;
+    }
+    const double delta = ring.samples().back().value - ring.samples().front().value;
+    return delta >= 0.0 ? std::optional<double>(delta) : std::nullopt;
+  };
+  const std::optional<double> rx_total = windowTotal(series->rx_bytes_total);
+  const std::optional<double> tx_total = windowTotal(series->tx_bytes_total);
+
+  out << "Current RX: " << formatWs(rx_current)
+      << "   Peak RX: " << formatWs(rx_peak) << '\n'
+      << "Current TX: " << formatWs(tx_current)
+      << "   Peak TX: " << formatWs(tx_peak) << '\n';
+
+  out << "Total in window: RX "
+      << (rx_total.has_value() ? atm::formatBytes(static_cast<std::uint64_t>(*rx_total))
+                               : "n/a (counter reset / insufficient data)")
+      << "   TX "
+      << (tx_total.has_value() ? atm::formatBytes(static_cast<std::uint64_t>(*tx_total))
+                               : "n/a")
+      << '\n';
+
+  // Samples and time span (steady clock range of the recorded cumulative ring).
+  out << "Samples: " << series->rx_bytes_total.size();
+  if (series->rx_bytes_total.size() >= 2) {
+    const double span_seconds = std::chrono::duration<double>(
+        series->rx_bytes_total.samples().back().timestamp -
+        series->rx_bytes_total.samples().front().timestamp)
+                                    .count();
+    out << "   Span: "
+        << (span_seconds < 1.0 ? "<1 s"
+                               : std::to_string(static_cast<long long>(span_seconds)) +
+                                     " s");
+  }
+  out << "   Updated: " << formatTimestamp(series->last_update) << '\n';
+
+  if (series->aggregate) {
+    out << "Note: the aggregate includes virtual/bridge/tunnel interfaces — "
+           "not physical link throughput. Totals are the sum of all "
+           "non-loopback interface counters.\n";
+    if (series->membership_changed) {
+      out << "Note: the interface set changed this tick; totals across the "
+             "change are approximate.\n";
+    }
+  }
 }
 
 /// Renders the RESOURCE HISTORY section: live time-series graphs for CPU,
@@ -3939,7 +4060,9 @@ std::string renderFrame(double cpu_usage, const atm::MemoryInfo &memory,
                          const atm::DiskHealthMonitor &disk_health,
 const atm::FilesystemMonitor &filesystems,
                          FilesystemFilter fs_filter,
-                         const atm::NetworkInterfaceMonitor &network_interfaces) {
+                         const atm::NetworkInterfaceMonitor &network_interfaces,
+                         const atm::NetworkTrafficHistory &network_traffic_history,
+                         const std::string &traffic_selection) {
    if (view == ViewMode::Tree) {
     // The tree view stays deliberately focused on the hierarchy; the storage
     // and network sections are part of the table view.
@@ -3961,6 +4084,8 @@ const atm::FilesystemMonitor &filesystems,
   renderDiskHealthSections(out, disk_health);
   renderNetworkSections(out, network);
   renderNetworkInterfaceSections(out, network_interfaces);
+  renderNetworkTrafficHistorySection(out, network_traffic_history,
+                                     traffic_selection);
   renderGpuSections(out, gpu);
   renderSensorSections(out, sensors, gpu);
   renderAlertsSections(out, alerts, alert_filter);
@@ -3984,7 +4109,8 @@ const atm::FilesystemMonitor &filesystems,
       << "Manage: press 'm' (then Enter) to control a process by PID\n"
       << "Details: press 'd' (then Enter) to inspect a process in detail\n"
 << "Network detail: press 'i' (then Enter) to inspect an interface\n"
-       << "Disk health: press 'h' (then Enter) to inspect disk health\n"
+        << "Network traffic: press 'c' (then Enter) to cycle the history graph\n"
+        << "Disk health: press 'h' (then Enter) to inspect disk health\n"
        << "Filesystems: press 'w' (then Enter) to inspect filesystems\n"
        << "GPU detail: press 'g' (then Enter) to inspect a GPU\n"
       << "Sensor detail: press 's' (then Enter) to inspect a sensor\n"
@@ -4027,7 +4153,9 @@ const atm::GpuSnapshot &gpu,
                  const atm::DiskHealthMonitor &disk_health,
                  const atm::FilesystemMonitor &filesystems,
                  FilesystemFilter fs_filter,
-                 const atm::NetworkInterfaceMonitor &network_interfaces) {
+                 const atm::NetworkInterfaceMonitor &network_interfaces,
+                 const atm::NetworkTrafficHistory &network_traffic_history,
+                 const std::string &traffic_selection) {
   // ANSI "clear entire screen" + "cursor to home" so the multi-line frame
   // refreshes in place instead of scrolling the terminal.
   std::cout << "\033[2J\033[H";
@@ -4037,7 +4165,8 @@ const atm::GpuSnapshot &gpu,
                            alert_filter, service_search, service_sort,
                            startup_search, startup_sort, packages,
                            refresh_interval_ms, cpu_details, memory_details,
-                           disk_health, filesystems, fs_filter, network_interfaces)
+                           disk_health, filesystems, fs_filter, network_interfaces,
+                           network_traffic_history, traffic_selection)
             << std::flush;
 }
 
@@ -4108,6 +4237,7 @@ class ConsoleInput {
     InspectSystemInfo,
     InspectPackages,
     InspectSettings,
+    CycleNetworkTraffic,
     ToggleHistory,
     ToggleAlertFilter,
     ToggleNotifications,
@@ -4218,6 +4348,7 @@ class ConsoleInput {
     if (token == "y" || token == "Y") return Command::InspectSystemInfo;
     if (token == "p" || token == "P") return Command::InspectPackages;
     if (token == "o" || token == "O") return Command::InspectSettings;
+    if (token == "c" || token == "C") return Command::CycleNetworkTraffic;
     if (token == "r" || token == "R") return Command::ToggleHistory;
     if (token == "f" || token == "F") return Command::ToggleAlertFilter;
     if (token == "n" || token == "N") return Command::ToggleNotifications;
@@ -6553,6 +6684,7 @@ int main() {
   atm::DiskHealthMonitor disk_health;
   atm::FilesystemMonitor filesystem_monitor;
   atm::NetworkInterfaceMonitor network_interface_details;
+  atm::NetworkTrafficHistory network_traffic_history;
   atm::NetworkMonitor network_monitor;
   atm::GpuMonitor gpu_monitor;
   atm::SensorMonitor sensor_monitor;
@@ -6579,6 +6711,8 @@ int main() {
   filesystem_monitor.setHistoryMaxSamples(
       static_cast<std::size_t>(settings.settings().history.max_samples));
   network_interface_details.setHistoryMaxSamples(
+      static_cast<std::size_t>(settings.settings().history.max_samples));
+  network_traffic_history.setHistoryMaxSamples(
       static_cast<std::size_t>(settings.settings().history.max_samples));
 
   // Forward alert state transitions to desktop notifications.
@@ -6616,6 +6750,8 @@ int main() {
   bool show_history = true;
   AlertFilter alert_filter = AlertFilter::All;
   FilesystemFilter fs_filter = FilesystemFilter::Physical;
+  std::string network_traffic_selection =
+      std::string(atm::kNetworkTrafficAllIdentity);
 
   // Choose the starting view. EOF (e.g. /dev/null stdin) defaults to the
   // configured default page. "1"/"2" always win over the setting.
@@ -6684,6 +6820,7 @@ int main() {
   const atm::DiskSnapshot first_disk = disk_monitor.read();
   const atm::NetworkSnapshot first_network = network_monitor.read();
   static_cast<void>(network_interface_details.read(first_network));
+  network_traffic_history.record(network_interface_details.current());
   const atm::GpuSnapshot first_gpu = gpu_monitor.read();
   const atm::SensorSnapshot first_sensors = sensor_monitor.read();
   const atm::SystemPressureSnapshot first_pressure = pressure_monitor.read();
@@ -6730,7 +6867,8 @@ int main() {
              first_startup, sysinfo, history, show_history, alerts, alert_filter,
              service_search, service_sort, startup_search, startup_sort,
              packages, refresh_interval_ms, cpu, memory, disk_health,
-             filesystem_monitor, fs_filter, network_interface_details);
+             filesystem_monitor, fs_filter, network_interface_details,
+             network_traffic_history, network_traffic_selection);
 
   atm::NetworkSnapshot network = first_network;
   atm::GpuSnapshot gpu = first_gpu;
@@ -6789,6 +6927,7 @@ int main() {
             const atm::DiskSnapshot disk = disk_monitor.read();
             const atm::NetworkSnapshot network = network_monitor.read();
             static_cast<void>(network_interface_details.read(network));
+            network_traffic_history.record(network_interface_details.current());
             static_cast<void>(filesystem_monitor.read());
             gpu = gpu_monitor.read();
             sensors = sensor_monitor.read();
@@ -6827,7 +6966,8 @@ int main() {
                        service_search, service_sort, startup_search,
                        startup_sort, packages, refresh_interval_ms, cpu,
                        memory, disk_health, filesystem_monitor, fs_filter,
-                       network_interface_details);
+                       network_interface_details, network_traffic_history,
+                       network_traffic_selection);
           }
         }
         continue;
@@ -6895,6 +7035,27 @@ int main() {
               static_cast<std::size_t>(settings.settings().history.max_samples));
           network_interface_details.setHistoryMaxSamples(
               static_cast<std::size_t>(settings.settings().history.max_samples));
+          network_traffic_history.setHistoryMaxSamples(
+              static_cast<std::size_t>(settings.settings().history.max_samples));
+        }
+        break;
+      case ConsoleInput::Command::CycleNetworkTraffic:
+        if (view == ViewMode::List) {
+          // Cycle through the aggregate and each tracked interface in stable
+          // discovery order via the component's selection list. A selection
+          // whose interface vanished is pruned from the list; cycling always
+          // starts/ends at "all".
+          const std::vector<std::string> selectable =
+              network_traffic_history.selectableIdentities();
+          const auto current = std::find(selectable.begin(), selectable.end(),
+                                         network_traffic_selection);
+          if (current != selectable.end() &&
+              std::next(current) != selectable.end()) {
+            network_traffic_selection = *std::next(current);
+          } else {
+            network_traffic_selection =
+                std::string(atm::kNetworkTrafficAllIdentity);
+          }
         }
         break;
       case ConsoleInput::Command::ToggleHistory:
@@ -6916,6 +7077,8 @@ int main() {
           filesystem_monitor.setHistoryMaxSamples(
               static_cast<std::size_t>(settings.settings().history.max_samples));
           network_interface_details.setHistoryMaxSamples(
+              static_cast<std::size_t>(settings.settings().history.max_samples));
+          network_traffic_history.setHistoryMaxSamples(
               static_cast<std::size_t>(settings.settings().history.max_samples));
         }
         break;
@@ -6944,6 +7107,7 @@ int main() {
     const atm::DiskSnapshot disk = disk_monitor.read();
     network = network_monitor.read();
     static_cast<void>(network_interface_details.read(network));
+    network_traffic_history.record(network_interface_details.current());
     static_cast<void>(filesystem_monitor.read());
     gpu = gpu_monitor.read();
     sensors = sensor_monitor.read();
@@ -6981,7 +7145,8 @@ int main() {
                systemd, startup, sysinfo, history, show_history, alerts,
                alert_filter, service_search, service_sort, startup_search,
                startup_sort, packages, refresh_interval_ms, cpu, memory,
-               disk_health, filesystem_monitor, fs_filter, network_interface_details);
+               disk_health, filesystem_monitor, fs_filter, network_interface_details,
+               network_traffic_history, network_traffic_selection);
   }
 
   // Clean shutdown: persist any pending settings changes.

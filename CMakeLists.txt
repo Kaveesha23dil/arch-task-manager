@@ -61,6 +61,7 @@ add_executable(arch-task-manager
   src/filesystem_monitor.cpp
   src/network_monitor.cpp
   src/network_interface_details.cpp
+  src/network_traffic_history.cpp
   src/gpu_monitor.cpp
   src/sensor_monitor.cpp
   src/systemd_manager.cpp
@@ -382,3 +383,26 @@ target_include_directories(network-interface-details-tests PRIVATE include)
 target_link_libraries(network-interface-details-tests PRIVATE Threads::Threads)
 
 add_test(NAME network-interface-details COMMAND network-interface-details-tests)
+
+add_executable(network-monitor-tests
+  tests/network_monitor_tests.cpp
+  src/network_monitor.cpp
+)
+
+target_include_directories(network-monitor-tests PRIVATE include)
+
+target_link_libraries(network-monitor-tests PRIVATE Threads::Threads)
+
+add_test(NAME network-monitor COMMAND network-monitor-tests)
+
+add_executable(network-traffic-history-tests
+  tests/network_traffic_history_tests.cpp
+  src/network_traffic_history.cpp
+  src/network_interface_details.cpp
+)
+
+target_include_directories(network-traffic-history-tests PRIVATE include)
+
+target_link_libraries(network-traffic-history-tests PRIVATE Threads::Threads)
+
+add_test(NAME network-traffic-history COMMAND network-traffic-history-tests)

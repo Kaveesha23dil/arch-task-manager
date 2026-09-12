@@ -41,18 +41,17 @@ std::string readInterfaceState(const std::string &name) {
   return state;
 }
 
-std::vector<NetworkInterfaceStats> readNetworkStats() {
-  // RAII: the file is closed when `file` goes out of scope.
-  std::ifstream file("/proc/net/dev");
-  if (!file.is_open()) {
-    return {};
-  }
-
+std::vector<NetworkInterfaceStats> parseNetworkStatsText(std::istream &input) {
   std::vector<NetworkInterfaceStats> interfaces;
   std::string line;
-  std::getline(file, line);  // "Inter-|   Receive ..."
-  std::getline(file, line);  // " face |bytes    packets ..."
-  while (std::getline(file, line)) {
+
+  // The kernel file always starts with two header lines ("Inter-| Receive ..."
+  // and " face |bytes    packets ..."). Skipping them is part of the parser
+  // contract and keeps parseNetworkStatsText byte-for-byte identical to the
+  // old file-reading implementation so any input behaves the same way.
+  std::getline(input, line);
+  std::getline(input, line);
+  while (std::getline(input, line)) {
     const std::size_t colon = line.find(':');
     if (colon == std::string::npos) {
       continue;  // not an interface data line
@@ -89,9 +88,21 @@ std::vector<NetworkInterfaceStats> readNetworkStats() {
     stats.tx_packets = fields[9];
     stats.tx_errors = fields[10];
     stats.tx_dropped = fields[11];
-    stats.state = readInterfaceState(name);
-    stats.loopback = (name == "lo");
     interfaces.push_back(std::move(stats));
+  }
+  return interfaces;
+}
+
+std::vector<NetworkInterfaceStats> readNetworkStats() {
+  // RAII: the file is closed when `file` goes out of scope.
+  std::ifstream file("/proc/net/dev");
+  if (!file.is_open()) {
+    return {};
+  }
+  std::vector<NetworkInterfaceStats> interfaces = parseNetworkStatsText(file);
+  for (NetworkInterfaceStats &stats : interfaces) {
+    stats.state = readInterfaceState(stats.name);
+    stats.loopback = (stats.name == "lo");
   }
   return interfaces;
 }
