@@ -64,6 +64,20 @@ struct PressureMetrics {
   std::optional<double> io_full;
 };
 
+/// Optional system-load values (raw 1/5/15-minute averages plus the per-CPU
+/// normalized averages) for one refresh. `std::nullopt` means that metric was
+/// unavailable for that refresh (file unreadable, or the online CPU count was
+/// unknown so normalization was impossible); such metrics simply skip the
+/// sample instead of plotting zeros.
+struct LoadMetrics {
+  std::optional<double> load1;
+  std::optional<double> load5;
+  std::optional<double> load15;
+  std::optional<double> normalized_load1;
+  std::optional<double> normalized_load5;
+  std::optional<double> normalized_load15;
+};
+
 /// Aggregates all system-level resource histories. It stores already-computed
 /// values from the existing monitors; it never reads /proc or /sys itself.
 class HistoryManager {
@@ -103,6 +117,12 @@ class HistoryManager {
   /// fake zero. Called once per refresh alongside update(); timestamped
   /// consistently with a single clock read for the whole batch.
   void updatePressure(const PressureMetrics& metrics);
+
+  /// Appends one sample for each available system-load average (raw
+  /// 1/5/15-minute averages and their per-CPU normalized forms). A missing
+  /// metric contributes no sample. Called once per refresh alongside update();
+  /// timestamped consistently with a single clock read for the whole batch.
+  void updateLoad(const LoadMetrics& metrics);
 
   /// Resets all history buffers.
   void clearAll();
@@ -174,6 +194,26 @@ class HistoryManager {
     return io_pressure_full_;
   }
 
+  // System load (raw 1/5/15-min averages and per-CPU normalized) histories.
+  const ResourceHistory<TimedSample>& load1History() const {
+    return load1_;
+  }
+  const ResourceHistory<TimedSample>& load5History() const {
+    return load5_;
+  }
+  const ResourceHistory<TimedSample>& load15History() const {
+    return load15_;
+  }
+  const ResourceHistory<TimedSample>& normalizedLoad1History() const {
+    return normalized_load1_;
+  }
+  const ResourceHistory<TimedSample>& normalizedLoad5History() const {
+    return normalized_load5_;
+  }
+  const ResourceHistory<TimedSample>& normalizedLoad15History() const {
+    return normalized_load15_;
+  }
+
   std::size_t maxSamples() const { return max_samples_; }
 
  private:
@@ -216,6 +256,14 @@ class HistoryManager {
   ResourceHistory<TimedSample> memory_pressure_full_;
   ResourceHistory<TimedSample> io_pressure_some_;
   ResourceHistory<TimedSample> io_pressure_full_;
+
+  // System load (raw and per-CPU normalized averages) histories.
+  ResourceHistory<TimedSample> load1_;
+  ResourceHistory<TimedSample> load5_;
+  ResourceHistory<TimedSample> load15_;
+  ResourceHistory<TimedSample> normalized_load1_;
+  ResourceHistory<TimedSample> normalized_load5_;
+  ResourceHistory<TimedSample> normalized_load15_;
 
   bool paused_ = false;
 

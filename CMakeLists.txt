@@ -32,6 +32,9 @@ pkg_check_modules(SYSTEMD REQUIRED libsystemd)
 # libalpm for Arch package management (official repository update detection).
 pkg_check_modules(ALPM REQUIRED libalpm)
 
+# libatasmart for ATA/SATA SMART health data (read-only).
+pkg_check_modules(ATASMART REQUIRED libatasmart)
+
 add_executable(arch-task-manager
   src/main.cpp
   src/advanced_cpu_monitor.cpp
@@ -54,10 +57,12 @@ add_executable(arch-task-manager
   src/process_report.cpp
   src/process_statistics.cpp
   src/disk_monitor.cpp
+  src/disk_health.cpp
   src/network_monitor.cpp
   src/gpu_monitor.cpp
   src/sensor_monitor.cpp
   src/systemd_manager.cpp
+  src/system_load_monitor.cpp
   src/system_pressure_monitor.cpp
   src/startup_manager.cpp
   src/system_info.cpp
@@ -79,6 +84,9 @@ target_include_directories(arch-task-manager PRIVATE include)
 target_link_libraries(arch-task-manager PRIVATE Threads::Threads ${SYSTEMD_LIBRARIES} ${ALPM_LIBRARIES})
 target_include_directories(arch-task-manager PRIVATE ${SYSTEMD_INCLUDE_DIRS} ${ALPM_INCLUDE_DIRS})
 target_link_directories(arch-task-manager PRIVATE ${SYSTEMD_LIBRARY_DIRS} ${ALPM_LIBRARY_DIRS})
+target_link_libraries(arch-task-manager PRIVATE ${ATASMART_LIBRARIES})
+target_include_directories(arch-task-manager PRIVATE ${ATASMART_INCLUDE_DIRS})
+target_link_directories(arch-task-manager PRIVATE ${ATASMART_LIBRARY_DIRS})
 
 # --- Tests ----------------------------------------------------------------
 enable_testing()
@@ -322,3 +330,31 @@ target_include_directories(system-pressure-monitor-tests PRIVATE include)
 target_link_libraries(system-pressure-monitor-tests PRIVATE Threads::Threads)
 
 add_test(NAME system-pressure-monitor COMMAND system-pressure-monitor-tests)
+
+add_executable(system-load-monitor-tests
+  tests/system_load_monitor_tests.cpp
+  src/system_load_monitor.cpp
+  src/resource_history.cpp
+  src/history_manager.cpp
+  src/logger.cpp
+)
+
+target_include_directories(system-load-monitor-tests PRIVATE include)
+
+target_link_libraries(system-load-monitor-tests PRIVATE Threads::Threads)
+
+add_test(NAME system-load-monitor COMMAND system-load-monitor-tests)
+
+add_executable(disk-health-tests
+  tests/disk_health_tests.cpp
+  src/disk_health.cpp
+  src/logger.cpp
+)
+
+target_include_directories(disk-health-tests PRIVATE include)
+
+target_link_libraries(disk-health-tests PRIVATE Threads::Threads ${ATASMART_LIBRARIES})
+target_include_directories(disk-health-tests PRIVATE ${ATASMART_INCLUDE_DIRS})
+target_link_directories(disk-health-tests PRIVATE ${ATASMART_LIBRARY_DIRS})
+
+add_test(NAME disk-health COMMAND disk-health-tests)

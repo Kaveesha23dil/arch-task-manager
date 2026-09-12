@@ -27,6 +27,7 @@
 #include "advanced_cpu_monitor.hpp"
 #include "advanced_memory_monitor.hpp"
 #include "cpu_monitor.hpp"
+#include "disk_health.hpp"
 #include "disk_monitor.hpp"
 #include "format_bytes.hpp"
 #include "gpu_monitor.hpp"
@@ -60,6 +61,7 @@
 #include "app_autostart_manager.hpp"
 #include "startup_manager.hpp"
 #include "system_info.hpp"
+#include "system_load_monitor.hpp"
 #include "system_pressure_monitor.hpp"
 #include "systemd_manager.hpp"
 
@@ -111,6 +113,14 @@ constexpr std::size_t kNameColumnWidth = 18;
 constexpr std::size_t kMaxNameWidth = 16;
 constexpr std::size_t kStorageMountWidth = 28;
 constexpr std::size_t kDeviceNameWidth = 14;
+constexpr std::size_t kHealthDeviceWidth = 14;
+constexpr std::size_t kHealthTypeWidth = 10;
+constexpr std::size_t kHealthModelWidth = 26;
+constexpr std::size_t kHealthStatusWidth = 16;
+constexpr std::size_t kHealthTempWidth = 9;
+constexpr std::size_t kHealthPowerOnWidth = 11;
+constexpr std::size_t kHealthRefreshWidth = 20;
+constexpr std::size_t kHealthAttributeNameWidth = 26;
 constexpr std::size_t kNetworkInterfaceWidth = 14;
 constexpr std::size_t kNetworkRateWidth = 12;
 constexpr std::size_t kNetworkBytesWidth = 10;
@@ -487,6 +497,39 @@ atm::PressureMetrics buildPressureMetrics(
   return metrics;
 }
 
+/// The number of logical CPUs currently online, from the advanced CPU
+/// monitor's cached topology. 0 when the kernel did not report a usable online
+/// mask; load normalization is skipped in that case rather than guessed.
+std::uint32_t onlineLogicalCpuCount(const atm::AdvancedCpuSnapshot &cpu) {
+  if (!cpu.topology.online_available) {
+    return 0;
+  }
+  return static_cast<std::uint32_t>(cpu.topology.online.size());
+}
+
+/// Builds the system-load history sample for a snapshot. Raw 1/5/15-minute
+/// averages are recorded whenever the file was readable; per-CPU normalized
+/// averages are recorded only when an online CPU count is known. Unavailable
+/// values stay unset so the history manager skips them for that refresh
+/// instead of plotting garbage.
+atm::LoadMetrics buildLoadMetrics(const atm::SystemLoadSnapshot &load,
+                                  std::uint32_t online_cpus) {
+  atm::LoadMetrics metrics;
+  if (!load.load.readable) {
+    return metrics;
+  }
+  metrics.load1 = load.load.load1;
+  metrics.load5 = load.load.load5;
+  metrics.load15 = load.load.load15;
+  metrics.normalized_load1 =
+      atm::normalizeLoad(load.load.load1, online_cpus);
+  metrics.normalized_load5 =
+      atm::normalizeLoad(load.load.load5, online_cpus);
+  metrics.normalized_load15 =
+      atm::normalizeLoad(load.load.load15, online_cpus);
+  return metrics;
+}
+
 /// Renders the ADVANCED CPU section of the live view: the total-CPU time
 /// breakdown followed by one row per logical CPU. Frequencies are the values
 /// the kernel currently reports and may be shared by CPUs on the same policy;
@@ -810,6 +853,43 @@ void renderResourceHistorySection(std::ostringstream &out,
   if (!history.commitmentPercentHistory().empty()) {
     out << "\n[COMMITMENT Usage]\n" << atm::GraphRenderer::renderText(
         history.commitmentPercentHistory(), percent, "", "%") << '\n';
+  }
+
+  // System load — raw load averages and per-CPU normalized averages. These are
+  // counts (not percentages) so they auto-scale; a missing dataset simply has
+  // no graph. The normalized graphs only appear once an online CPU count is
+  // known.
+  {
+    atm::GraphConfig load_scale;
+    load_scale.width = 40;
+    load_scale.height = 6;
+    load_scale.dynamic_scale = true;
+    const auto renderLoadHist =
+        [&](const char *title,
+            const atm::ResourceHistory<atm::TimedSample> &h) {
+          if (!h.empty()) {
+            out << "\n" << title << "\n"
+                << atm::GraphRenderer::renderText(h, load_scale, "", "")
+                << '\n';
+          }
+        };
+    if (!history.load1History().empty()) {
+      out << "\n[SYSTEM LOAD]\n";
+      renderLoadHist("Load Average (1 min)", history.load1History());
+      renderLoadHist("Load Average (5 min)", history.load5History());
+      renderLoadHist("Load Average (15 min)", history.load15History());
+    }
+    if (!history.normalizedLoad1History().empty() ||
+        !history.normalizedLoad5History().empty() ||
+        !history.normalizedLoad15History().empty()) {
+      out << "\n[NORMALIZED LOAD]\n";
+      renderLoadHist("Normalized Load (1 min)",
+                     history.normalizedLoad1History());
+      renderLoadHist("Normalized Load (5 min)",
+                     history.normalizedLoad5History());
+      renderLoadHist("Normalized Load (15 min)",
+                     history.normalizedLoad15History());
+    }
   }
 
   // System pressure (PSI) — 10-second averages. Only metrics that have data
@@ -1367,6 +1447,96 @@ void renderPressureSections(std::ostringstream &out,
     renderRow("I/O", "Full", pressure.io.full);
   }
   out << '\n';
+}
+
+/// Formats a load average with two decimals, e.g. "0.42".
+std::string formatLoadAverage(double load) {
+  std::ostringstream out;
+  out << std::fixed << std::setprecision(2) << load;
+  return out.str();
+}
+
+/// Small glyph for a load-severity indicator in the summary view.
+const char *loadSeverityGlyph(atm::LoadSeverity severity) {
+  switch (severity) {
+    case atm::LoadSeverity::Normal:   return "\u25cb";  // ○
+    case atm::LoadSeverity::Elevated: return "\u25b2";  // ▲
+    case atm::LoadSeverity::High:     return "\u26a0";   // ⚠
+    case atm::LoadSeverity::Critical: return "\U0001f534";  // 🔴
+  }
+  return "?";
+}
+
+/// Formats a wall-clock time point as "YYYY-MM-DD HH:MM:SS" in local time.
+std::string formatDateTime(std::chrono::system_clock::time_point when) {
+  const std::time_t tt = std::chrono::system_clock::to_time_t(when);
+  std::tm local{};
+  ::localtime_r(&tt, &local);
+  char buffer[64];
+  std::strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", &local);
+  return buffer;
+}
+
+/// Renders the SYSTEM LOAD AND UPTIME section: load averages (raw and per-CPU
+/// normalized), a heuristic severity, running/total tasks, last PID, uptime,
+/// idle time and the wall-clock boot estimate. Everything is read-only;
+/// unavailable values show "N/A" instead of faked zeros.
+void renderSystemLoadSections(std::ostringstream &out,
+                              const atm::SystemLoadSnapshot &load,
+                              std::uint32_t online_cpus) {
+  out << "\n## SYSTEM LOAD AND UPTIME\n\n";
+  if (!load.load.readable) {
+    out << "Load averages unavailable (/proc/loadavg could not be read).\n";
+  } else {
+    appendLabeled(out, "Load Average (1 min):",
+                  formatLoadAverage(load.load.load1));
+    appendLabeled(out, "Load Average (5 min):",
+                  formatLoadAverage(load.load.load5));
+    appendLabeled(out, "Load Average (15 min):",
+                  formatLoadAverage(load.load.load15));
+    const std::optional<double> normalized =
+        atm::normalizeLoad(load.load.load1, online_cpus);
+    if (online_cpus > 0) {
+      appendLabeled(out, "Normalized (per CPU):",
+                    formatLoadAverage(*normalized) + " / " +
+                        std::to_string(online_cpus) + " logical CPU" +
+                        (online_cpus == 1 ? "" : "s"));
+      const atm::LoadSeverity severity =
+          atm::classifyLoadSeverity(*normalized);
+      appendLabeled(out, "Load Severity:",
+                    std::string(loadSeverityGlyph(severity)) + " " +
+                        atm::loadSeverityName(severity));
+    } else {
+      appendLabeled(out, "Normalized (per CPU):", "N/A (CPU count unknown)");
+      appendLabeled(out, "Load Severity:", "N/A");
+    }
+    appendLabeled(
+        out, "Running/Total:",
+        load.load.running_total_available
+            ? std::to_string(static_cast<std::uint64_t>(load.load.running)) +
+                  "/" +
+                  std::to_string(static_cast<std::uint64_t>(load.load.total))
+            : std::string("N/A"));
+    appendLabeled(out, "Last PID:",
+                  load.load.last_pid_available
+                      ? formatThousands(load.load.last_pid)
+                      : std::string("N/A"));
+  }
+
+  if (!load.uptime.readable) {
+    out << "Uptime unavailable (/proc/uptime could not be read).\n";
+  } else {
+    appendLabeled(out, "Uptime:",
+                  atm::formatUptime(static_cast<std::uint64_t>(
+                      load.uptime.uptime_seconds)));
+    appendLabeled(out, "Idle time:",
+                  atm::formatUptime(static_cast<std::uint64_t>(
+                      load.uptime.idle_seconds)));
+    appendLabeled(out, "Boot time:",
+                  load.boot_time.has_value()
+                      ? formatDateTime(*load.boot_time)
+                      : std::string("N/A"));
+  }
 }
 
 /// Best display name for a GPU temperature sensor: resolves the hwmon device
@@ -2066,6 +2236,245 @@ std::string formatTimestamp(std::chrono::system_clock::time_point timestamp) {
   char buffer[32];
   std::strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", &local);
   return buffer;
+}
+
+/// Renders the DISK HEALTH summary table shared by the live view and the 'h'
+/// detail screen. Health data lives in DiskHealthMonitor's background cache; a
+/// device is only ever shown 'Healthy' when a real read-only health source
+/// reported a passing result.
+void renderDiskHealthSummary(
+    std::ostringstream &out,
+    const std::vector<atm::DiskHealthCacheEntry> &entries) {
+  if (entries.empty()) {
+    out << "No disk health data has been collected yet.\n";
+    return;
+  }
+  out << std::left << std::setw(kHealthDeviceWidth) << "DEVICE" << std::right
+      << std::setw(kHealthTypeWidth) << "TYPE"
+      << std::setw(kHealthModelWidth) << "MODEL"
+      << std::setw(kHealthStatusWidth) << "STATUS"
+      << std::setw(kHealthTempWidth) << "TEMP"
+      << std::setw(kHealthPowerOnWidth) << "POWER ON"
+      << std::setw(kHealthRefreshWidth) << "LAST REFRESH"
+      << "  NOTE\n";
+  for (const atm::DiskHealthCacheEntry &entry : entries) {
+    const atm::DiskHealthSnapshot &s = entry.state;
+    std::ostringstream temp;
+    temp << (s.temperature_celsius.has_value()
+                 ? formatCelsius(*s.temperature_celsius)
+                 : "-");
+    std::ostringstream power_on;
+    power_on << (s.power_on_hours.has_value()
+                     ? std::to_string(*s.power_on_hours) + "h"
+                     : "-");
+    const std::string note =
+        entry.last_error_category != atm::HealthErrorCategory::None &&
+                !entry.last_error.empty()
+            ? entry.last_error
+            : (s.ok ? "" : s.detail);
+    out << std::left << std::setw(kHealthDeviceWidth)
+        << fitTo(s.device_name, kHealthDeviceWidth) << std::right
+        << std::setw(kHealthTypeWidth) << atm::diskHealthSourceName(s.source)
+        << std::setw(kHealthModelWidth)
+        << fitTo(s.model.empty() ? "-" : s.model, kHealthModelWidth)
+        << std::setw(kHealthStatusWidth)
+        << atm::diskHealthStatusName(s.status)
+        << std::setw(kHealthTempWidth) << temp.str()
+        << std::setw(kHealthPowerOnWidth) << power_on.str()
+        << std::setw(kHealthRefreshWidth)
+        << (s.ok ? formatTimestamp(s.refreshed_at) : "-") << "  " << note
+        << '\n';
+  }
+}
+
+/// Renders the DISK HEALTH section of the live view above the process table.
+/// The cache is read without blocking and never triggers health reads.
+void renderDiskHealthSections(std::ostringstream &out,
+                              const atm::DiskHealthMonitor &disk_health) {
+  out << "\n## DISK HEALTH\n\n";
+  renderDiskHealthSummary(out, disk_health.entries());
+  out << "Detailed disk health: press 'h' (then Enter)\n";
+}
+
+/// Renders the per-device health detail screen (identification, assessment,
+/// temperature/power history, bounded SMART attributes and NVMe counters). All
+/// values come from the read-only background refresh; nothing is fabricated.
+std::string renderDiskHealthDetailText(
+    const atm::DiskHealthCacheEntry &entry) {
+  const atm::DiskHealthSnapshot &s = entry.state;
+  std::ostringstream out;
+
+  out << "DEVICE\n";
+  appendLabeled(out, "Name:", s.device_name.empty() ? "-" : s.device_name);
+  appendLabeled(out, "Type:", atm::diskHealthSourceName(s.source));
+  appendLabeled(out, "Path:", s.device_path.empty() ? "-" : s.device_path);
+  appendLabeled(out, "Model:", s.model.empty() ? "-" : s.model);
+  appendLabeled(out, "Firmware:",
+                s.firmware_revision.empty() ? "-" : s.firmware_revision);
+  appendLabeled(out, "Serial:",
+                s.serial_available ? "present (not displayed)" : "not exposed");
+  appendLabeled(out, "Status:", atm::diskHealthStatusName(s.status));
+
+  out << "\nHEALTH\n";
+  if (s.ok) {
+    if (s.smart_self_assessment.has_value()) {
+      appendLabeled(out, "SMART health:",
+                    *s.smart_self_assessment ? "PASSED" : "FAILED");
+    }
+    if (!s.smart_overall.empty()) {
+      appendLabeled(out, "SMART overall:", s.smart_overall);
+    }
+    if (s.temperature_celsius.has_value()) {
+      appendLabeled(out, "Temperature:", formatCelsius(*s.temperature_celsius));
+    }
+    if (s.power_on_hours.has_value()) {
+      appendLabeled(out, "Powered on:",
+                    std::to_string(*s.power_on_hours) + " h");
+    }
+    if (s.power_cycles.has_value()) {
+      appendLabeled(out, "Power cycles:", std::to_string(*s.power_cycles));
+    }
+    if (s.reallocated_sectors.has_value()) {
+      appendLabeled(out, "Reallocated sectors:",
+                    std::to_string(*s.reallocated_sectors));
+    }
+    if (s.current_pending_sectors.has_value()) {
+      appendLabeled(out, "Pending sectors:",
+                    std::to_string(*s.current_pending_sectors));
+    }
+    if (s.offline_uncorrectable_sectors.has_value()) {
+      appendLabeled(out, "Offline uncorrectable:",
+                    std::to_string(*s.offline_uncorrectable_sectors));
+    }
+    if (s.reported_uncorrectable_errors.has_value()) {
+      appendLabeled(out, "Reported uncorrectable errors:",
+                    std::to_string(*s.reported_uncorrectable_errors));
+    }
+    if (s.unsafe_shutdowns.has_value()) {
+      appendLabeled(out, "Unsafe shutdowns:",
+                    std::to_string(*s.unsafe_shutdowns));
+    }
+  } else {
+    appendLabeled(out, "Readable health data:",
+                  s.detail.empty() ? "not available" : ("not available — " +
+                                                        s.detail));
+  }
+
+  if (!s.attributes.empty()) {
+    out << "\nSMART ATTRIBUTES"
+        << (s.attributes_truncated ? " (truncated)" : "") << "\n\n"
+        << std::left << std::setw(5) << "ID" << std::setw(27) << "NAME"
+        << std::right << std::setw(8) << "CURRENT" << std::setw(8) << "WORST"
+        << std::setw(8) << "THRESH" << "  RAW\n";
+    for (const atm::SmartAttribute &attribute : s.attributes) {
+      out << std::right << std::setw(4) << static_cast<unsigned>(attribute.id)
+          << "  " << std::left << std::setw(kHealthAttributeNameWidth)
+          << fitTo(attribute.name_known ? attribute.name : "(unknown)",
+                   kHealthAttributeNameWidth)
+          << std::right
+          << std::setw(8)
+          << std::to_string(attribute.current.value_or(static_cast<std::uint8_t>(0)))
+          << std::setw(8)
+          << std::to_string(attribute.worst.value_or(static_cast<std::uint8_t>(0)))
+          << std::setw(8)
+          << std::to_string(attribute.threshold.value_or(static_cast<std::uint8_t>(0)))
+          << "  " << attribute.raw_hex
+          << (!attribute.unit.empty() && attribute.pretty_value.has_value()
+                  ? "  (" + std::to_string(*attribute.pretty_value) + " " +
+                        attribute.unit + ")"
+                  : "")
+          << (attribute.warning ? "  [WARNING]" : "") << '\n';
+    }
+  }
+
+  const atm::NvmeHealthLog *nvme = s.nvme ? &*s.nvme : nullptr;
+  if (nvme != nullptr) {
+    out << "\nNVMe SMART / HEALTH LOG\n";
+    if (nvme->percentage_used.has_value()) {
+      appendLabeled(out, "Life used:", std::to_string(*nvme->percentage_used) +
+                                   "%");
+    }
+    if (nvme->available_spare.has_value()) {
+      appendLabeled(out, "Available spare:",
+                    std::to_string(*nvme->available_spare) + "%");
+    }
+    if (nvme->available_spare_threshold.has_value()) {
+      appendLabeled(out, "Spare threshold:",
+                    std::to_string(*nvme->available_spare_threshold) + "%");
+    }
+    if (nvme->data_units_read.has_value()) {
+      appendLabeled(out, "Data read:",
+                    atm::formatBytes(
+                        atm::nvmeDataUnitsToBytes(*nvme->data_units_read)));
+    }
+    if (nvme->data_units_written.has_value()) {
+      appendLabeled(out, "Data written:",
+                    atm::formatBytes(
+                        atm::nvmeDataUnitsToBytes(*nvme->data_units_written)));
+    }
+    if (nvme->host_read_commands.has_value()) {
+      appendLabeled(out, "Host read commands:",
+                    std::to_string(*nvme->host_read_commands));
+    }
+    if (nvme->host_write_commands.has_value()) {
+      appendLabeled(out, "Host write commands:",
+                    std::to_string(*nvme->host_write_commands));
+    }
+    if (nvme->controller_busy_time_minutes.has_value()) {
+      appendLabeled(out, "Busy time:",
+                    std::to_string(*nvme->controller_busy_time_minutes) +
+                        " minutes");
+    }
+    if (nvme->power_cycles.has_value()) {
+      appendLabeled(out, "Power cycles:", std::to_string(*nvme->power_cycles));
+    }
+    if (nvme->power_on_hours.has_value()) {
+      appendLabeled(out, "Powered on:", std::to_string(*nvme->power_on_hours) +
+                                   " h");
+    }
+    if (nvme->unsafe_shutdowns.has_value()) {
+      appendLabeled(out, "Unsafe shutdowns:",
+                    std::to_string(*nvme->unsafe_shutdowns));
+    }
+    if (nvme->media_and_data_integrity_errors.has_value()) {
+      appendLabeled(out, "Media errors:",
+                    std::to_string(*nvme->media_and_data_integrity_errors));
+    }
+    if (nvme->error_information_log_entries.has_value()) {
+      appendLabeled(out, "Error log entries:",
+                    std::to_string(*nvme->error_information_log_entries));
+    }
+    if (nvme->warning_temperature_time_minutes.has_value()) {
+      appendLabeled(out, "Warning temp time:",
+                    std::to_string(*nvme->warning_temperature_time_minutes) +
+                        " minutes");
+    }
+    if (nvme->critical_temperature_time_minutes.has_value()) {
+      appendLabeled(out, "Critical temp time:",
+                    std::to_string(*nvme->critical_temperature_time_minutes) +
+                        " minutes");
+    }
+    if (nvme->critical_warning.has_value() && *nvme->critical_warning != 0) {
+      const std::vector<std::string> warnings =
+          atm::nvmeCriticalWarnings(*nvme->critical_warning);
+      out << "\nCRITICAL WARNINGS\n";
+      for (const std::string &warning : warnings) {
+        out << "- " << warning << '\n';
+      }
+    }
+  }
+
+  if (entry.last_error_category != atm::HealthErrorCategory::None) {
+    appendLabeled(out, "Last error:",
+                  entry.last_error.empty() ? s.detail : entry.last_error);
+    appendLabeled(out, "Error type:", atm::healthErrorCategoryName(
+                                         entry.last_error_category));
+  }
+  if (entry.last_success_at.has_value()) {
+    appendLabeled(out, "Last good read:",
+                  formatTimestamp(*entry.last_success_at));
+  }
+  return out.str();
 }
 
 /// Formats a duration in seconds as "Xd Xh Xm Xs" (omitting empty leading
@@ -3166,6 +3575,7 @@ std::string renderFrame(double cpu_usage, const atm::MemoryInfo &memory,
                         const atm::GpuSnapshot &gpu,
                         const atm::SensorSnapshot &sensors,
                         const atm::SystemPressureSnapshot &pressure,
+                        const atm::SystemLoadSnapshot &load,
                         const atm::SystemdSnapshot &systemd,
                         const atm::StartupSnapshot &startup,
                          const atm::SystemInfo &sysinfo,
@@ -3180,7 +3590,8 @@ std::string renderFrame(double cpu_usage, const atm::MemoryInfo &memory,
                          const atm::PackageManager &packages,
                          int refresh_interval_ms,
                          const atm::AdvancedCpuSnapshot &cpu_details,
-                         const atm::AdvancedMemorySnapshot &memory_details) {
+                         const atm::AdvancedMemorySnapshot &memory_details,
+                         const atm::DiskHealthMonitor &disk_health) {
   if (view == ViewMode::Tree) {
     // The tree view stays deliberately focused on the hierarchy; the storage
     // and network sections are part of the table view.
@@ -3190,6 +3601,7 @@ std::string renderFrame(double cpu_usage, const atm::MemoryInfo &memory,
   std::ostringstream out;
   renderHeader(out, cpu_usage, memory);
   renderSystemInfoSections(out, sysinfo);
+  renderSystemLoadSections(out, load, onlineLogicalCpuCount(cpu_details));
   renderMemorySections(out, memory, memory_details);
   renderCpuSections(out, cpu_details);
   if (show_history) {
@@ -3197,6 +3609,7 @@ std::string renderFrame(double cpu_usage, const atm::MemoryInfo &memory,
   }
   renderPressureSections(out, pressure);
   renderStorageSections(out, disk);
+  renderDiskHealthSections(out, disk_health);
   renderNetworkSections(out, network);
   renderGpuSections(out, gpu);
   renderSensorSections(out, sensors, gpu);
@@ -3220,8 +3633,9 @@ std::string renderFrame(double cpu_usage, const atm::MemoryInfo &memory,
       << alertFilterName(alert_filter) << ")\n"
       << "Manage: press 'm' (then Enter) to control a process by PID\n"
       << "Details: press 'd' (then Enter) to inspect a process in detail\n"
-      << "Network detail: press 'i' (then Enter) to inspect an interface\n"
-      << "GPU detail: press 'g' (then Enter) to inspect a GPU\n"
+<< "Network detail: press 'i' (then Enter) to inspect an interface\n"
+       << "Disk health: press 'h' (then Enter) to inspect disk health\n"
+       << "GPU detail: press 'g' (then Enter) to inspect a GPU\n"
       << "Sensor detail: press 's' (then Enter) to inspect a sensor\n"
 << "Systemd services: press 'u' (then Enter) to manage services\n"
        << "Startup apps: press 'a' (then Enter) to manage autostart\n"
@@ -3240,12 +3654,13 @@ void renderView(double cpu_usage, const atm::MemoryInfo &memory,
                 ViewMode view, const atm::ProcessTree &tree,
                 const atm::DiskSnapshot &disk,
                 const atm::NetworkSnapshot &network,
-                const atm::GpuSnapshot &gpu,
-                const atm::SensorSnapshot &sensors,
-                const atm::SystemPressureSnapshot &pressure,
-                const atm::SystemdSnapshot &systemd,
-                const atm::StartupSnapshot &startup,
-                 const atm::SystemInfo &sysinfo,
+const atm::GpuSnapshot &gpu,
+                 const atm::SensorSnapshot &sensors,
+                 const atm::SystemPressureSnapshot &pressure,
+                 const atm::SystemLoadSnapshot &load,
+                 const atm::SystemdSnapshot &systemd,
+                 const atm::StartupSnapshot &startup,
+                  const atm::SystemInfo &sysinfo,
                  const atm::HistoryManager &history,
                  bool show_history,
                  const atm::AlertManager &alerts,
@@ -3257,16 +3672,18 @@ void renderView(double cpu_usage, const atm::MemoryInfo &memory,
                  const atm::PackageManager &packages,
                  int refresh_interval_ms,
                  const atm::AdvancedCpuSnapshot &cpu_details,
-                 const atm::AdvancedMemorySnapshot &memory_details) {
+                 const atm::AdvancedMemorySnapshot &memory_details,
+                 const atm::DiskHealthMonitor &disk_health) {
   // ANSI "clear entire screen" + "cursor to home" so the multi-line frame
   // refreshes in place instead of scrolling the terminal.
   std::cout << "\033[2J\033[H";
   std::cout << renderFrame(cpu_usage, memory, processes, stats, sort, view, tree,
-                           disk, network, gpu, sensors, pressure, systemd, startup,
-                           sysinfo, history, show_history, alerts, alert_filter,
-                           service_search, service_sort, startup_search,
-                           startup_sort, packages, refresh_interval_ms,
-                           cpu_details, memory_details)
+                           disk, network, gpu, sensors, pressure, load, systemd,
+                           startup, sysinfo, history, show_history, alerts,
+                           alert_filter, service_search, service_sort,
+                           startup_search, startup_sort, packages,
+                           refresh_interval_ms, cpu_details, memory_details,
+                           disk_health)
             << std::flush;
 }
 
@@ -3328,6 +3745,7 @@ class ConsoleInput {
     Manage,
     InspectProcess,
     InspectNetwork,
+    InspectDiskHealth,
     InspectGpu,
     InspectSensors,
     InspectSystemd,
@@ -3436,6 +3854,7 @@ class ConsoleInput {
     if (token == "m" || token == "M") return Command::Manage;
     if (token == "d" || token == "D") return Command::InspectProcess;
     if (token == "i" || token == "I") return Command::InspectNetwork;
+    if (token == "h" || token == "H") return Command::InspectDiskHealth;
     if (token == "g" || token == "G") return Command::InspectGpu;
     if (token == "s" || token == "S") return Command::InspectSensors;
     if (token == "u" || token == "U") return Command::InspectSystemd;
@@ -3449,6 +3868,79 @@ class ConsoleInput {
     return Command::None;
   }
 };
+
+/// "h": disk health summary plus per-device detail. Press [1] to force a fresh
+/// background health read (permission/capability errors are highlighted, never
+/// retried as healthy), or type a device name for its full report. Health
+/// reads always run on the monitor's background worker, never on the UI thread.
+void interactDiskHealth(atm::DiskHealthMonitor &disk_health,
+                        ConsoleInput &input) {
+  for (;;) {
+    std::cout << "\033[2J\033[H";
+    std::cout << "========================================\n"
+                 "ARCH TASK MANAGER — Disk Health Detail\n"
+                 "========================================\n\n";
+    std::ostringstream summary;
+    renderDiskHealthSummary(summary, disk_health.entries());
+    std::cout << summary.str() << "\n"
+              << "[1] Refresh health data now\n"
+              << "[2] Inspect a device\n"
+              << "[0] Cancel\n"
+              << "> " << std::flush;
+
+    const std::optional<std::string> line = input.readLine();
+    if (!line) {
+      std::cout << "\nInput cancelled.\n";
+      return;
+    }
+    const std::string choice = trimWhitespace(*line);
+    if (choice.empty() || choice == "0") {
+      return;
+    }
+    if (choice == "1") {
+      const bool started = disk_health.requestRefresh(true);
+      std::cout << "\n"
+                << (started ? "Reading health data..."
+                            : "Already reading health data...")
+                << "\n"
+                << std::flush;
+      disk_health.waitForIdle();
+      continue;
+    }
+    if (choice == "2") {
+      const std::optional<std::string> name_line = input.readLine();
+      if (!name_line) {
+        std::cout << "\nInput cancelled.\n";
+        return;
+      }
+      const std::string name = trimWhitespace(*name_line);
+      if (name.empty()) {
+        continue;
+      }
+      const std::optional<atm::DiskHealthCacheEntry> entry =
+          disk_health.entryFor(name);
+      if (!entry.has_value()) {
+        std::cout << "\nUnknown device '" << name
+                  << "'. Press Enter to return.\n"
+                  << std::flush;
+        static_cast<void>(input.readLine());
+        continue;
+      }
+      std::cout << "\033[2J\033[H";
+      std::cout << "========================================\n"
+                   "ARCH TASK MANAGER — Disk Health: "
+                << name << "\n"
+                << "========================================\n\n"
+                << renderDiskHealthDetailText(*entry)
+                << "\n\nPress Enter to return.\n"
+                << std::flush;
+      static_cast<void>(input.readLine());
+      continue;
+    }
+    std::cout << "Invalid action. Press Enter to return.\n" << std::flush;
+    static_cast<void>(input.readLine());
+  }
+}
 
 /// Prints a confirmation prompt and waits for y/Y/yes (anything else is a
 /// "no"). Never refuses to return on EOF: EOF cancels.
@@ -5495,10 +5987,12 @@ int main() {
   atm::ProcessMonitor process_monitor;
   atm::ProcessStatisticsAggregator process_statistics;
   atm::DiskMonitor disk_monitor;
+  atm::DiskHealthMonitor disk_health;
   atm::NetworkMonitor network_monitor;
   atm::GpuMonitor gpu_monitor;
   atm::SensorMonitor sensor_monitor;
   atm::SystemPressureMonitor pressure_monitor;
+  atm::SystemLoadMonitor load_monitor;
   atm::SystemdManager systemd_manager;
   atm::StartupManager startup_manager;
   atm::SystemInfoProvider system_info;
@@ -5587,6 +6081,16 @@ int main() {
   static_cast<void>(sensor_monitor.read());
   systemd_manager.discover();
   static_cast<void>(pressure_monitor.read());
+  static_cast<void>(load_monitor.read());
+
+  // Disk health uses the same whole-disks discovered from /sys/block as the
+  // storage section, then starts its first read-only health pass in the
+  // background immediately so the initial frame shows real status. Health
+  // reads never run on the monitoring tick: they are (re)triggered on demand
+  // from the 'h' page only.
+  disk_health.setDevices(atm::listWholeDisks());
+  static_cast<void>(disk_health.requestRefresh(true));
+
   std::this_thread::sleep_for(std::chrono::milliseconds(refresh_interval_ms));
 
   atm::AdvancedCpuSnapshot cpu = cpu_details.read();
@@ -5607,6 +6111,7 @@ int main() {
   const atm::GpuSnapshot first_gpu = gpu_monitor.read();
   const atm::SensorSnapshot first_sensors = sensor_monitor.read();
   const atm::SystemPressureSnapshot first_pressure = pressure_monitor.read();
+  const atm::SystemLoadSnapshot first_load = load_monitor.read();
   const atm::SystemdSnapshot first_systemd = systemd_manager.read();
   const atm::StartupSnapshot first_startup = startup_manager.read();
   system_info.load(first_gpu);
@@ -5637,6 +6142,7 @@ int main() {
     history.updateCpuHistories(cpuHistoryVector(cpu));
     history.updateAdvancedMemory(buildAdvancedMemoryMetrics(memory));
     history.updatePressure(buildPressureMetrics(first_pressure));
+    history.updateLoad(buildLoadMetrics(first_load, onlineLogicalCpuCount(cpu)));
     history.updateProcessStats(proc_stats);
     updateAlerts(alerts, aggregateCpuPercent(cpu), first_memory, first_disk,
                  first_network, first_gpu, first_sensors, history);
@@ -5644,15 +6150,16 @@ int main() {
 
   renderView(aggregateCpuPercent(cpu), first_memory, snapshot.processes,
              proc_stats, sort, view, tree, first_disk, first_network, first_gpu,
-             first_sensors, first_pressure, first_systemd, first_startup,
-             sysinfo, history, show_history, alerts, alert_filter,
+             first_sensors, first_pressure, first_load, first_systemd,
+             first_startup, sysinfo, history, show_history, alerts, alert_filter,
              service_search, service_sort, startup_search, startup_sort,
-             packages, refresh_interval_ms, cpu, memory);
+             packages, refresh_interval_ms, cpu, memory, disk_health);
 
   atm::NetworkSnapshot network = first_network;
   atm::GpuSnapshot gpu = first_gpu;
   atm::SensorSnapshot sensors = first_sensors;
   atm::SystemPressureSnapshot pressure = first_pressure;
+  atm::SystemLoadSnapshot load = first_load;
   atm::SystemdSnapshot systemd = first_systemd;
   atm::StartupSnapshot startup = first_startup;
 
@@ -5736,10 +6243,11 @@ int main() {
             }
             renderView(aggregateCpuPercent(cpu), mem_info, snapshot.processes,
                        proc_stats, sort, view, tree, disk, network, gpu,
-                       sensors, pressure, systemd, startup, sysinfo, history,
-                       show_history, alerts, alert_filter, service_search,
-                       service_sort, startup_search, startup_sort, packages,
-                       refresh_interval_ms, cpu, memory);
+                       sensors, pressure, load, systemd, startup, sysinfo,
+                       history, show_history, alerts, alert_filter,
+                       service_search, service_sort, startup_search,
+                       startup_sort, packages, refresh_interval_ms, cpu,
+                       memory, disk_health);
           }
         }
         continue;
@@ -5754,6 +6262,11 @@ int main() {
       case ConsoleInput::Command::InspectNetwork:
         if (view == ViewMode::List) {
           interactNetworkDetail(network, input);
+        }
+        break;
+      case ConsoleInput::Command::InspectDiskHealth:
+        if (view == ViewMode::List) {
+          interactDiskHealth(disk_health, input);
         }
         break;
       case ConsoleInput::Command::InspectGpu:
@@ -5840,6 +6353,7 @@ int main() {
     gpu = gpu_monitor.read();
     sensors = sensor_monitor.read();
     pressure = pressure_monitor.read();
+    load = load_monitor.read();
     systemd = systemd_manager.read();
     startup = startup_manager.read();
 
@@ -5861,16 +6375,18 @@ int main() {
       history.updateCpuHistories(cpuHistoryVector(cpu));
       history.updateAdvancedMemory(buildAdvancedMemoryMetrics(memory));
       history.updatePressure(buildPressureMetrics(pressure));
+      history.updateLoad(buildLoadMetrics(load, onlineLogicalCpuCount(cpu)));
       history.updateProcessStats(proc_stats);
       updateAlerts(alerts, aggregateCpuPercent(cpu), mem_info, disk, network,
                    gpu, sensors, history);
     }
 
     renderView(aggregateCpuPercent(cpu), mem_info, snapshot.processes, proc_stats,
-               sort, view, tree, disk, network, gpu, sensors, pressure, systemd,
-               startup, sysinfo, history, show_history, alerts, alert_filter,
-               service_search, service_sort, startup_search, startup_sort,
-               packages, refresh_interval_ms, cpu, memory);
+               sort, view, tree, disk, network, gpu, sensors, pressure, load,
+               systemd, startup, sysinfo, history, show_history, alerts,
+               alert_filter, service_search, service_sort, startup_search,
+               startup_sort, packages, refresh_interval_ms, cpu, memory,
+               disk_health);
   }
 
   // Clean shutdown: persist any pending settings changes.
