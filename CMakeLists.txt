@@ -60,6 +60,7 @@ add_executable(arch-task-manager
   src/disk_health.cpp
   src/filesystem_monitor.cpp
   src/network_monitor.cpp
+  src/network_interface_details.cpp
   src/gpu_monitor.cpp
   src/sensor_monitor.cpp
   src/systemd_manager.cpp
@@ -370,3 +371,14 @@ target_include_directories(filesystem-monitor-tests PRIVATE include)
 target_link_libraries(filesystem-monitor-tests PRIVATE Threads::Threads)
 
 add_test(NAME filesystem-monitor COMMAND filesystem-monitor-tests)
+
+add_executable(network-interface-details-tests
+  tests/network_interface_details_tests.cpp
+  src/network_interface_details.cpp
+)
+
+target_include_directories(network-interface-details-tests PRIVATE include)
+
+target_link_libraries(network-interface-details-tests PRIVATE Threads::Threads)
+
+add_test(NAME network-interface-details COMMAND network-interface-details-tests)
