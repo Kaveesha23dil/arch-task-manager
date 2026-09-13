@@ -11,6 +11,8 @@
 
 namespace atm {
 
+struct NetworkLinkMetrics;  // link speed/duplex monitor state (export metadata)
+
 /// Supported network-traffic-history export formats. CSV and JSON are the only
 /// two: both are plain-text, self-describing and easy to inspect or import.
 enum class NetworkTrafficExportFormat { Csv, Json };
@@ -61,6 +63,21 @@ struct NetworkTrafficExportSummary {
   std::chrono::system_clock::time_point last_update{};
 };
 
+/// Link speed/duplex metadata serialized alongside one exported series when the
+/// monitoring layer can attribute it to a single physical interface. Absent for
+/// the aggregate and for non-physical interfaces — never a fake zero or a stale
+/// firmware value.
+struct NetworkTrafficExportLink {
+  bool physical = false;             // is a physical Ethernet/Wi-Fi/InfiniBand
+  bool link_active = false;          // availability == Connected at export time
+  std::string speed_state;           // "valid" / "stale" / "unavailable" / ...
+  std::optional<int> speed_mbps;     // last successfully reported value, if any
+  std::string speed_unit;            // the sysfs unit, "Mb/s"
+  std::string duplex;                // "full" / "half" / "unknown"
+  std::string duplex_state;          // "valid" / "stale" / "unavailable" / ...
+  std::chrono::system_clock::time_point last_update{};  // fresh-read time
+};
+
 /// Implementation-free, immutable snapshot of one traffic series ready for
 /// serialization. Contains only plain data — no pointers, no mutexes, no UI
 /// objects and no internal bookkeeping. Building this snapshot before
@@ -77,6 +94,10 @@ struct NetworkTrafficExportSnapshot {
   double retention_window_seconds = 0.0;            // first..last sample span
   NetworkTrafficExportSummary summary;
   std::vector<NetworkTrafficExportRow> samples;  // ascending timestamp order
+
+  // Link speed/duplex metadata when the exported series maps to a single
+  // physical interface (std::nullopt for the aggregate / non-physical links).
+  std::optional<NetworkTrafficExportLink> link;
 };
 
 /// Builds a stable snapshot of `series` for export. Reads only the series'
@@ -85,8 +106,11 @@ struct NetworkTrafficExportSnapshot {
 /// series' last update, and computes the summary. Pure and read-only: the
 /// series is never mutated. `max_samples` is the current retention bound (used
 /// for coverage/completeness); pass NetworkTrafficHistory::historyMaxSamples().
+/// When `link_metrics` points to the selected interface's metrics they are
+/// captured into snapshot.link (additively — existing fields are unchanged).
 [[nodiscard]] NetworkTrafficExportSnapshot buildNetworkTrafficExportSnapshot(
-    const NetworkTrafficSeries &series, std::size_t max_samples);
+    const NetworkTrafficSeries &series, std::size_t max_samples,
+    const NetworkLinkMetrics *link_metrics = nullptr);
 
 /// Formats a wall-clock time point as ISO-8601 local time
 /// "YYYY-MM-DDTHH:MM:SS". This is the timestamp format used by every export
@@ -101,15 +125,19 @@ struct NetworkTrafficExportSnapshot {
 /// Serializes a snapshot to CSV with a stable column order:
 /// timestamp, interface, identity, rx/tx bytes per second, rx/tx bits per
 /// second, cumulative rx/tx bytes, rx/tx packets per second, rx/tx errors per
-/// second, rx/tx drops per second. Unavailable metrics are empty fields (never
-/// misleading zeros); headers are always emitted, so a snapshot with no rows
-/// still produces a valid, readable CSV.
+/// second, rx/tx drops per second and — when link metrics were captured with
+/// the snapshot — the trailing link_speed/duplex columns. Link columns are
+/// append-only additions, so the leading historical columns are unchanged;
+/// without metrics the trailing columns are empty. Unavailable metrics are
+/// empty fields (never misleading zeros); headers are always emitted, so a
+/// snapshot with no rows still produces a valid, readable CSV.
 [[nodiscard]] std::string generateNetworkTrafficCsv(
     const NetworkTrafficExportSnapshot &snapshot);
 
 /// Serializes a snapshot to valid JSON with stable field names: export
 /// metadata, interface identity/name/aggregate flag, history span and sampling
-/// interval, unit information, the summary values and the sample array.
+/// interval, unit information, the summary values, an optional "link" object
+/// (link speed/duplex metadata, null when absent) and the sample array.
 /// Unavailable values are null; an empty sample array is valid; no internal
 /// implementation state is ever serialized.
 [[nodiscard]] std::string generateNetworkTrafficJson(

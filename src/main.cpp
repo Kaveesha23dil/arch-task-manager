@@ -37,6 +37,7 @@
 #include "memory_monitor.hpp"
 #include "network_monitor.hpp"
 #include "network_interface_details.hpp"
+#include "network_link_metrics.hpp"
 #include "network_link_state.hpp"
 #include "network_traffic_history.hpp"
 #include "network_traffic_alert.hpp"
@@ -197,8 +198,8 @@ constexpr std::size_t kIfDetailStateWidth = 8;
 constexpr std::size_t kIfDetailCarrierWidth = 8;
 constexpr std::size_t kIfDetailMacWidth = 18;
 constexpr std::size_t kIfDetailMtuWidth = 6;
-constexpr std::size_t kIfDetailSpeedWidth = 12;
-constexpr std::size_t kIfDetailDuplexWidth = 8;
+constexpr std::size_t kIfDetailSpeedWidth = 14;
+constexpr std::size_t kIfDetailDuplexWidth = 11;
 constexpr std::size_t kIfDetailRateWidth = 11;
 constexpr std::size_t kIfDetailAddrWidth = 22;
 constexpr std::size_t kNetworkRateWidth = 12;
@@ -861,12 +862,81 @@ std::string renderAddressList(const std::vector<atm::NetworkAddressInfo> &addres
   return out.str();
 }
 
+/// Renders the "Speed" table cell from the monitored link metrics. A stale
+/// value (preserved from before the link stopped reporting) carries a '*'
+/// marker; virtual/tunnel/loopback and never-reported interfaces read as
+/// "unavailable" — never a misleading number.
+std::string renderLinkSpeedCell(const atm::NetworkLinkMetrics &metrics) {
+  switch (metrics.speed_state) {
+    case atm::NetworkSpeedState::Valid:
+      return atm::formatNetworkSpeed(metrics.speed_mbps);
+    case atm::NetworkSpeedState::Stale:
+      return atm::formatNetworkSpeed(metrics.speed_mbps) + " *";
+    case atm::NetworkSpeedState::Unknown:
+    case atm::NetworkSpeedState::Unavailable:
+      return "unavailable";
+  }
+  return "unavailable";
+}
+
+/// Renders the "Duplex" table cell from the monitored link metrics, mirroring
+/// the speed cell ('*' marks a preserved, stale value).
+std::string renderLinkDuplexCell(const atm::NetworkLinkMetrics &metrics) {
+  switch (metrics.duplex_state) {
+    case atm::NetworkDuplexState::Valid:
+      return atm::networkDuplexModeName(metrics.duplex);
+    case atm::NetworkDuplexState::Stale:
+      return std::string(atm::networkDuplexModeName(metrics.duplex)) + " *";
+    case atm::NetworkDuplexState::Unknown:
+    case atm::NetworkDuplexState::Unavailable:
+      return "unavailable";
+  }
+  return "unavailable";
+}
+
+/// Full "Link speed:" detail value for the interface-details page and the
+/// network traffic history section (no column constraints).
+std::string renderLinkSpeedDetail(const atm::NetworkLinkMetrics &metrics) {
+  if (!metrics.physical) {
+    return "unavailable (not a physical link)";
+  }
+  switch (metrics.speed_state) {
+    case atm::NetworkSpeedState::Valid:
+      return atm::formatNetworkSpeed(metrics.speed_mbps);
+    case atm::NetworkSpeedState::Stale:
+      return atm::formatNetworkSpeed(metrics.speed_mbps) + " (stale)";
+    case atm::NetworkSpeedState::Unknown:
+    case atm::NetworkSpeedState::Unavailable:
+      return "unavailable";
+  }
+  return "unavailable";
+}
+
+/// Full "Duplex:" detail value for the interface-details page and the network
+/// traffic history section.
+std::string renderLinkDuplexDetail(const atm::NetworkLinkMetrics &metrics) {
+  if (!metrics.physical) {
+    return "unavailable (not a physical link)";
+  }
+  switch (metrics.duplex_state) {
+    case atm::NetworkDuplexState::Valid:
+      return atm::networkDuplexModeName(metrics.duplex);
+    case atm::NetworkDuplexState::Stale:
+      return std::string(atm::networkDuplexModeName(metrics.duplex)) + " (stale)";
+    case atm::NetworkDuplexState::Unknown:
+    case atm::NetworkDuplexState::Unavailable:
+      return "unavailable";
+  }
+  return "unavailable";
+}
+
 /// Renders the NETWORK INTERFACES table (link metadata + addresses + the same
 /// traffic rates as the NETWORK section). Loopback floats last, matching the
 /// traffic table; rows are stable across renames because selection keys on the
 /// sysfs ifindex, not the name.
 std::string renderNetworkInterfaceTableText(
-    const atm::NetworkInterfaceSnapshot &snapshot) {
+    const atm::NetworkInterfaceSnapshot &snapshot,
+    const atm::NetworkLinkMetricsMonitor &link_metrics_monitor) {
   std::ostringstream out;
   if (!snapshot.sysfs_readable) {
     out << "Interface details unavailable: " << snapshot.error_detail << "\n";
@@ -888,6 +958,8 @@ std::string renderNetworkInterfaceTableText(
         info.traffic ? info.traffic->rx_bytes_per_second : 0;
     const std::uint64_t tx =
         info.traffic ? info.traffic->tx_bytes_per_second : 0;
+    const atm::NetworkLinkMetrics *link_metrics =
+        link_metrics_monitor.tracked(info.identity());
     std::string state = fitTo(toUpperAscii(info.link.operstate.value_or("unknown")),
                               kIfDetailStateWidth);
     out << std::left << std::setw(kIfDetailNameWidth)
@@ -902,9 +974,16 @@ std::string renderNetworkInterfaceTableText(
         << std::setw(kIfDetailMtuWidth)
         << (info.link.mtu.has_value() ? std::to_string(*info.link.mtu) : "-")
         << std::setw(kIfDetailSpeedWidth)
-        << atm::formatNetworkSpeed(info.link.speed_mbps)
+        << fitTo(link_metrics != nullptr
+                     ? renderLinkSpeedCell(*link_metrics)
+                     : atm::formatNetworkSpeed(info.link.speed_mbps),
+                 kIfDetailSpeedWidth)
         << std::setw(kIfDetailDuplexWidth)
-        << atm::formatNetworkDuplex(info.link.duplex) << std::right
+        << fitTo(link_metrics != nullptr
+                     ? renderLinkDuplexCell(*link_metrics)
+                     : atm::formatNetworkDuplex(info.link.duplex),
+                 kIfDetailDuplexWidth)
+        << std::right
         << std::setw(kIfDetailRateWidth) << atm::formatNetworkRate(rx)
         << std::setw(kIfDetailRateWidth) << atm::formatNetworkRate(tx) << std::left
         << std::setw(kIfDetailAddrWidth)
@@ -920,7 +999,8 @@ std::string renderNetworkInterfaceTableText(
 void renderNetworkInterfaceSections(
     std::ostringstream &out,
     const atm::NetworkInterfaceMonitor &monitor,
-    const atm::NetworkLinkStateMonitor &link_state) {
+    const atm::NetworkLinkStateMonitor &link_state,
+    const atm::NetworkLinkMetricsMonitor &link_metrics_monitor) {
   out << "\n## NETWORK INTERFACES\n\n";
   const atm::NetworkLinkStateCounts &counts = link_state.counts();
   if (counts.physical_total == 0) {
@@ -936,7 +1016,7 @@ void renderNetworkInterfaceSections(
                   std::to_string(counts.unavailable));
     out << '\n';
   }
-  out << renderNetworkInterfaceTableText(monitor.current())
+  out << renderNetworkInterfaceTableText(monitor.current(), link_metrics_monitor)
       << "\nDetailed info: press 'i' (then Enter)\n";
 }
 
@@ -958,7 +1038,8 @@ void renderNetworkTrafficHistorySection(
     std::ostringstream &out, const atm::NetworkTrafficHistory &traffic,
     const std::string &selection,
     const atm::NetworkTrafficAlertMonitor &network_alert_monitor,
-    const atm::NetworkLinkStateMonitor &network_link_state) {
+    const atm::NetworkLinkStateMonitor &network_link_state,
+    const atm::NetworkLinkMetricsMonitor &link_metrics_monitor) {
   out << "\n## NETWORK TRAFFIC HISTORY\n\n";
   const atm::NetworkTrafficSeries *series = traffic.seriesFor(selection);
   const bool stale_selection = series == nullptr;
@@ -988,6 +1069,16 @@ void renderNetworkTrafficHistorySection(
           << " (operstate " << atm::networkOperStateName(tracked->oper)
           << ", carrier " << atm::networkCarrierStateName(tracked->carrier)
           << ", admin " << atm::networkAdminStateName(tracked->admin) << ")\n";
+    }
+    // The negotiated link speed and duplex are shown only for physical links
+    // that the metrics monitor could attribute to this series; the aggregate
+    // and virtual/tunnel/loopback selections never imply a link speed.
+    const atm::NetworkLinkMetrics *link_metrics =
+        link_metrics_monitor.tracked(series->identity);
+    if (link_metrics != nullptr && link_metrics->physical &&
+        link_metrics->present) {
+      out << "Link speed: " << renderLinkSpeedDetail(*link_metrics)
+          << "   Duplex: " << renderLinkDuplexDetail(*link_metrics) << '\n';
     }
   }
 
@@ -4252,7 +4343,8 @@ const atm::FilesystemMonitor &filesystems,
                          const atm::NetworkTrafficHistory &network_traffic_history,
                          const std::string &traffic_selection,
                          const atm::NetworkTrafficAlertMonitor &network_alert_monitor,
-                         const atm::NetworkLinkStateMonitor &network_link_state) {
+                         const atm::NetworkLinkStateMonitor &network_link_state,
+                         const atm::NetworkLinkMetricsMonitor &network_link_metrics) {
    if (view == ViewMode::Tree) {
     // The tree view stays deliberately focused on the hierarchy; the storage
     // and network sections are part of the table view.
@@ -4273,11 +4365,12 @@ const atm::FilesystemMonitor &filesystems,
   renderFilesystemSections(out, filesystems, fs_filter);
   renderDiskHealthSections(out, disk_health);
   renderNetworkSections(out, network);
-  renderNetworkInterfaceSections(out, network_interfaces, network_link_state);
+  renderNetworkInterfaceSections(out, network_interfaces, network_link_state,
+                                 network_link_metrics);
   renderNetworkTrafficHistorySection(out, network_traffic_history,
                                      traffic_selection,
                                      network_alert_monitor,
-                                     network_link_state);
+                                     network_link_state, network_link_metrics);
   renderGpuSections(out, gpu);
   renderSensorSections(out, sensors, gpu);
   renderAlertsSections(out, alerts, alert_filter);
@@ -4352,7 +4445,8 @@ const atm::GpuSnapshot &gpu,
                  const atm::NetworkTrafficHistory &network_traffic_history,
                  const std::string &traffic_selection,
                  const atm::NetworkTrafficAlertMonitor &network_alert_monitor,
-                 const atm::NetworkLinkStateMonitor &network_link_state) {
+                 const atm::NetworkLinkStateMonitor &network_link_state,
+                 const atm::NetworkLinkMetricsMonitor &network_link_metrics) {
   // ANSI "clear entire screen" + "cursor to home" so the multi-line frame
   // refreshes in place instead of scrolling the terminal.
   std::cout << "\033[2J\033[H";
@@ -4364,7 +4458,8 @@ const atm::GpuSnapshot &gpu,
                            refresh_interval_ms, cpu_details, memory_details,
                            disk_health, filesystems, fs_filter, network_interfaces,
                            network_traffic_history, traffic_selection,
-                           network_alert_monitor, network_link_state)
+                           network_alert_monitor, network_link_state,
+                           network_link_metrics)
             << std::flush;
 }
 
@@ -4569,6 +4664,7 @@ class ConsoleInput {
 /// message.
 void interactNetworkTrafficExport(const atm::NetworkTrafficHistory &traffic,
                                   const std::string &selection,
+                                  const atm::NetworkLinkMetricsMonitor &link_metrics,
                                   ConsoleInput &input) {
   for (;;) {
     std::cout << "\033[2J\033[H";
@@ -4629,8 +4725,9 @@ void interactNetworkTrafficExport(const atm::NetworkTrafficHistory &traffic,
     }
 
     const atm::NetworkTrafficExportSnapshot snapshot =
-        atm::buildNetworkTrafficExportSnapshot(*series,
-                                               traffic.historyMaxSamples());
+        atm::buildNetworkTrafficExportSnapshot(
+            *series, traffic.historyMaxSamples(),
+            link_metrics.tracked(effective_identity));
     if (snapshot.samples.empty()) {
       std::cout << "\nNo network traffic history samples are available to "
                    "export for this selection (history is disabled or never "
@@ -5650,6 +5747,7 @@ std::string buildNetworkInterfacePage(
     const atm::NetworkInterfaceSnapshot &snapshot,
     const atm::NetworkInterfaceMonitor &monitor,
     const atm::NetworkLinkStateMonitor &link_state,
+    const atm::NetworkLinkMetricsMonitor &link_metrics_monitor,
     const atm::NetworkInterfaceStats &traffic) {
   const auto found = std::find_if(
       snapshot.interfaces.begin(), snapshot.interfaces.end(),
@@ -5679,8 +5777,37 @@ std::string buildNetworkInterfacePage(
   if (info.link.mtu.has_value()) {
     appendLabeled(out, "  MTU:", std::to_string(*info.link.mtu));
   }
-  appendLabeled(out, "  Link speed:", atm::formatNetworkSpeed(info.link.speed_mbps));
-  appendLabeled(out, "  Duplex:", atm::formatNetworkDuplex(info.link.duplex));
+
+  // Negotiated link speed and duplex, from the metrics monitor: a fresh value
+  // while the link is active reads valid; a value retained after the link
+  // stopped reporting it reads stale; non-physical links read unavailable.
+  out << "\nLink speed and duplex\n";
+  const atm::NetworkLinkMetrics *link_metrics =
+      link_metrics_monitor.tracked(identity);
+  if (link_metrics == nullptr) {
+    appendLabeled(out, "  Speed:", atm::formatNetworkSpeed(info.link.speed_mbps));
+    appendLabeled(out, "  Duplex:", atm::formatNetworkDuplex(info.link.duplex));
+  } else {
+    appendLabeled(out, "  Speed:", renderLinkSpeedDetail(*link_metrics));
+    appendLabeled(out, "  Duplex:", renderLinkDuplexDetail(*link_metrics));
+    appendLabeled(out, "  Speed state:",
+                  atm::networkSpeedStateName(link_metrics->speed_state));
+    appendLabeled(out, "  Duplex state:",
+                  atm::networkDuplexStateName(link_metrics->duplex_state));
+    if (link_metrics->duplex == atm::NetworkDuplexMode::Half &&
+        link_metrics->duplex_state == atm::NetworkDuplexState::Valid) {
+      appendLabeled(out, "  Note:",
+                    "half duplex \u2014 reduced throughput on this link");
+    }
+    if (link_metrics->last_update ==
+        std::chrono::system_clock::time_point{}) {
+      appendLabeled(out, "  Last update:", "not yet sampled");
+    } else {
+      appendLabeled(out, "  Last update:",
+                    formatTimestamp(link_metrics->last_update));
+    }
+  }
+
   if (info.link.flags.has_value()) {
     appendLabeled(out, "  Flags:",
                   atm::formatInterfaceFlagsRaw(info.link.flags) + " " +
@@ -5805,13 +5932,15 @@ std::string buildNetworkInterfacePage(
 void interactNetworkDetail(const atm::NetworkSnapshot &network,
                            const atm::NetworkInterfaceMonitor &interfaces,
                            const atm::NetworkLinkStateMonitor &link_state,
+                           const atm::NetworkLinkMetricsMonitor &link_metrics,
                            ConsoleInput &input) {
   std::cout << "\033[2J\033[H";
   const atm::NetworkInterfaceSnapshot &iface_snapshot = interfaces.current();
   std::cout << "========================================\n"
                "ARCH TASK MANAGER — Network Interface Detail\n"
                "========================================\n\n"
-            << renderNetworkInterfaceTableText(iface_snapshot) << "\n\n"
+            << renderNetworkInterfaceTableText(iface_snapshot, link_metrics)
+            << "\n\n"
             << "Enter interface name to inspect (blank to cancel):\n> "
             << std::flush;
 
@@ -5837,8 +5966,9 @@ void interactNetworkDetail(const atm::NetworkSnapshot &network,
     return;
   }
 
-  const std::string page = buildNetworkInterfacePage(iface_snapshot, interfaces,
-                                                     link_state, *found);
+const std::string page = buildNetworkInterfacePage(iface_snapshot, interfaces,
+                                                      link_state, link_metrics,
+                                                      *found);
   if (page.empty()) {
     std::cout << "Interface does not exist (not found in the current "
                  "interface list).\n";
@@ -7495,6 +7625,7 @@ int main() {
   atm::AlertManager alerts;
   atm::NetworkTrafficAlertMonitor network_alert_monitor(alerts);
   atm::NetworkLinkStateMonitor network_link_state(alerts);
+  atm::NetworkLinkMetricsMonitor network_link_metrics;
   atm::NotificationManager notifications;
   atm::PackageManager packages;
   atm::PackageTransaction package_transaction;
@@ -7621,6 +7752,7 @@ int main() {
   static_cast<void>(network_interface_details.read(first_network));
   network_traffic_history.record(network_interface_details.current());
   network_link_state.update(network_interface_details.current());
+  network_link_metrics.update(network_interface_details.current());
   network_alert_monitor.evaluate(network_traffic_history);
   const atm::GpuSnapshot first_gpu = gpu_monitor.read();
   const atm::SensorSnapshot first_sensors = sensor_monitor.read();
@@ -7670,7 +7802,7 @@ int main() {
              packages, refresh_interval_ms, cpu, memory, disk_health,
              filesystem_monitor, fs_filter, network_interface_details,
              network_traffic_history, network_traffic_selection,
-             network_alert_monitor, network_link_state);
+             network_alert_monitor, network_link_state, network_link_metrics);
 
   atm::NetworkSnapshot network = first_network;
   atm::GpuSnapshot gpu = first_gpu;
@@ -7731,6 +7863,7 @@ int main() {
             static_cast<void>(network_interface_details.read(network));
             network_traffic_history.record(network_interface_details.current());
             network_link_state.update(network_interface_details.current());
+            network_link_metrics.update(network_interface_details.current());
             network_alert_monitor.evaluate(network_traffic_history);
             static_cast<void>(filesystem_monitor.read());
             gpu = gpu_monitor.read();
@@ -7763,16 +7896,16 @@ int main() {
               updateAlerts(alerts, aggregateCpuPercent(cpu), mem_info, disk,
                            network, gpu, sensors, history);
             }
-            renderView(aggregateCpuPercent(cpu), mem_info, snapshot.processes,
-                       proc_stats, sort, view, tree, disk, network, gpu,
-                       sensors, pressure, load, systemd, startup, sysinfo,
-                       history, show_history, alerts, alert_filter,
-                       service_search, service_sort, startup_search,
-                       startup_sort, packages, refresh_interval_ms, cpu,
-                       memory, disk_health, filesystem_monitor, fs_filter,
-                       network_interface_details, network_traffic_history,
-                       network_traffic_selection, network_alert_monitor,
-                       network_link_state);
+renderView(aggregateCpuPercent(cpu), mem_info, snapshot.processes,
+                   proc_stats, sort, view, tree, disk, network, gpu,
+                   sensors, pressure, load, systemd, startup, sysinfo,
+                   history, show_history, alerts, alert_filter,
+                   service_search, service_sort, startup_search,
+                   startup_sort, packages, refresh_interval_ms, cpu,
+                   memory, disk_health, filesystem_monitor, fs_filter,
+                   network_interface_details, network_traffic_history,
+                   network_traffic_selection, network_alert_monitor,
+                   network_link_state, network_link_metrics);
           }
         }
         continue;
@@ -7786,8 +7919,8 @@ int main() {
         break;
       case ConsoleInput::Command::InspectNetwork:
         if (view == ViewMode::List) {
-          interactNetworkDetail(network, network_interface_details, network_link_state,
-                          input);
+          interactNetworkDetail(network, network_interface_details,
+                                network_link_state, network_link_metrics, input);
         }
         break;
       case ConsoleInput::Command::InspectDiskHealth:
@@ -7868,7 +8001,8 @@ int main() {
       case ConsoleInput::Command::ExportNetworkTraffic:
         if (view == ViewMode::List) {
           interactNetworkTrafficExport(network_traffic_history,
-                                       network_traffic_selection, input);
+                                       network_traffic_selection,
+                                       network_link_metrics, input);
         }
         break;
       case ConsoleInput::Command::ToggleHistory:
@@ -7923,6 +8057,7 @@ int main() {
     static_cast<void>(network_interface_details.read(network));
     network_traffic_history.record(network_interface_details.current());
     network_link_state.update(network_interface_details.current());
+    network_link_metrics.update(network_interface_details.current());
     network_alert_monitor.evaluate(network_traffic_history);
     static_cast<void>(filesystem_monitor.read());
     gpu = gpu_monitor.read();
@@ -7963,7 +8098,7 @@ int main() {
                startup_sort, packages, refresh_interval_ms, cpu, memory,
                disk_health, filesystem_monitor, fs_filter, network_interface_details,
                network_traffic_history, network_traffic_selection,
-               network_alert_monitor, network_link_state);
+               network_alert_monitor, network_link_state, network_link_metrics);
   }
 
   // Clean shutdown: persist any pending settings changes.
