@@ -5,6 +5,7 @@
 #include <cerrno>
 #include <cstdlib>
 #include <sstream>
+#include <unordered_set>
 
 namespace atm::cfg {
 namespace {
@@ -178,6 +179,58 @@ void applyEntry(AppSettings &s, const std::string &section,
     return;
   }
 
+  // Rule tables: [alerts.network_rule.<i>]
+  {
+    std::string_view sv(section);
+    static constexpr std::string_view kPrefix = "alerts.network_rule.";
+    if (sv.size() > kPrefix.size() && sv.substr(0, kPrefix.size()) == kPrefix) {
+      std::string_view idx_part = sv.substr(kPrefix.size());
+      bool all_digits = !idx_part.empty() &&
+                        std::all_of(idx_part.begin(), idx_part.end(),
+                                    [](char c) { return c >= '0' && c <= '9'; });
+      if (!all_digits) {
+        addProblem("unrecognized setting (ignored)");
+        return;
+      }
+      char *end = nullptr;
+      errno = 0;
+      std::string idx_str(idx_part);
+      const long idx_long = std::strtol(idx_str.c_str(), &end, 10);
+      if (errno != 0 || end == nullptr || *end != '\0' || idx_long < 0) {
+        addProblem("invalid network rule index");
+        return;
+      }
+      const auto idx = static_cast<std::size_t>(idx_long);
+      if (idx >= kMaxNetworkTrafficAlertRules) {
+        addProblem("network rule index exceeds maximum (ignored)");
+        return;
+      }
+      s.alerts.network_rules.resize(
+          std::max(s.alerts.network_rules.size(), idx + 1));
+      // Map the key to a field.
+      NetworkTrafficAlertRuleField field{};
+      bool field_found = false;
+      for (int f = 0;
+           f <= static_cast<int>(NetworkTrafficAlertRuleField::Name); ++f) {
+        const auto ft = static_cast<NetworkTrafficAlertRuleField>(f);
+        if (key == networkTrafficAlertRuleFieldName(ft)) {
+          field = ft;
+          field_found = true;
+          break;
+        }
+      }
+      if (!field_found) {
+        addProblem("unrecognized setting (ignored)");
+        return;
+      }
+      if (!applyNetworkTrafficAlertRuleField(s.alerts.network_rules[idx], field,
+                                              raw)) {
+        addProblem("invalid config value for");
+      }
+      return;
+    }
+  }
+
   if (section == "notifications") {
     if (key == "enabled")
       setBool(s.notifications.enabled);
@@ -292,6 +345,16 @@ std::vector<std::string> AppSettings::validate() const {
            kMaxPercentThreshold);
   category("alerts.temperature", alerts.temperature, kMaxTemperatureWarning,
            kMaxTemperatureCritical);
+  for (std::size_t i = 0; i < alerts.network_rules.size(); ++i) {
+    const NetworkTrafficAlertValidation res =
+        validateNetworkTrafficAlertRule(alerts.network_rules[i]);
+    if (!res.valid) {
+      for (const std::string &problem : res.problems) {
+        problems.push_back("alerts.network_rule." + std::to_string(i) + ": " +
+                           problem);
+      }
+    }
+  }
   range("notifications.cooldown_seconds", notifications.cooldown_seconds,
         kMinCooldownSeconds, kMaxCooldownSeconds);
   range("notifications.timeout_ms", notifications.timeout_ms,
@@ -356,6 +419,33 @@ std::vector<std::string> AppSettings::clampAndFix() {
   fixCategory(alerts.temperature, "alerts.temperature", kMaxTemperatureWarning,
               kMaxTemperatureCritical, {true, 75.0, 90.0});
 
+  // Network-traffic rules: clamp repairable fields, drop the unrepairable and
+  // the duplicates (same target identity + alert type).
+  {
+    std::vector<NetworkTrafficAlertRule> kept;
+    kept.reserve(alerts.network_rules.size());
+    std::unordered_set<std::string> seen;
+    for (std::size_t i = 0; i < alerts.network_rules.size(); ++i) {
+      NetworkTrafficAlertRule rule = alerts.network_rules[i];
+      const NetworkTrafficAlertValidation res = clampNetworkTrafficAlertRule(rule);
+      for (const std::string &problem : res.problems) {
+        note("alerts.network_rule." + std::to_string(i) + ": " + problem);
+      }
+      if (!res.valid) {
+        note("dropping invalid network rule " + std::to_string(i));
+        continue;
+      }
+      const std::string key = rule.target_identity + "|" +
+                              std::to_string(static_cast<int>(rule.type));
+      if (!seen.insert(key).second) {
+        note("dropping duplicate network rule " + std::to_string(i));
+        continue;
+      }
+      kept.push_back(std::move(rule));
+    }
+    alerts.network_rules = std::move(kept);
+  }
+
   clampIntField(notifications.cooldown_seconds, kMinCooldownSeconds,
                 kMaxCooldownSeconds, "notifications.cooldown_seconds");
   clampIntField(notifications.timeout_ms, kMinNotificationTimeoutMs,
@@ -396,6 +486,11 @@ std::string serializeSettings(const AppSettings &s) {
   writeCategory("alerts.swap", s.alerts.swap);
   writeCategory("alerts.disk", s.alerts.disk);
   writeCategory("alerts.temperature", s.alerts.temperature);
+
+  for (std::size_t i = 0; i < s.alerts.network_rules.size(); ++i) {
+    out << '\n';
+    writeNetworkTrafficAlertRule(out, i, s.alerts.network_rules[i]);
+  }
 
   out << "\n[notifications]\n"
       << "enabled = " << boolText(s.notifications.enabled) << '\n'

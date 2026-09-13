@@ -4,6 +4,8 @@
 #include <string_view>
 #include <vector>
 
+#include "network_traffic_alert.hpp"
+
 namespace atm::cfg {
 
 /// Schema/format version written into every configuration file. Future
@@ -62,6 +64,7 @@ struct AlertSettings {
   AlertCategorySettings disk;
   AlertCategorySettings temperature;
   int recovery_hysteresis = 5;  // recovery = warning - hysteresis
+  std::vector<atm::NetworkTrafficAlertRule> network_rules;
 };
 
 /// Desktop-notification behaviour. Mirrors the fields used by the existing

@@ -50,6 +50,13 @@ const char *alertTypeName(AlertType type) {
     case AlertType::DiskWriteActivity:return "Disk write";
     case AlertType::NetworkReceive:   return "Network receive";
     case AlertType::NetworkTransmit:  return "Network transmit";
+    case AlertType::NetworkCombined:  return "Network combined";
+    case AlertType::NetworkRxPackets:  return "Network RX packets";
+    case AlertType::NetworkTxPackets:  return "Network TX packets";
+    case AlertType::NetworkRxErrors:   return "Network RX errors";
+    case AlertType::NetworkTxErrors:   return "Network TX errors";
+    case AlertType::NetworkRxDropped:  return "Network RX dropped";
+    case AlertType::NetworkTxDropped:  return "Network TX dropped";
     case AlertType::GpuUsage:         return "GPU usage";
     case AlertType::GpuMemoryUsage:   return "GPU memory";
     case AlertType::Temperature:      return "Temperature";
@@ -101,6 +108,18 @@ AlertThreshold AlertDefaults::forType(AlertType type) {
       break;
     case AlertType::NetworkTransmit:
       t.warning = 125.0; t.critical = 250.0; t.recovery = 100.0;
+      t.enabled = false;
+      break;
+    case AlertType::NetworkCombined:
+    case AlertType::NetworkRxPackets:
+    case AlertType::NetworkTxPackets:
+    case AlertType::NetworkRxErrors:
+    case AlertType::NetworkTxErrors:
+    case AlertType::NetworkRxDropped:
+    case AlertType::NetworkTxDropped:
+      // Per-rule network alerts are configured individually (rule objects);
+      // the manager-level thresholds for these types stay disabled so nothing
+      // is ever tripped from the five user-facing category settings page.
       t.enabled = false;
       break;
     case AlertType::GpuUsage:
@@ -319,6 +338,54 @@ void AlertManager::updateNetwork(double rx_bps, double tx_bps) {
                "High network transmit rate: ");
     }
   }
+}
+
+void AlertManager::recordRuleEvent(AlertType type, const std::string &source,
+                                   AlertSeverity severity, double value,
+                                   double threshold,
+                                   const std::string &message) {
+  const std::string key = subjectKey(type, source);
+  SubjectState &state = subjects_[key];
+
+  // Unavailable/sentinel values never change state; keep the latest real value
+  // for the dashboard and stay quiet.
+  if (!std::isfinite(value)) {
+    state.value = 0.0;
+    return;
+  }
+  state.value = value;
+
+  // No severity transition -> no new history event (the external monitor can
+  // still repeat notifications under its own policy).
+  if (state.severity == severity) {
+    state.threshold = threshold;
+    return;
+  }
+
+  AlertEvent event;
+  event.type = type;
+  event.severity = severity;
+  event.source = source;
+  event.value = value;
+  event.threshold = threshold;
+  event.is_recovery = (severity == AlertSeverity::Normal);
+  event.message = message;
+  event.timestamp = std::chrono::system_clock::now();
+
+  state.severity = severity;
+  state.threshold = threshold;
+  pushEvent(event);
+
+  // Deliberately no notification sink here: the external monitor owns its
+  // delivery policy (per-rule notify flag, cooldown, repeat).
+}
+
+void AlertManager::clearSubject(AlertType type, const std::string &source) {
+  const auto it = subjects_.find(subjectKey(type, source));
+  if (it == subjects_.end() || it->second.severity == AlertSeverity::Normal) {
+    return;
+  }
+  it->second.severity = AlertSeverity::Normal;
 }
 
 void AlertManager::updateGpu(const std::string &id, double usage_percent,

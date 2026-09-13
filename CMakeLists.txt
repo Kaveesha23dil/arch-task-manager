@@ -63,6 +63,7 @@ add_executable(arch-task-manager
   src/network_interface_details.cpp
   src/network_traffic_history.cpp
   src/network_traffic_history_export.cpp
+  src/network_traffic_alert.cpp
   src/gpu_monitor.cpp
   src/sensor_monitor.cpp
   src/systemd_manager.cpp
@@ -105,6 +106,9 @@ add_executable(settings-tests
   src/history_manager.cpp
   src/notification_manager.cpp
   src/resource_history.cpp
+  src/network_traffic_alert.cpp
+  src/network_traffic_history.cpp
+  src/network_interface_details.cpp
 )
 
 target_include_directories(settings-tests PRIVATE include)
@@ -121,6 +125,8 @@ add_executable(autostart-tests
   src/logger.cpp
   src/settings.cpp
   src/settings_manager.cpp
+  src/network_traffic_alert.cpp
+  src/alert_manager.cpp
 )
 
 target_include_directories(autostart-tests PRIVATE include)
@@ -432,3 +438,19 @@ target_include_directories(network-traffic-history-export-tests PRIVATE include)
 target_link_libraries(network-traffic-history-export-tests PRIVATE Threads::Threads)
 
 add_test(NAME network-traffic-history-export COMMAND network-traffic-history-export-tests)
+
+add_executable(network-traffic-alert-tests
+  tests/network_traffic_alert_tests.cpp
+  src/network_traffic_alert.cpp
+  src/network_traffic_history.cpp
+  src/network_interface_details.cpp
+  src/alert_manager.cpp
+  src/network_monitor.cpp
+  src/logger.cpp
+)
+
+target_include_directories(network-traffic-alert-tests PRIVATE include)
+
+target_link_libraries(network-traffic-alert-tests PRIVATE Threads::Threads)
+
+add_test(NAME network-traffic-alert COMMAND network-traffic-alert-tests)

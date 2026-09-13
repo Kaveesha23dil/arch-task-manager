@@ -20,6 +20,35 @@ namespace atm {
 /// "name:<name>").
 inline constexpr std::string_view kNetworkTrafficAllIdentity = "all";
 
+/// Derived transfer rates for one refresh window (rate = counter delta /
+/// elapsed seconds; bytes per second for bytes, packets per second for the
+/// packet and error/drop counters). A std::nullopt rate means "cannot be
+/// calculated safely for this window" — no previous baseline yet, zero/negative
+/// elapsed time, a counter reset or wraparound detected, or the counter not
+/// reported this tick — never a fake zero and never a bogus spike.
+struct NetworkTrafficRates {
+  std::optional<double> rx_bytes_per_second;
+  std::optional<double> tx_bytes_per_second;
+  std::optional<double> rx_packets_per_second;
+  std::optional<double> tx_packets_per_second;
+  std::optional<double> rx_errors_per_second;
+  std::optional<double> tx_errors_per_second;
+  std::optional<double> rx_dropped_per_second;
+  std::optional<double> tx_dropped_per_second;
+};
+
+/// Snapshot of the most recent record() tick: derived rates and display names
+/// for every identity that was sampled. The alert monitor evaluates rules
+/// against this single, validated data source — no second polling loop and no
+/// re-derivation of rates.
+struct NetworkTrafficTick {
+  std::chrono::steady_clock::time_point timestamp{};
+  std::chrono::system_clock::time_point wall_clock{};
+  std::unordered_map<std::string, NetworkTrafficRates> rates;  // identity -> rates
+  std::unordered_map<std::string, std::string> names;          // identity -> display name
+  [[nodiscard]] bool empty() const { return rates.empty(); }
+};
+
 /// Default bound for each traffic-history ring buffer (samples). Mirrors the
 /// other per-entity history defaults so the "history retention" setting is the
 /// single knob: services stay bounded and consistent with ResourcesHistory.
@@ -39,23 +68,6 @@ struct NetworkTrafficCounters {
   std::optional<std::uint64_t> tx_errors;
   std::optional<std::uint64_t> rx_dropped;
   std::optional<std::uint64_t> tx_dropped;
-};
-
-/// Derived transfer rates for one refresh window (rate = counter delta /
-/// elapsed seconds; bytes per second for bytes, packets per second for the
-/// packet and error/drop counters). A std::nullopt rate means "cannot be
-/// calculated safely for this window" — no previous baseline yet, zero/negative
-/// elapsed time, a counter reset or wraparound detected, or the counter not
-/// reported this tick — never a fake zero and never a bogus spike.
-struct NetworkTrafficRates {
-  std::optional<double> rx_bytes_per_second;
-  std::optional<double> tx_bytes_per_second;
-  std::optional<double> rx_packets_per_second;
-  std::optional<double> tx_packets_per_second;
-  std::optional<double> rx_errors_per_second;
-  std::optional<double> tx_errors_per_second;
-  std::optional<double> rx_dropped_per_second;
-  std::optional<double> tx_dropped_per_second;
 };
 
 /// Full per-interface sample for one refresh: stable identity, the current
@@ -186,6 +198,14 @@ class NetworkTrafficHistory {
   /// run or will run); the interface membership set is tracked separately.
   [[nodiscard]] bool aggregateAvailable() const;
 
+  /// The most recent record() tick (derived rates + display names per
+  /// identity), or nullptr when nothing has been recorded yet. The alert
+  /// monitor reads exactly these values — the same validated rates the graphs
+  /// and export use.
+  [[nodiscard]] const NetworkTrafficTick *lastTick() const {
+    return last_tick_.empty() ? nullptr : &last_tick_;
+  }
+
   void setHistoryMaxSamples(std::size_t max_samples);
   [[nodiscard]] std::size_t historyMaxSamples() const { return max_samples_; }
 
@@ -205,6 +225,10 @@ class NetworkTrafficHistory {
   std::unordered_map<std::string, NetworkTrafficCounters> baselines_;
   std::optional<std::chrono::steady_clock::time_point> previous_refresh_;
   std::vector<std::string> aggregate_members_;  // non-loopback identities last tick
+
+  // Most recent record() batch: derived rates + display names keyed by stable
+  // identity (aggregate included). Read by the alert monitor only.
+  NetworkTrafficTick last_tick_;
 
   std::size_t max_samples_ = kDefaultNetworkTrafficHistorySamples;
   bool history_paused_ = false;
