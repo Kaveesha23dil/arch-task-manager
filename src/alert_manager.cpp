@@ -60,6 +60,7 @@ const char *alertTypeName(AlertType type) {
     case AlertType::GpuUsage:         return "GPU usage";
     case AlertType::GpuMemoryUsage:   return "GPU memory";
     case AlertType::Temperature:      return "Temperature";
+    case AlertType::LinkStateChanged: return "Link state";
   }
   return "Unknown";
 }
@@ -122,6 +123,11 @@ AlertThreshold AlertDefaults::forType(AlertType type) {
       // is ever tripped from the five user-facing category settings page.
       t.enabled = false;
       break;
+    case AlertType::LinkStateChanged:
+      // Link-state transitions are recorded directly by the link-state monitor
+      // (recordRuleEvent), never by threshold evaluation.
+      t.enabled = false;
+      break;
     case AlertType::GpuUsage:
       t.warning = 85.0; t.critical = 95.0; t.recovery = 80.0; t.enabled = true;
       break;
@@ -137,7 +143,7 @@ AlertThreshold AlertDefaults::forType(AlertType type) {
 
 AlertManager::AlertManager(std::size_t max_history) : max_history_(max_history) {
   // Initialise thresholds for every alert type.
-  for (int i = 0; i <= static_cast<int>(AlertType::Temperature); ++i) {
+  for (int i = 0; i <= static_cast<int>(AlertType::LinkStateChanged); ++i) {
     const AlertType type = static_cast<AlertType>(i);
     thresholds_[type] = AlertDefaults::forType(type);
   }

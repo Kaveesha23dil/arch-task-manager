@@ -61,6 +61,7 @@ add_executable(arch-task-manager
   src/filesystem_monitor.cpp
   src/network_monitor.cpp
   src/network_interface_details.cpp
+  src/network_link_state.cpp
   src/network_traffic_history.cpp
   src/network_traffic_history_export.cpp
   src/network_traffic_alert.cpp
@@ -470,3 +471,18 @@ target_include_directories(network-traffic-viz-tests PRIVATE include)
 target_link_libraries(network-traffic-viz-tests PRIVATE Threads::Threads)
 
 add_test(NAME network-traffic-viz COMMAND network-traffic-viz-tests)
+
+add_executable(network-link-state-tests
+  tests/network_link_state_tests.cpp
+  src/network_link_state.cpp
+  src/network_interface_details.cpp
+  src/alert_manager.cpp
+  src/network_monitor.cpp
+  src/resource_history.cpp
+)
+
+target_include_directories(network-link-state-tests PRIVATE include)
+
+target_link_libraries(network-link-state-tests PRIVATE Threads::Threads)
+
+add_test(NAME network-link-state COMMAND network-link-state-tests)

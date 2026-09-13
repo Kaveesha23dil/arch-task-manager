@@ -31,6 +31,7 @@ enum class AlertType {
   GpuUsage,           // per-GPU utilization
   GpuMemoryUsage,     // per-GPU VRAM usage
   Temperature,        // per-sensor temperature
+  LinkStateChanged,   // network interface availability/link-state transitions
 };
 
 /// Current severity of a monitored metric, derived from its thresholds.
