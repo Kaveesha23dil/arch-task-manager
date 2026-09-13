@@ -40,6 +40,7 @@
 #include "network_traffic_history.hpp"
 #include "network_traffic_alert.hpp"
 #include "network_traffic_history_export.hpp"
+#include "network_traffic_viz.hpp"
 #include "notification_manager.hpp"
 #include "package_manager.hpp"
 #include "package_transaction.hpp"
@@ -927,18 +928,25 @@ void renderNetworkInterfaceSections(std::ostringstream &out,
 /// formatters; declared here so the traffic section can use it).
 std::string formatTimestamp(std::chrono::system_clock::time_point timestamp);
 
-/// Renders the NETWORK TRAFFIC HISTORY section: RX/TX byte-rate graphs plus
-/// current/peak/in-window-total/samples/span/last-update for one selected
-/// series (the aggregate or a tracked interface). Everything is read from the
-/// NetworkTrafficHistory ring buffers — the renderer never touches the network
-/// itself and never parses /proc/net/dev again. The 'c' key cycles the
+/// Renders the NETWORK TRAFFIC HISTORY section: one overlaid RX/TX throughput
+/// chart plus current/peak/in-window-total/samples/span/last-update for one
+/// selected series (the aggregate or a tracked interface). Everything is read
+/// from the NetworkTrafficHistory ring buffers — the renderer never touches the
+/// network itself and never parses /proc/net/dev again. The 'c' key cycles the
 /// selection; a stale selection (removed interface) falls back to the
-/// aggregate via displayNameFor()/seriesFor() behaviour in the component.
+/// aggregate with an explanatory note. Per-identity alert status is included by
+/// reading the alert monitor's already-computed statuses (never evaluated in
+/// the renderer).
 void renderNetworkTrafficHistorySection(
     std::ostringstream &out, const atm::NetworkTrafficHistory &traffic,
-    const std::string &selection) {
+    const std::string &selection,
+    const atm::NetworkTrafficAlertMonitor &network_alert_monitor) {
   out << "\n## NETWORK TRAFFIC HISTORY\n\n";
   const atm::NetworkTrafficSeries *series = traffic.seriesFor(selection);
+  const bool stale_selection = series == nullptr;
+  if (series == nullptr) {
+    series = traffic.seriesFor(std::string(atm::kNetworkTrafficAllIdentity));
+  }
   if (series == nullptr) {
     out << "Traffic history: no interfaces sampled yet (waiting for the next "
            "network read).\n"
@@ -946,36 +954,22 @@ void renderNetworkTrafficHistorySection(
     return;
   }
 
-  out << "History: " << series->display_name
+  out << "Interface: " << series->display_name
       << "  (press 'c' to cycle)\n";
-
-  atm::GraphConfig rate;
-  rate.width = 40;
-  rate.height = 6;
-  rate.dynamic_scale = true;
-
-  // Current/peak from the derived byte-rate rings (bytes/s).
-  double rx_current = 0.0, rx_peak = 0.0;
-  for (const atm::TimedSample &sample : series->rx_bytes_per_second.samples()) {
-    rx_current = sample.value;
-    rx_peak = std::max(rx_peak, sample.value);
-  }
-  double tx_current = 0.0, tx_peak = 0.0;
-  for (const atm::TimedSample &sample : series->tx_bytes_per_second.samples()) {
-    tx_current = sample.value;
-    tx_peak = std::max(tx_peak, sample.value);
+  if (stale_selection && selection != atm::kNetworkTrafficAllIdentity) {
+    out << "Note: selected interface '" << selection
+        << "' is no longer present \u2014 showing the aggregate.\n";
   }
 
-  const bool has_rates = !series->rx_bytes_per_second.empty() ||
-                         !series->tx_bytes_per_second.empty();
-  if (has_rates) {
-    out << "[RX rate]\n"
-        << atm::GraphRenderer::renderText(series->rx_bytes_per_second, rate, "",
-                                          "B/s")
-        << '\n'
-        << "[TX rate]\n"
-        << atm::GraphRenderer::renderText(series->tx_bytes_per_second, rate, "",
-                                          "B/s")
+  const atm::NetworkTrafficSummary summary =
+      atm::summarizeNetworkTrafficSeries(*series);
+
+  if (summary.has_rate_data) {
+    atm::NetworkTrafficChartConfig chart;
+    chart.data_width = 40;
+    chart.data_height = 6;
+    out << atm::renderNetworkTrafficChart(series->rx_bytes_per_second,
+                                          series->tx_bytes_per_second, chart)
         << '\n';
   } else {
     out << "[RX rate]      (no samples yet)\n"
@@ -989,50 +983,84 @@ void renderNetworkTrafficHistorySection(
         value > 0.0 ? static_cast<std::uint64_t>(value) : 0);
   };
 
-  // Total transferred during the retained window (last - first cumulative
-  // sample). A counter reset inside the window or an aggregate membership
-  // change makes the delta unreliable: reported as unavailable, never a bogus
-  // negative or a doubled value.
-  const auto windowTotal = [](const atm::ResourceHistory<atm::TimedSample> &ring)
-      -> std::optional<double> {
-    if (ring.size() < 2) {
-      return std::nullopt;
-    }
-    const double delta = ring.samples().back().value - ring.samples().front().value;
-    return delta >= 0.0 ? std::optional<double>(delta) : std::nullopt;
-  };
-  const std::optional<double> rx_total = windowTotal(series->rx_bytes_total);
-  const std::optional<double> tx_total = windowTotal(series->tx_bytes_total);
-
-  out << "Current RX: " << formatWs(rx_current)
-      << "   Peak RX: " << formatWs(rx_peak) << '\n'
-      << "Current TX: " << formatWs(tx_current)
-      << "   Peak TX: " << formatWs(tx_peak) << '\n';
+  out << "Current RX: " << formatWs(summary.rx_current)
+      << "   Peak RX: " << formatWs(summary.rx_peak) << '\n'
+      << "Current TX: " << formatWs(summary.tx_current)
+      << "   Peak TX: " << formatWs(summary.tx_peak) << '\n';
 
   out << "Total in window: RX "
-      << (rx_total.has_value() ? atm::formatBytes(static_cast<std::uint64_t>(*rx_total))
-                               : "n/a (counter reset / insufficient data)")
+      << (summary.rx_window_total.has_value()
+              ? atm::formatBytes(static_cast<std::uint64_t>(*summary.rx_window_total))
+              : "n/a (counter reset / insufficient data)")
       << "   TX "
-      << (tx_total.has_value() ? atm::formatBytes(static_cast<std::uint64_t>(*tx_total))
-                               : "n/a")
+      << (summary.tx_window_total.has_value()
+              ? atm::formatBytes(static_cast<std::uint64_t>(*summary.tx_window_total))
+              : "n/a")
       << '\n';
 
   // Samples and time span (steady clock range of the recorded cumulative ring).
-  out << "Samples: " << series->rx_bytes_total.size();
-  if (series->rx_bytes_total.size() >= 2) {
-    const double span_seconds = std::chrono::duration<double>(
-        series->rx_bytes_total.samples().back().timestamp -
-        series->rx_bytes_total.samples().front().timestamp)
-                                    .count();
+  out << "Samples: " << summary.sample_count;
+  if (series->rx_bytes_total.size() >= 2 && summary.span_seconds >= 0.0) {
     out << "   Span: "
-        << (span_seconds < 1.0 ? "<1 s"
-                               : std::to_string(static_cast<long long>(span_seconds)) +
-                                     " s");
+        << (summary.span_seconds < 1.0
+                ? "<1 s"
+                : std::to_string(static_cast<long long>(summary.span_seconds)) +
+                      " s");
   }
   out << "   Updated: " << formatTimestamp(series->last_update) << '\n';
 
+  // Alert status for this identity — read from the monitor's statuses only,
+  // never evaluated or derived here.
+  const auto activeStatus = [](atm::NetworkTrafficAlertRuleStatus status) {
+    return status == atm::NetworkTrafficAlertRuleStatus::Pending ||
+           status == atm::NetworkTrafficAlertRuleStatus::Exceeded ||
+           status == atm::NetworkTrafficAlertRuleStatus::Cooldown;
+  };
+  bool any_matching_rule = false;
+  bool any_active = false;
+  for (const atm::NetworkTrafficRuleStatus &st :
+       network_alert_monitor.statuses()) {
+    if (st.rule.target_identity != series->identity) {
+      continue;
+    }
+    any_matching_rule = true;
+    if (activeStatus(st.status)) {
+      any_active = true;
+    }
+  }
+  if (any_matching_rule) {
+    if (any_active) {
+      out << "Alerts:\n";
+      for (const atm::NetworkTrafficRuleStatus &st :
+           network_alert_monitor.statuses()) {
+        if (st.rule.target_identity != series->identity ||
+            !activeStatus(st.status)) {
+          continue;
+        }
+        out << "  \u26a0 " << atm::alertSeverityName(st.rule.severity)
+            << ' ' << atm::networkTrafficAlertTypeName(st.rule.type)
+            << " on '" << st.rule.target_identity << "': "
+            << (st.available
+                    ? atm::networkTrafficAlertFormatValue(st.rule.type, st.value)
+                    : "n/a")
+            << " (limit "
+            << atm::networkTrafficAlertFormatValue(st.rule.type, st.rule.threshold)
+            << ") \u2192 " << atm::networkTrafficAlertRuleStatusName(st.status);
+        if (st.status == atm::NetworkTrafficAlertRuleStatus::Pending &&
+            st.rule.confirmation ==
+                atm::NetworkTrafficAlertConfirmation::Samples) {
+          out << " (" << st.pending_samples << '/' << st.rule.confirmation_samples
+              << ')';
+        }
+        out << '\n';
+      }
+    } else {
+      out << "Alerts: no active breaches for this interface.\n";
+    }
+  }
+
   if (series->aggregate) {
-    out << "Note: the aggregate includes virtual/bridge/tunnel interfaces — "
+    out << "Note: the aggregate includes virtual/bridge/tunnel interfaces \u2014 "
            "not physical link throughput. Totals are the sum of all "
            "non-loopback interface counters.\n";
     if (series->membership_changed) {
@@ -4203,7 +4231,8 @@ const atm::FilesystemMonitor &filesystems,
   renderNetworkSections(out, network);
   renderNetworkInterfaceSections(out, network_interfaces);
   renderNetworkTrafficHistorySection(out, network_traffic_history,
-                                     traffic_selection);
+                                     traffic_selection,
+                                     network_alert_monitor);
   renderGpuSections(out, gpu);
   renderSensorSections(out, sensors, gpu);
   renderAlertsSections(out, alerts, alert_filter);
