@@ -38,6 +38,7 @@
 #include "network_monitor.hpp"
 #include "network_interface_details.hpp"
 #include "network_traffic_history.hpp"
+#include "network_traffic_history_export.hpp"
 #include "notification_manager.hpp"
 #include "package_manager.hpp"
 #include "package_transaction.hpp"
@@ -4110,6 +4111,8 @@ const atm::FilesystemMonitor &filesystems,
       << "Details: press 'd' (then Enter) to inspect a process in detail\n"
 << "Network detail: press 'i' (then Enter) to inspect an interface\n"
         << "Network traffic: press 'c' (then Enter) to cycle the history graph\n"
+        << "Network traffic export: press 'x' (then Enter) to export the "
+           "traffic history\n"
         << "Disk health: press 'h' (then Enter) to inspect disk health\n"
        << "Filesystems: press 'w' (then Enter) to inspect filesystems\n"
        << "GPU detail: press 'g' (then Enter) to inspect a GPU\n"
@@ -4238,6 +4241,7 @@ class ConsoleInput {
     InspectPackages,
     InspectSettings,
     CycleNetworkTraffic,
+    ExportNetworkTraffic,
     ToggleHistory,
     ToggleAlertFilter,
     ToggleNotifications,
@@ -4349,12 +4353,148 @@ class ConsoleInput {
     if (token == "p" || token == "P") return Command::InspectPackages;
     if (token == "o" || token == "O") return Command::InspectSettings;
     if (token == "c" || token == "C") return Command::CycleNetworkTraffic;
+    if (token == "x" || token == "X") return Command::ExportNetworkTraffic;
     if (token == "r" || token == "R") return Command::ToggleHistory;
     if (token == "f" || token == "F") return Command::ToggleAlertFilter;
     if (token == "n" || token == "N") return Command::ToggleNotifications;
     return Command::None;
   }
 };
+
+/// "x": exports the currently selected network traffic history series —
+/// the aggregate or a tracked interface — as CSV or JSON.
+///
+/// Reads only the retained ring buffers through a stable, immutable snapshot;
+/// the selection, the chart and the history retention are never reset, and no
+/// extra network read is triggered. A stale selection (interface vanished /
+/// recreated with a new index) falls back to the aggregate exactly like
+/// displayNameFor() does, so an export is never silently mislabelled. Follows
+/// the process-report export flow: format prompt, destination prompt with a
+/// default filename, overwrite confirmation, then a clear success/failure
+/// message.
+void interactNetworkTrafficExport(const atm::NetworkTrafficHistory &traffic,
+                                  const std::string &selection,
+                                  ConsoleInput &input) {
+  for (;;) {
+    std::cout << "\033[2J\033[H";
+    std::cout << "========================================\n"
+                 "ARCH TASK MANAGER — Network Traffic Export\n"
+                 "========================================\n\n";
+
+    const atm::NetworkTrafficSeries *series = traffic.seriesFor(selection);
+    std::string effective_identity = selection;
+    if (series == nullptr) {
+      series = traffic.seriesFor(std::string(atm::kNetworkTrafficAllIdentity));
+      effective_identity = std::string(atm::kNetworkTrafficAllIdentity);
+    }
+    if (series == nullptr) {
+      std::cout << "No network traffic has been collected yet.\n"
+                   "[0] Back\n> "
+                << std::flush;
+      const std::optional<std::string> line = input.readLine();
+      if (!line) {
+        return;
+      }
+      const std::string choice = trimWhitespace(*line);
+      if (choice.empty() || choice == "0") {
+        return;
+      }
+      continue;
+    }
+
+    std::cout << "Selection: " << series->display_name;
+    if (effective_identity != selection) {
+      std::cout << "  (the previously selected interface is gone; exporting "
+                   "the aggregate instead)";
+    }
+    std::cout << "\n\n"
+              << "[1] Export as CSV\n"
+              << "[2] Export as JSON\n"
+              << "[0] Cancel\n"
+              << "> " << std::flush;
+
+    const std::optional<std::string> format_line = input.readLine();
+    if (!format_line) {
+      return;
+    }
+    const std::string format_choice = trimWhitespace(*format_line);
+    if (format_choice.empty() || format_choice == "0") {
+      return;
+    }
+    atm::NetworkTrafficExportFormat format;
+    if (format_choice == "1") {
+      format = atm::NetworkTrafficExportFormat::Csv;
+    } else if (format_choice == "2") {
+      format = atm::NetworkTrafficExportFormat::Json;
+    } else {
+      std::cout << "\nInvalid choice.\nPress Enter to continue.\n"
+                << std::flush;
+      static_cast<void>(input.readLine());
+      continue;
+    }
+
+    const atm::NetworkTrafficExportSnapshot snapshot =
+        atm::buildNetworkTrafficExportSnapshot(*series,
+                                               traffic.historyMaxSamples());
+    if (snapshot.samples.empty()) {
+      std::cout << "\nNo network traffic history samples are available to "
+                   "export for this selection (history is disabled or never "
+                   "collected).\n"
+                   "Press Enter to continue.\n"
+                << std::flush;
+      static_cast<void>(input.readLine());
+      return;
+    }
+
+    const std::string default_name = atm::defaultNetworkTrafficExportFilename(
+        effective_identity, series->display_name, format);
+    std::cout << "\nExport destination (blank for \"" << default_name
+              << "\"):\n> " << std::flush;
+    const auto dest_line = input.readLine();
+    if (!dest_line) {
+      return;
+    }
+    std::string destination = trimWhitespace(*dest_line);
+    if (destination.empty()) {
+      destination = default_name;
+    }
+
+    // Overwrite protection: ask before replacing an existing file (the same
+    // behaviour as the process-report export flow).
+    {
+      struct stat st {};
+      if (::stat(destination.c_str(), &st) == 0) {
+        std::cout << "File \"" << destination
+                  << "\" already exists. Overwrite? [y/N]: " << std::flush;
+        const auto confirm = input.readLine();
+        if (!confirm || trimWhitespace(*confirm) != "y") {
+          std::cout << "\nExport cancelled.\nPress Enter to continue.\n"
+                    << std::flush;
+          static_cast<void>(input.readLine());
+          continue;
+        }
+      }
+    }
+
+    const atm::NetworkTrafficExportResult result =
+        atm::exportNetworkTrafficHistory(destination, snapshot, format);
+    if (result.status == atm::NetworkTrafficExportStatus::Success) {
+      std::cout << "\nNetwork traffic history exported: " << result.path << " ("
+                << result.bytes << " bytes)\n";
+      if (snapshot.summary.totals_approximate) {
+        std::cout << "(The interface set changed during the retained window; "
+                     "window totals are approximate.)\n";
+      }
+    } else {
+      std::cout << "\nFailed to export network traffic history: "
+                << atm::networkTrafficExportStatusMessage(result.status)
+                << "\n";
+    }
+    std::cout << "Press Enter to continue.\n" << std::flush;
+    static_cast<void>(input.readLine());
+    return;
+  }
+}
 
 /// "h": disk health summary plus per-device detail. Press [1] to force a fresh
 /// background health read (permission/capability errors are highlighted, never
@@ -7056,6 +7196,12 @@ int main() {
             network_traffic_selection =
                 std::string(atm::kNetworkTrafficAllIdentity);
           }
+        }
+        break;
+      case ConsoleInput::Command::ExportNetworkTraffic:
+        if (view == ViewMode::List) {
+          interactNetworkTrafficExport(network_traffic_history,
+                                       network_traffic_selection, input);
         }
         break;
       case ConsoleInput::Command::ToggleHistory:
