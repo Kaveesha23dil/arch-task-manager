@@ -38,6 +38,7 @@
 #include "network_monitor.hpp"
 #include "network_interface_details.hpp"
 #include "network_traffic_history.hpp"
+#include "network_traffic_alert.hpp"
 #include "network_traffic_history_export.hpp"
 #include "notification_manager.hpp"
 #include "package_manager.hpp"
@@ -1235,12 +1236,39 @@ const char *severitySymbol(atm::AlertSeverity severity) {
   return "?";
 }
 
+/// Maps a central AlertType back to the network-traffic rule metric it
+/// describes, or nullopt when the type is unrelated to network alerts.
+std::optional<atm::NetworkTrafficAlertType> networkTrafficRuleTypeFor(
+    atm::AlertType type) {
+  switch (type) {
+    case atm::AlertType::NetworkCombined:
+      return atm::NetworkTrafficAlertType::Combined;
+    case atm::AlertType::NetworkRxPackets:
+      return atm::NetworkTrafficAlertType::RxPackets;
+    case atm::AlertType::NetworkTxPackets:
+      return atm::NetworkTrafficAlertType::TxPackets;
+    case atm::AlertType::NetworkRxErrors:
+      return atm::NetworkTrafficAlertType::RxErrors;
+    case atm::AlertType::NetworkTxErrors:
+      return atm::NetworkTrafficAlertType::TxErrors;
+    case atm::AlertType::NetworkRxDropped:
+      return atm::NetworkTrafficAlertType::RxDropped;
+    case atm::AlertType::NetworkTxDropped:
+      return atm::NetworkTrafficAlertType::TxDropped;
+    default:
+      return std::nullopt;
+  }
+}
+
 /// Formats a metric value with its unit for alert messages.
 std::string formatAlertValue(atm::AlertType type, double value) {
   std::ostringstream out;
   if (type == atm::AlertType::Temperature) {
     out << std::fixed << std::setprecision(0) << value << "\u00b0C";
     return out.str();
+  }
+  if (const auto rule_type = networkTrafficRuleTypeFor(type)) {
+    return atm::networkTrafficAlertFormatValue(*rule_type, value);
   }
   if (type == atm::AlertType::DiskReadActivity ||
       type == atm::AlertType::DiskWriteActivity ||
@@ -1273,6 +1301,20 @@ std::string describeAlertSubject(atm::AlertType type, const std::string &source,
       return "High network receive rate: " + v;
     case atm::AlertType::NetworkTransmit:
       return "High network transmit rate: " + v;
+    case atm::AlertType::NetworkCombined:
+      return "High combined network throughput: " + v;
+    case atm::AlertType::NetworkRxPackets:
+      return source + " high packet receive rate: " + v;
+    case atm::AlertType::NetworkTxPackets:
+      return source + " high packet transmit rate: " + v;
+    case atm::AlertType::NetworkRxErrors:
+      return source + " receive errors: " + v;
+    case atm::AlertType::NetworkTxErrors:
+      return source + " transmit errors: " + v;
+    case atm::AlertType::NetworkRxDropped:
+      return source + " receive drops: " + v;
+    case atm::AlertType::NetworkTxDropped:
+      return source + " transmit drops: " + v;
     case atm::AlertType::GpuUsage:
       return source + " usage: " + v;
     case atm::AlertType::GpuMemoryUsage:
@@ -1332,7 +1374,14 @@ void renderAlertsSections(std::ostringstream &out,
       {"GPU",        {atm::AlertType::GpuUsage, atm::AlertType::GpuMemoryUsage}},
       {"Temperature", {atm::AlertType::Temperature}},
       {"Network",    {atm::AlertType::NetworkReceive,
-                      atm::AlertType::NetworkTransmit}},
+                      atm::AlertType::NetworkTransmit,
+                      atm::AlertType::NetworkCombined,
+                      atm::AlertType::NetworkRxPackets,
+                      atm::AlertType::NetworkTxPackets,
+                      atm::AlertType::NetworkRxErrors,
+                      atm::AlertType::NetworkTxErrors,
+                      atm::AlertType::NetworkRxDropped,
+                      atm::AlertType::NetworkTxDropped}},
   };
   for (const auto &row : rows) {
     const atm::AlertSeverity sev = dashboardSeverity(alerts, row.types);
@@ -1390,6 +1439,63 @@ void renderAlertsSections(std::ostringstream &out,
   }
   out << "Alert filter: press 'f' (then Enter) to cycle "
          "All / Warning / Critical / Recovery.\n";
+}
+
+/// Formats a bit/s threshold for display (1000-based scaling).
+std::string formatBitsPerSecond(double value) {
+  static const char *const kSuffixes[] = {"bit/s", "kbit/s", "Mbit/s",
+                                          "Gbit/s", "Tbit/s"};
+  const double v = std::abs(value);
+  std::size_t idx = 0;
+  double scaled = v;
+  while (scaled >= 1000.0 && idx + 1 < 5u) {
+    scaled /= 1000.0;
+    ++idx;
+  }
+  std::ostringstream out;
+  out << std::fixed << std::setprecision(scaled >= 100.0 ? 0 : 1) << scaled << ' '
+      << kSuffixes[idx];
+  return out.str();
+}
+
+/// Formats a rule's threshold in its configured unit.
+std::string formatNetworkRuleThreshold(
+    const atm::NetworkTrafficAlertRule &rule) {
+  const double value =
+      atm::networkTrafficAlertFromCanonical(rule.threshold, rule.unit);
+  if (rule.unit == atm::NetworkTrafficAlertUnit::BitsPerSecond) {
+    return formatBitsPerSecond(value);
+  }
+  return atm::networkTrafficAlertFormatValue(rule.type, value);
+}
+
+/// Renders the live per-rule status of the network-traffic alert monitor as a
+/// compact section. Omitted entirely when no rules are configured.
+void renderNetworkTrafficAlertStatus(
+    std::ostringstream &out,
+    const atm::NetworkTrafficAlertMonitor &network_alert_monitor) {
+  if (network_alert_monitor.rules().empty()) {
+    return;
+  }
+  out << "\n## NETWORK ALERTS\n";
+  for (const atm::NetworkTrafficRuleStatus &st :
+       network_alert_monitor.statuses()) {
+    const atm::NetworkTrafficAlertRule &rule = st.rule;
+    out << "  [" << (rule.enabled ? "on" : "off") << "] "
+        << std::left << std::setw(12)
+        << atm::networkTrafficAlertTypeName(rule.type) << " on '"
+        << rule.target_identity << "' threshold "
+        << formatNetworkRuleThreshold(rule) << " \u2192 "
+        << atm::networkTrafficAlertRuleStatusName(st.status);
+    if (st.available) {
+      out << " ("
+          << atm::networkTrafficAlertFormatValue(rule.type, st.value) << ")";
+    }
+    if (!st.detail.empty()) {
+      out << " \u2014 " << st.detail;
+    }
+    out << '\n';
+  }
 }
 
 /// Evaluates the AlertManager from the already-computed monitor snapshots.
@@ -1508,6 +1614,16 @@ atm::NotificationManager *g_notification_manager = nullptr;
 /// settings and cooldown and swallows any D-Bus failures.
 void onAlertEvent(const atm::AlertManager & /*alerts*/,
                   const atm::AlertEvent &event) {
+  if (g_notification_manager != nullptr) {
+    g_notification_manager->notify(event);
+  }
+}
+
+/// Event sink for the network-traffic alert monitor: forwards each rule
+/// violation/recovery/repeat to the desktop notification manager, which still
+/// applies the global settings and its own per-source cooldown. The rule's own
+/// notify_enabled/cooldown/repeat policy was already enforced by the monitor.
+void onNetworkTrafficAlertEvent(const atm::AlertEvent &event) {
   if (g_notification_manager != nullptr) {
     g_notification_manager->notify(event);
   }
@@ -4063,7 +4179,8 @@ const atm::FilesystemMonitor &filesystems,
                          FilesystemFilter fs_filter,
                          const atm::NetworkInterfaceMonitor &network_interfaces,
                          const atm::NetworkTrafficHistory &network_traffic_history,
-                         const std::string &traffic_selection) {
+                         const std::string &traffic_selection,
+                         const atm::NetworkTrafficAlertMonitor &network_alert_monitor) {
    if (view == ViewMode::Tree) {
     // The tree view stays deliberately focused on the hierarchy; the storage
     // and network sections are part of the table view.
@@ -4090,6 +4207,7 @@ const atm::FilesystemMonitor &filesystems,
   renderGpuSections(out, gpu);
   renderSensorSections(out, sensors, gpu);
   renderAlertsSections(out, alerts, alert_filter);
+  renderNetworkTrafficAlertStatus(out, network_alert_monitor);
   renderSystemdSections(out, systemd, service_search, service_sort);
   renderStartupSections(out, startup, startup_search, startup_sort);
   renderPackageSections(out, packages);
@@ -4158,7 +4276,8 @@ const atm::GpuSnapshot &gpu,
                  FilesystemFilter fs_filter,
                  const atm::NetworkInterfaceMonitor &network_interfaces,
                  const atm::NetworkTrafficHistory &network_traffic_history,
-                 const std::string &traffic_selection) {
+                 const std::string &traffic_selection,
+                 const atm::NetworkTrafficAlertMonitor &network_alert_monitor) {
   // ANSI "clear entire screen" + "cursor to home" so the multi-line frame
   // refreshes in place instead of scrolling the terminal.
   std::cout << "\033[2J\033[H";
@@ -4169,7 +4288,8 @@ const atm::GpuSnapshot &gpu,
                            startup_search, startup_sort, packages,
                            refresh_interval_ms, cpu_details, memory_details,
                            disk_health, filesystems, fs_filter, network_interfaces,
-                           network_traffic_history, traffic_selection)
+                           network_traffic_history, traffic_selection,
+                           network_alert_monitor)
             << std::flush;
 }
 
@@ -6662,6 +6782,407 @@ void editPackages(atm::cfg::SettingsManager &settings, ConsoleInput &input) {
 }
 
 /// Edits the XDG desktop autostart preference. The persisted setting holds the
+void printNetworkTrafficAlertRule(int index,
+                                  const atm::NetworkTrafficAlertRule &rule) {
+  std::cout << "  [" << index << "] " << (rule.enabled ? "enabled" : "disabled")
+            << "\n"
+            << "      target: " << rule.target_identity << "\n"
+            << "      type: " << atm::networkTrafficAlertTypeName(rule.type)
+            << "\n"
+            << "      threshold: " << formatNetworkRuleThreshold(rule) << "\n"
+            << "      confirmation: ";
+  if (rule.confirmation ==
+      atm::NetworkTrafficAlertConfirmation::Samples) {
+    std::cout << "samples (" << rule.confirmation_samples
+              << " consecutive)\n";
+  } else {
+    std::ostringstream duration;
+    duration << std::fixed << std::setprecision(1)
+             << rule.confirmation_duration_seconds;
+    std::cout << "duration (" << duration.str() << " s continuously)\n";
+  }
+  std::cout << "      notifications: "
+            << (rule.notify_enabled ? "enabled" : "disabled");
+  if (rule.notify_enabled && rule.repeat) {
+    std::cout << " (repeat, " << rule.cooldown_seconds << " s cooldown)";
+  }
+  std::cout << "\n"
+            << "      severity: " << atm::alertSeverityName(rule.severity)
+            << "\n";
+  if (!rule.name.empty()) {
+    std::cout << "      name: " << rule.name << "\n";
+  }
+}
+
+void setNetworkRuleDefaultUnit(atm::NetworkTrafficAlertRule &rule) {
+  switch (rule.type) {
+    case atm::NetworkTrafficAlertType::Receive:
+    case atm::NetworkTrafficAlertType::Transmit:
+    case atm::NetworkTrafficAlertType::Combined:
+      rule.unit = atm::NetworkTrafficAlertUnit::BytesPerSecond;
+      break;
+    case atm::NetworkTrafficAlertType::RxPackets:
+    case atm::NetworkTrafficAlertType::TxPackets:
+      rule.unit = atm::NetworkTrafficAlertUnit::PacketsPerSecond;
+      break;
+    case atm::NetworkTrafficAlertType::RxErrors:
+    case atm::NetworkTrafficAlertType::TxErrors:
+    case atm::NetworkTrafficAlertType::RxDropped:
+    case atm::NetworkTrafficAlertType::TxDropped:
+      rule.unit = atm::NetworkTrafficAlertUnit::EventsPerSecond;
+      break;
+  }
+}
+
+const char *networkTrafficUnitLabel(atm::NetworkTrafficAlertUnit unit) {
+  switch (unit) {
+    case atm::NetworkTrafficAlertUnit::BytesPerSecond:
+      return "bytes/s";
+    case atm::NetworkTrafficAlertUnit::BitsPerSecond:
+      return "bits/s";
+    case atm::NetworkTrafficAlertUnit::PacketsPerSecond:
+      return "packets/s";
+    case atm::NetworkTrafficAlertUnit::EventsPerSecond:
+      return "events/s";
+  }
+  return "?";
+}
+
+/// Lets the user pick a traffic target (the aggregate or a tracked interface).
+bool pickNetworkTrafficTarget(const atm::NetworkTrafficHistory &traffic,
+                              std::string &out, ConsoleInput &input) {
+  const std::vector<std::string> ids = traffic.selectableIdentities();
+  if (ids.empty()) {
+    std::cout << "No traffic targets available yet.\n";
+    return false;
+  }
+  std::cout << "Target:\n";
+  for (std::size_t i = 0; i < ids.size(); ++i) {
+    std::cout << "  [" << (i + 1) << "] " << ids[i] << " ("
+              << traffic.displayNameFor(ids[i]) << ")\n";
+  }
+  std::cout << "Select target (1-" << ids.size() << "): " << std::flush;
+  const std::optional<std::string> line = input.readLine();
+  if (!line) {
+    return false;
+  }
+  int idx = 0;
+  if (!parseSignedInteger(*line, idx) ||
+      idx < 1 || idx > static_cast<int>(ids.size())) {
+    std::cout << "Invalid target.\n";
+    return false;
+  }
+  out = ids[static_cast<std::size_t>(idx - 1)];
+  return true;
+}
+
+bool pickNetworkTrafficType(atm::NetworkTrafficAlertType &out,
+                            ConsoleInput &input) {
+  std::cout << "Alert type:\n"
+            << "  [1] receive        (RX throughput)\n"
+            << "  [2] transmit       (TX throughput)\n"
+            << "  [3] combined       (RX + TX throughput)\n"
+            << "  [4] rx_packets     (packets received/s)\n"
+            << "  [5] tx_packets     (packets transmitted/s)\n"
+            << "  [6] rx_errors      (receive errors/s)\n"
+            << "  [7] tx_errors      (transmit errors/s)\n"
+            << "  [8] rx_dropped     (receive drops/s)\n"
+            << "  [9] tx_dropped     (transmit drops/s)\n"
+            << "Select type (1-9): " << std::flush;
+  const std::optional<std::string> line = input.readLine();
+  if (!line) {
+    return false;
+  }
+  int choice = 0;
+  if (!parseSignedInteger(*line, choice) || choice < 1 || choice > 9) {
+    std::cout << "Invalid type.\n";
+    return false;
+  }
+  const auto type = static_cast<atm::NetworkTrafficAlertType>(choice - 1);
+  if (!atm::networkTrafficAlertUnitSupported(type, atm::NetworkTrafficAlertUnit::BytesPerSecond) &&
+      !atm::networkTrafficAlertUnitSupported(type, atm::NetworkTrafficAlertUnit::BitsPerSecond) &&
+      !atm::networkTrafficAlertUnitSupported(type, atm::NetworkTrafficAlertUnit::PacketsPerSecond) &&
+      !atm::networkTrafficAlertUnitSupported(type, atm::NetworkTrafficAlertUnit::EventsPerSecond)) {
+    std::cout << "No unit is supported for that type; please try again.\n";
+    return false;
+  }
+  out = type;
+  return true;
+}
+
+/// Prompts for the threshold in the rule's unit (unit selectable first).
+/// Returns true when a new canonical threshold was stored.
+bool editNetworkRuleValue(atm::NetworkTrafficAlertRule &rule,
+                          ConsoleInput &input) {
+  if (!atm::networkTrafficAlertUnitSupported(rule.type, rule.unit)) {
+    setNetworkRuleDefaultUnit(rule);
+  }
+  std::vector<atm::NetworkTrafficAlertUnit> units;
+  if (rule.type == atm::NetworkTrafficAlertType::Receive ||
+      rule.type == atm::NetworkTrafficAlertType::Transmit ||
+      rule.type == atm::NetworkTrafficAlertType::Combined) {
+    units = {atm::NetworkTrafficAlertUnit::BytesPerSecond,
+             atm::NetworkTrafficAlertUnit::BitsPerSecond};
+  } else if (rule.type == atm::NetworkTrafficAlertType::RxPackets ||
+             rule.type == atm::NetworkTrafficAlertType::TxPackets) {
+    units = {atm::NetworkTrafficAlertUnit::PacketsPerSecond};
+  } else {
+    units = {atm::NetworkTrafficAlertUnit::EventsPerSecond};
+  }
+
+  std::cout << "Threshold unit:\n";
+  for (std::size_t i = 0; i < units.size(); ++i) {
+    std::cout << "  [" << (i + 1) << "] " << networkTrafficUnitLabel(units[i])
+              << (units[i] == rule.unit ? " (current)" : "") << '\n';
+  }
+  std::cout << "Select unit (1-" << units.size() << "): " << std::flush;
+  atm::NetworkTrafficAlertUnit unit = rule.unit;
+  const std::optional<std::string> unit_line = input.readLine();
+  if (unit_line) {
+    int choice = 0;
+    if (parseSignedInteger(*unit_line, choice) &&
+        choice >= 1 && choice <= static_cast<int>(units.size())) {
+      unit = units[static_cast<std::size_t>(choice - 1)];
+    }
+  }
+
+  const double current =
+      atm::networkTrafficAlertFromCanonical(rule.threshold, unit);
+  const double hi =
+      atm::networkTrafficAlertFromCanonical(atm::kMaxNetworkTrafficThreshold,
+                                            unit);
+  double entered = current;
+  const std::string label =
+      std::string("Threshold (") + networkTrafficUnitLabel(unit) + ")";
+  if (!promptDoubleRange(input, label, current, 0.001, hi, entered)) {
+    return false;
+  }
+  rule.threshold = atm::networkTrafficAlertToCanonical(entered, unit);
+  rule.unit = unit;
+  return true;
+}
+
+void editNetworkRuleConfirmation(atm::NetworkTrafficAlertRule &rule,
+                                 ConsoleInput &input) {
+  std::cout << "Confirmation mode:\n"
+            << "  [1] Samples  [2] Duration (current: "
+            << (rule.confirmation ==
+                        atm::NetworkTrafficAlertConfirmation::Samples
+                    ? "samples"
+                    : "duration")
+            << "): " << std::flush;
+  const std::optional<std::string> line = input.readLine();
+  if (line) {
+    const std::string choice = trimWhitespace(*line);
+    if (choice == "1") {
+      rule.confirmation = atm::NetworkTrafficAlertConfirmation::Samples;
+    } else if (choice == "2") {
+      rule.confirmation = atm::NetworkTrafficAlertConfirmation::Duration;
+    }
+  }
+  if (rule.confirmation ==
+      atm::NetworkTrafficAlertConfirmation::Samples) {
+    int samples = static_cast<int>(rule.confirmation_samples);
+    if (promptIntRange(input, "Consecutive violating refreshes", samples, 1,
+                       static_cast<int>(atm::kMaxConfirmationSamples),
+                       samples)) {
+      rule.confirmation_samples = static_cast<std::size_t>(samples);
+    }
+  } else {
+    double seconds = rule.confirmation_duration_seconds;
+    if (promptDoubleRange(input, "Continuous violation duration (s)", seconds,
+                          0.1, atm::kMaxConfirmationDurationSeconds, seconds)) {
+      rule.confirmation_duration_seconds = seconds;
+    }
+  }
+}
+
+void editNetworkRuleNotifications(atm::NetworkTrafficAlertRule &rule,
+                                  ConsoleInput &input) {
+  bool notify = rule.notify_enabled;
+  if (promptBool(input, "Desktop notifications for this rule", notify, notify)) {
+    rule.notify_enabled = notify;
+  }
+  if (rule.notify_enabled) {
+    int cooldown = static_cast<int>(rule.cooldown_seconds);
+    if (promptIntRange(input, "Repeat cooldown (seconds)", cooldown, 0,
+                       static_cast<int>(atm::kMaxCooldownSeconds), cooldown)) {
+      rule.cooldown_seconds = static_cast<std::size_t>(cooldown);
+    }
+    bool repeat = rule.repeat;
+    if (promptBool(input, "Repeat notification while still exceeding", repeat,
+                   repeat)) {
+      rule.repeat = repeat;
+    }
+  }
+}
+
+void editNetworkTrafficAlertRuleAt(atm::cfg::AppSettings &next,
+                                   const atm::NetworkTrafficHistory &traffic,
+                                   ConsoleInput &input, std::size_t idx) {
+  atm::NetworkTrafficAlertRule &rule = next.alerts.network_rules[idx];
+  for (;;) {
+    std::cout << "\n--- Rule " << idx << " ---\n";
+    printNetworkTrafficAlertRule(idx, rule);
+    std::cout << "[1] Toggle enabled\n"
+              << "[2] Change target\n"
+              << "[3] Change alert type\n"
+              << "[4] Change threshold\n"
+              << "[5] Confirmation mode / timing\n"
+              << "[6] Notifications\n"
+              << "[7] Severity\n"
+              << "[8] Name\n"
+              << "[9] Delete rule\n"
+              << "[0] Back\n"
+              << "Select action: " << std::flush;
+    const std::optional<std::string> line = input.readLine();
+    if (!line) {
+      break;
+    }
+    const std::string choice = trimWhitespace(*line);
+    if (choice.empty() || choice == "0") {
+      break;
+    }
+    if (choice == "1") {
+      rule.enabled = !rule.enabled;
+    } else if (choice == "2") {
+      pickNetworkTrafficTarget(traffic, rule.target_identity, input);
+    } else if (choice == "3") {
+      atm::NetworkTrafficAlertType new_type = rule.type;
+      if (pickNetworkTrafficType(new_type, input)) {
+        rule.type = new_type;
+        setNetworkRuleDefaultUnit(rule);
+        std::cout << "Changing the type resets the threshold. ";
+        editNetworkRuleValue(rule, input);
+      }
+    } else if (choice == "4") {
+      editNetworkRuleValue(rule, input);
+    } else if (choice == "5") {
+      editNetworkRuleConfirmation(rule, input);
+    } else if (choice == "6") {
+      editNetworkRuleNotifications(rule, input);
+    } else if (choice == "7") {
+      std::cout << "Severity:\n"
+                << "  [1] Warning  [2] Critical (current: "
+                << atm::alertSeverityName(rule.severity) << "): " << std::flush;
+      const std::optional<std::string> sev = input.readLine();
+      if (sev) {
+        const std::string sv = trimWhitespace(*sev);
+        if (sv == "1" || sv == "w" || sv == "warning" || sv == "Warning") {
+          rule.severity = atm::AlertSeverity::Warning;
+        } else if (sv == "2" || sv == "c" || sv == "critical" ||
+                   sv == "Critical") {
+          rule.severity = atm::AlertSeverity::Critical;
+        }
+      }
+    } else if (choice == "8") {
+      std::cout << "Name (Enter to clear, current: '" << rule.name
+                << "'): " << std::flush;
+      const std::optional<std::string> name = input.readLine();
+      if (name) {
+        rule.name = trimWhitespace(*name);
+      }
+    } else if (choice == "9") {
+      if (confirm("Delete this rule?", input)) {
+        next.alerts.network_rules.erase(next.alerts.network_rules.begin() +
+                                        static_cast<std::ptrdiff_t>(idx));
+        break;
+      }
+    } else {
+      std::cout << "Invalid action.\n";
+    }
+  }
+}
+
+/// Settings sub-page for network-traffic alert rules. Each rule is edited as a
+/// whole (add / per-field edit / delete; live status is shown on the main
+/// frame, not here). Identities come from the live traffic history so targets
+/// always match what the monitor evaluates.
+void interactNetworkTrafficAlerts(atm::cfg::SettingsManager &settings,
+                                  const atm::NetworkTrafficHistory &traffic,
+                                  ConsoleInput &input) {
+  for (;;) {
+    atm::cfg::AppSettings next = settings.settings();
+    std::cout << "\033[2J\033[H";
+    std::cout << "========================================\n"
+                 "ARCH TASK MANAGER — Network Alerts\n"
+                 "========================================\n\n";
+    const std::vector<atm::NetworkTrafficAlertRule> &rules =
+        next.alerts.network_rules;
+    if (rules.empty()) {
+      std::cout << "  No network alert rules configured.\n";
+    } else {
+      for (std::size_t i = 0; i < rules.size(); ++i) {
+        printNetworkTrafficAlertRule(i, rules[i]);
+      }
+    }
+    std::cout << "\n[R] Add rule\n";
+    if (!rules.empty()) {
+      std::cout << "[E] Edit or delete a rule\n";
+    }
+    std::cout << "[0] Back\n\nSelect action: " << std::flush;
+
+    const std::optional<std::string> line = input.readLine();
+    if (!line) {
+      break;
+    }
+    const std::string choice = trimWhitespace(*line);
+    if (choice.empty() || choice == "0") {
+      break;
+    }
+    if (choice == "r" || choice == "R") {
+      if (rules.size() >= atm::kMaxNetworkTrafficAlertRules) {
+        std::cout << "Maximum of " << atm::kMaxNetworkTrafficAlertRules
+                  << " rules reached.\n";
+        std::this_thread::sleep_for(500ms);
+        continue;
+      }
+      atm::NetworkTrafficAlertRule rule;
+      if (pickNetworkTrafficTarget(traffic, rule.target_identity, input) &&
+          pickNetworkTrafficType(rule.type, input)) {
+        setNetworkRuleDefaultUnit(rule);
+        if (editNetworkRuleValue(rule, input)) {
+          bool duplicate = false;
+          for (const atm::NetworkTrafficAlertRule &existing : rules) {
+            if (existing.target_identity == rule.target_identity &&
+                existing.type == rule.type) {
+              duplicate = true;
+              break;
+            }
+          }
+          if (duplicate) {
+            std::cout << "A rule for that target and alert type already "
+                         "exists; delaying edit to change it instead.\n";
+            std::this_thread::sleep_for(700ms);
+            continue;
+          }
+          next.alerts.network_rules.push_back(rule);
+          settings.updateSettings(next);
+        }
+      }
+    } else if (choice == "e" || choice == "E") {
+      std::cout << "Rule number (0-" << (rules.size() - 1) << "): "
+                << std::flush;
+      const std::optional<std::string> sel = input.readLine();
+      if (sel) {
+        int idx = 0;
+        if (parseSignedInteger(*sel, idx) && idx >= 0 &&
+            idx < static_cast<int>(rules.size())) {
+          editNetworkTrafficAlertRuleAt(next, traffic, input,
+                                        static_cast<std::size_t>(idx));
+          settings.updateSettings(next);
+        } else {
+          std::cout << "Invalid rule number.\n";
+        }
+      }
+    } else {
+      std::cout << "Invalid action.\n";
+    }
+    std::this_thread::sleep_for(300ms);
+  }
+}
+
+/// Edits the XDG desktop autostart preference. The persisted setting holds the
 /// user's intent; the desktop entry on disk is applied immediately (enable or
 /// disable). When the filesystem operation fails, a clear error is shown and
 /// the setting is kept so a later startup can retry the repair automatically.
@@ -6699,6 +7220,8 @@ void interactSettings(atm::cfg::SettingsManager &settings,
                       atm::AlertManager &alerts,
                       atm::NotificationManager &notifications,
                       atm::AppAutostartManager &autostart,
+                      const atm::NetworkTrafficHistory &network_traffic_history,
+                      atm::NetworkTrafficAlertMonitor &network_alert_monitor,
                       ConsoleInput &input) {
   for (;;) {
     const atm::cfg::AppSettings &s = settings.settings();
@@ -6725,6 +7248,9 @@ void interactSettings(atm::cfg::SettingsManager &settings,
     printAlertCategory("Temperature", s.alerts.temperature);
     std::cout << "  Recovery hysteresis: " << s.alerts.recovery_hysteresis
               << "\n"
+              << "\nNetwork alerts:\n"
+              << "  Rules: " << s.alerts.network_rules.size() << " (up to "
+              << atm::kMaxNetworkTrafficAlertRules << ")\n"
               << "\nNotifications:\n"
               << "  Enabled: " << yesNo(s.notifications.enabled) << "\n"
               << "  Warning notifications: "
@@ -6749,8 +7275,9 @@ void interactSettings(atm::cfg::SettingsManager &settings,
               << "[3] Edit Alerts\n"
               << "[4] Edit Notifications\n"
               << "[5] Edit Packages\n"
-              << "[6] Edit Startup\n"
-              << "[7] Reset to Defaults\n"
+              << "[6] Edit Network Alerts\n"
+              << "[7] Edit Startup\n"
+              << "[8] Reset to Defaults\n"
               << "[0] Back (save changes)\n\n"
               << "Changes apply immediately; settings are saved when you leave "
                  "this page.\n"
@@ -6775,8 +7302,10 @@ void interactSettings(atm::cfg::SettingsManager &settings,
     } else if (choice == "5") {
       editPackages(settings, input);
     } else if (choice == "6") {
-      editStartup(settings, autostart, input);
+      interactNetworkTrafficAlerts(settings, network_traffic_history, input);
     } else if (choice == "7") {
+      editStartup(settings, autostart, input);
+    } else if (choice == "8") {
       if (confirm("Reset all settings to defaults?", input)) {
         // The autostart preference is a setting: resetting it to false must
         // also remove the application's desktop entry (only its own entry).
@@ -6803,6 +7332,7 @@ void interactSettings(atm::cfg::SettingsManager &settings,
   }
   atm::cfg::applySettingsToRuntime(settings.settings(), refresh_interval_ms,
                                    history, alerts, notifications);
+  network_alert_monitor.setRules(settings.settings().alerts.network_rules);
 }
 
 }  // namespace
@@ -6839,6 +7369,7 @@ int main() {
   atm::HistoryManager history(
       static_cast<std::size_t>(settings.settings().history.max_samples));
   atm::AlertManager alerts;
+  atm::NetworkTrafficAlertMonitor network_alert_monitor(alerts);
   atm::NotificationManager notifications;
   atm::PackageManager packages;
   atm::PackageTransaction package_transaction;
@@ -6848,6 +7379,7 @@ int main() {
   // Apply the loaded settings to the runtime components and to the main loop.
   atm::cfg::applySettingsToRuntime(settings.settings(), refresh_interval_ms,
                                    history, alerts, notifications);
+  network_alert_monitor.setRules(settings.settings().alerts.network_rules);
   filesystem_monitor.setHistoryMaxSamples(
       static_cast<std::size_t>(settings.settings().history.max_samples));
   network_interface_details.setHistoryMaxSamples(
@@ -6858,6 +7390,7 @@ int main() {
   // Forward alert state transitions to desktop notifications.
   g_notification_manager = &notifications;
   alerts.setNotificationSink(&onAlertEvent);
+  network_alert_monitor.setEventSink(&onNetworkTrafficAlertEvent);
 
   // Reconcile the persisted autostart preference with the desktop entry on
   // disk. This only repairs/removes arch-task-manager.desktop in the user's
@@ -6961,6 +7494,7 @@ int main() {
   const atm::NetworkSnapshot first_network = network_monitor.read();
   static_cast<void>(network_interface_details.read(first_network));
   network_traffic_history.record(network_interface_details.current());
+  network_alert_monitor.evaluate(network_traffic_history);
   const atm::GpuSnapshot first_gpu = gpu_monitor.read();
   const atm::SensorSnapshot first_sensors = sensor_monitor.read();
   const atm::SystemPressureSnapshot first_pressure = pressure_monitor.read();
@@ -7008,7 +7542,8 @@ int main() {
              service_search, service_sort, startup_search, startup_sort,
              packages, refresh_interval_ms, cpu, memory, disk_health,
              filesystem_monitor, fs_filter, network_interface_details,
-             network_traffic_history, network_traffic_selection);
+             network_traffic_history, network_traffic_selection,
+             network_alert_monitor);
 
   atm::NetworkSnapshot network = first_network;
   atm::GpuSnapshot gpu = first_gpu;
@@ -7068,6 +7603,7 @@ int main() {
             const atm::NetworkSnapshot network = network_monitor.read();
             static_cast<void>(network_interface_details.read(network));
             network_traffic_history.record(network_interface_details.current());
+            network_alert_monitor.evaluate(network_traffic_history);
             static_cast<void>(filesystem_monitor.read());
             gpu = gpu_monitor.read();
             sensors = sensor_monitor.read();
@@ -7107,7 +7643,7 @@ int main() {
                        startup_sort, packages, refresh_interval_ms, cpu,
                        memory, disk_health, filesystem_monitor, fs_filter,
                        network_interface_details, network_traffic_history,
-                       network_traffic_selection);
+                       network_traffic_selection, network_alert_monitor);
           }
         }
         continue;
@@ -7170,7 +7706,8 @@ int main() {
       case ConsoleInput::Command::InspectSettings:
         if (view == ViewMode::List) {
           interactSettings(settings, refresh_interval_ms, history, alerts,
-                           notifications, autostart, input);
+                           notifications, autostart, network_traffic_history,
+                           network_alert_monitor, input);
           filesystem_monitor.setHistoryMaxSamples(
               static_cast<std::size_t>(settings.settings().history.max_samples));
           network_interface_details.setHistoryMaxSamples(
@@ -7220,6 +7757,7 @@ int main() {
           atm::cfg::applySettingsToRuntime(
               settings.settings(), refresh_interval_ms, history, alerts,
               notifications);
+          network_alert_monitor.setRules(settings.settings().alerts.network_rules);
           filesystem_monitor.setHistoryMaxSamples(
               static_cast<std::size_t>(settings.settings().history.max_samples));
           network_interface_details.setHistoryMaxSamples(
@@ -7254,6 +7792,7 @@ int main() {
     network = network_monitor.read();
     static_cast<void>(network_interface_details.read(network));
     network_traffic_history.record(network_interface_details.current());
+    network_alert_monitor.evaluate(network_traffic_history);
     static_cast<void>(filesystem_monitor.read());
     gpu = gpu_monitor.read();
     sensors = sensor_monitor.read();
@@ -7292,7 +7831,8 @@ int main() {
                alert_filter, service_search, service_sort, startup_search,
                startup_sort, packages, refresh_interval_ms, cpu, memory,
                disk_health, filesystem_monitor, fs_filter, network_interface_details,
-               network_traffic_history, network_traffic_selection);
+               network_traffic_history, network_traffic_selection,
+               network_alert_monitor);
   }
 
   // Clean shutdown: persist any pending settings changes.

@@ -327,6 +327,124 @@ int main() {
     CHECK(notifications.settings().cooldown == std::chrono::seconds(7));
   }
 
+  run("network rule sections serialize, parse, validate and clamp");
+  {
+    AppSettings s = AppSettings::defaults();
+    atm::NetworkTrafficAlertRule &a = s.alerts.network_rules.emplace_back();
+    a.target_identity = "idx:2";
+    a.type = atm::NetworkTrafficAlertType::Receive;
+    a.threshold = 12500000.0;
+    a.unit = atm::NetworkTrafficAlertUnit::BytesPerSecond;
+    a.confirmation = atm::NetworkTrafficAlertConfirmation::Samples;
+    a.confirmation_samples = 4;
+    a.notify_enabled = false;
+    a.cooldown_seconds = 30;
+    a.repeat = true;
+    a.severity = atm::AlertSeverity::Warning;
+    a.name = "voip";
+
+    atm::NetworkTrafficAlertRule &b = s.alerts.network_rules.emplace_back();
+    b.target_identity = "all";
+    b.type = atm::NetworkTrafficAlertType::Combined;
+    b.threshold = 1000000.0;
+    b.unit = atm::NetworkTrafficAlertUnit::BitsPerSecond;
+    b.confirmation = atm::NetworkTrafficAlertConfirmation::Duration;
+    b.confirmation_duration_seconds = 7.5;
+    b.name = "agg";
+
+    CHECK(s.validate().empty());
+
+    const std::string text = atm::cfg::serializeSettings(s);
+    CHECK(text.find("[alerts.network_rule.0]") != std::string::npos);
+    CHECK(text.find("type = \"receive\"") != std::string::npos);
+
+    AppSettings parsed;
+    std::vector<std::string> problems;
+    CHECK(atm::cfg::parseSettings(text, parsed, problems));
+    CHECK(problems.empty());
+    CHECK(parsed.alerts.network_rules.size() == 2);
+    const atm::NetworkTrafficAlertRule &pa = parsed.alerts.network_rules[0];
+    CHECK(pa.target_identity == "idx:2");
+    CHECK(pa.type == atm::NetworkTrafficAlertType::Receive);
+    CHECK_NEAR(pa.threshold, 12500000.0, 1e-6);
+    CHECK(pa.unit == atm::NetworkTrafficAlertUnit::BytesPerSecond);
+    CHECK(pa.confirmation == atm::NetworkTrafficAlertConfirmation::Samples);
+    CHECK(pa.confirmation_samples == 4);
+    CHECK(!pa.notify_enabled);
+    CHECK(pa.cooldown_seconds == 30);
+    CHECK(pa.repeat);
+    CHECK(pa.severity == atm::AlertSeverity::Warning);
+    CHECK(pa.name == "voip");
+    const atm::NetworkTrafficAlertRule &pb = parsed.alerts.network_rules[1];
+    CHECK(pb.target_identity == "all");
+    CHECK(pb.type == atm::NetworkTrafficAlertType::Combined);
+    CHECK_NEAR(pb.threshold, 1000000.0, 1e-6);
+    CHECK(pb.unit == atm::NetworkTrafficAlertUnit::BitsPerSecond);
+    CHECK_NEAR(pb.confirmation_duration_seconds, 7.5, 1e-6);
+    CHECK(pb.name == "agg");
+  }
+
+  run("missing network rule sections yield empty rules");
+  {
+    const std::string text =
+        "config_version = 1\n[general]\nrefresh_interval_ms = 1500\n";
+    AppSettings parsed;
+    std::vector<std::string> problems;
+    CHECK(atm::cfg::parseSettings(text, parsed, problems));
+    CHECK(problems.empty());
+    CHECK(parsed.alerts.network_rules.empty());
+  }
+
+  run("broken network rule entries are reported and never throw");
+  {
+    const std::string text =
+        "[alerts.network_rule.0]\nenabled = true\ntarget_identity = \"idx:2\"\n"
+        "type = \"bogus\"\nthreshold = abc\nunit = \"bytes\"\n";
+    AppSettings parsed;
+    std::vector<std::string> problems;
+    CHECK(atm::cfg::parseSettings(text, parsed, problems));
+    CHECK(!problems.empty());
+    // Defaults kept on failure.
+    CHECK(parsed.alerts.network_rules[0].target_identity == "idx:2");
+    CHECK(parsed.alerts.network_rules[0].type ==
+          atm::NetworkTrafficAlertType::Receive);
+    CHECK(parsed.alerts.network_rules[0].threshold == 0.0);
+  }
+
+  run("network rule clampAndFix drops invalid rules and dedupes");
+  {
+    AppSettings s = AppSettings::defaults();
+    atm::NetworkTrafficAlertRule good = atm::NetworkTrafficAlertRule{};
+    good.target_identity = "idx:2";
+    good.threshold = 1000.0;
+    // Duplicate of `good`.
+    atm::NetworkTrafficAlertRule duplicate = good;
+    duplicate.name = "dup";
+    // Invalid: empty identity.
+    atm::NetworkTrafficAlertRule empty_id = atm::NetworkTrafficAlertRule{};
+    empty_id.threshold = 500.0;
+    // Invalid: zero threshold.
+    atm::NetworkTrafficAlertRule zero_th = good;
+    zero_th.threshold = 0.0;
+    // Repairable: unsupported unit + bad severity (distinct type so it is not
+    // deduped away against `good`).
+    atm::NetworkTrafficAlertRule repairable = good;
+    repairable.type = atm::NetworkTrafficAlertType::Transmit;
+    repairable.unit = atm::NetworkTrafficAlertUnit::PacketsPerSecond;
+    repairable.severity = atm::AlertSeverity::Normal;
+
+    s.alerts.network_rules = {good, duplicate, empty_id, zero_th, repairable};
+    const auto corrections = s.clampAndFix();
+    CHECK(s.alerts.network_rules.size() == 2);  // good + repairable (deduped)
+    CHECK(s.alerts.network_rules[0].target_identity == "idx:2");
+    CHECK(s.alerts.network_rules[0].name.empty());  // first kept
+    CHECK(s.alerts.network_rules[1].unit ==
+          atm::NetworkTrafficAlertUnit::BytesPerSecond);
+    CHECK(s.alerts.network_rules[1].severity == atm::AlertSeverity::Critical);
+    CHECK(s.validate().empty());
+    CHECK(!corrections.empty());
+  }
+
   run("package settings are check-only and never install anything");
   {
     const AppSettings s = AppSettings::defaults();

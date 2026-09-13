@@ -190,6 +190,8 @@ void NetworkTrafficHistory::record(const NetworkInterfaceSnapshot &interfaces) {
 
   const auto now = std::chrono::steady_clock::now();
   const auto wall = std::chrono::system_clock::now();
+  last_tick_.timestamp = now;
+  last_tick_.wall_clock = wall;
 
   double seconds = 0.0;
   if (previous_refresh_.has_value()) {
@@ -256,6 +258,9 @@ void NetworkTrafficHistory::record(const NetworkInterfaceSnapshot &interfaces) {
       rates = deriveTrafficRates(baseline->second, counters, seconds);
     }
     baselines_[identity] = counters;
+
+    last_tick_.rates[identity] = rates;
+    last_tick_.names[identity] = info.name;
 
     NetworkTrafficSeries *const series =
         seriesOrCreate(identity, info.name, /*aggregate=*/false);
@@ -379,6 +384,20 @@ void NetworkTrafficHistory::record(const NetworkInterfaceSnapshot &interfaces) {
     }
   }
 
+  // Last-tick aggregate rates: one per metric when at least one member
+  // produced it (mirrors the aggregate rings), never a fake zero.
+  NetworkTrafficRates aggregate_rates;
+  if (any_rx_rate) aggregate_rates.rx_bytes_per_second = agg_rx_rate;
+  if (any_tx_rate) aggregate_rates.tx_bytes_per_second = agg_tx_rate;
+  if (any_rx_packets) aggregate_rates.rx_packets_per_second = agg_rx_packets;
+  if (any_tx_packets) aggregate_rates.tx_packets_per_second = agg_tx_packets;
+  if (any_rx_errors) aggregate_rates.rx_errors_per_second = agg_rx_errors;
+  if (any_tx_errors) aggregate_rates.tx_errors_per_second = agg_tx_errors;
+  if (any_rx_drops) aggregate_rates.rx_dropped_per_second = agg_rx_drops;
+  if (any_tx_drops) aggregate_rates.tx_dropped_per_second = agg_tx_drops;
+  last_tick_.rates[std::string(kNetworkTrafficAllIdentity)] = aggregate_rates;
+  last_tick_.names[std::string(kNetworkTrafficAllIdentity)] = "All interfaces";
+
   pruneHistory(present);
 }
 
@@ -464,6 +483,7 @@ void NetworkTrafficHistory::clearHistory() {
   baselines_.clear();
   aggregate_members_.clear();
   previous_refresh_.reset();
+  last_tick_ = NetworkTrafficTick{};
 }
 
 }  // namespace atm

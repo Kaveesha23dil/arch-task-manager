@@ -21,6 +21,13 @@ enum class AlertType {
   DiskWriteActivity,  // aggregate write throughput
   NetworkReceive,     // aggregate RX throughput
   NetworkTransmit,    // aggregate TX throughput
+  NetworkCombined,    // combined RX+TX throughput (configurable per-rule alert)
+  NetworkRxPackets,   // per-rule RX packet-rate alert
+  NetworkTxPackets,   // per-rule TX packet-rate alert
+  NetworkRxErrors,    // per-rule RX error-rate alert
+  NetworkTxErrors,    // per-rule TX error-rate alert
+  NetworkRxDropped,   // per-rule RX drop-rate alert
+  NetworkTxDropped,   // per-rule TX drop-rate alert
   GpuUsage,           // per-GPU utilization
   GpuMemoryUsage,     // per-GPU VRAM usage
   Temperature,        // per-sensor temperature
@@ -125,6 +132,23 @@ class AlertManager {
 
   /// Feeds aggregate network RX/TX throughput in bytes per second.
   void updateNetwork(double rx_bps, double tx_bps);
+
+  /// Records an alert event computed by an external monitor (e.g. a network
+  /// traffic rule) into the bounded history and current-severity state. Unlike
+  /// the internal evaluate() path this never fires the notification sink: the
+  /// external monitor owns its own delivery policy (per-rule notify flag,
+  /// cooldown, repeat). Only a severity transition produces a history event, so
+  /// a repeatedly-violating rule does not spam the central log.
+  /// @param source human label of the subject (interface name / "All
+  ///     interfaces"); must not contain '|'.
+  void recordRuleEvent(AlertType type, const std::string& source,
+                       AlertSeverity severity, double value, double threshold,
+                       const std::string& message);
+
+  /// Silently resets a subject back to Normal without pushing a history event.
+  /// Used when an external monitor's subject disappears (interface removed), so
+  /// the central view never shows a stale active alert for a vanished target.
+  void clearSubject(AlertType type, const std::string& source);
 
   /// Feeds one GPU's utilization (percent) and VRAM usage (percent).
   /// Unavailable metrics are passed as NaN and never generate alerts.
