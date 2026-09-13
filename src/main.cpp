@@ -37,6 +37,7 @@
 #include "memory_monitor.hpp"
 #include "network_monitor.hpp"
 #include "network_interface_details.hpp"
+#include "network_interface_hardware.hpp"
 #include "network_link_metrics.hpp"
 #include "network_link_state.hpp"
 #include "network_traffic_history.hpp"
@@ -1025,6 +1026,38 @@ void renderNetworkInterfaceSections(
 /// formatters; declared here so the traffic section can use it).
 std::string formatTimestamp(std::chrono::system_clock::time_point timestamp);
 
+/// One-line hardware/driver summary used in the traffic-history section:
+/// physical devices show their bus and bound driver (stale reads are flagged),
+/// synthetic devices state their kind, and a missing device relationship is
+/// called out explicitly ("not applicable") rather than left as an unexplained
+/// blank. All metadata comes from the already-updated hardware monitor.
+std::string describeNetworkHardwareLine(
+    const atm::NetworkInterfaceHardware &hw) {
+  if (hw.device_kind == atm::NetworkDeviceKind::Physical) {
+    std::string line =
+        "Physical device" +
+        (hw.device_bus.empty()
+             ? std::string(" (bus unknown)")
+             : " on " + hw.device_bus + " bus");
+    if (!hw.driver.empty()) {
+      line += " \u2014 driver " + hw.driver;
+      if (hw.driver_state == atm::NetworkHardwareState::Stale) {
+        line += " (stale)";
+      }
+    } else {
+      line += " \u2014 no driver bound";
+    }
+    return line;
+  }
+  if (hw.device_kind == atm::NetworkDeviceKind::Virtual) {
+    return "Virtual device (software link \u2014 no physical link hardware)";
+  }
+  if (hw.device_related) {
+    return "Hardware relationship unknown";
+  }
+  return "Not applicable (no device relationship)";
+}
+
 /// Renders the NETWORK TRAFFIC HISTORY section: one overlaid RX/TX throughput
 /// chart plus current/peak/in-window-total/samples/span/last-update for one
 /// selected series (the aggregate or a tracked interface). Everything is read
@@ -1039,7 +1072,8 @@ void renderNetworkTrafficHistorySection(
     const std::string &selection,
     const atm::NetworkTrafficAlertMonitor &network_alert_monitor,
     const atm::NetworkLinkStateMonitor &network_link_state,
-    const atm::NetworkLinkMetricsMonitor &link_metrics_monitor) {
+    const atm::NetworkLinkMetricsMonitor &link_metrics_monitor,
+    const atm::NetworkInterfaceHardwareMonitor &hardware_monitor) {
   out << "\n## NETWORK TRAFFIC HISTORY\n\n";
   const atm::NetworkTrafficSeries *series = traffic.seriesFor(selection);
   const bool stale_selection = series == nullptr;
@@ -1079,6 +1113,14 @@ void renderNetworkTrafficHistorySection(
         link_metrics->present) {
       out << "Link speed: " << renderLinkSpeedDetail(*link_metrics)
           << "   Duplex: " << renderLinkDuplexDetail(*link_metrics) << '\n';
+    }
+    // One compact hardware/driver line for the selected interface (never read
+    // on the render path — the monitor is fed once per tick). Software links
+    // state their kind explicitly instead of leaving an unexplained blank.
+    const atm::NetworkInterfaceHardware *hardware =
+        hardware_monitor.tracked(series->identity);
+    if (hardware != nullptr && hardware->present) {
+      out << "Hardware: " << describeNetworkHardwareLine(*hardware) << '\n';
     }
   }
 
@@ -4344,7 +4386,8 @@ const atm::FilesystemMonitor &filesystems,
                          const std::string &traffic_selection,
                          const atm::NetworkTrafficAlertMonitor &network_alert_monitor,
                          const atm::NetworkLinkStateMonitor &network_link_state,
-                         const atm::NetworkLinkMetricsMonitor &network_link_metrics) {
+                         const atm::NetworkLinkMetricsMonitor &network_link_metrics,
+                         const atm::NetworkInterfaceHardwareMonitor &hardware_monitor) {
    if (view == ViewMode::Tree) {
     // The tree view stays deliberately focused on the hierarchy; the storage
     // and network sections are part of the table view.
@@ -4370,7 +4413,8 @@ const atm::FilesystemMonitor &filesystems,
   renderNetworkTrafficHistorySection(out, network_traffic_history,
                                      traffic_selection,
                                      network_alert_monitor,
-                                     network_link_state, network_link_metrics);
+                                     network_link_state, network_link_metrics,
+                                     hardware_monitor);
   renderGpuSections(out, gpu);
   renderSensorSections(out, sensors, gpu);
   renderAlertsSections(out, alerts, alert_filter);
@@ -4446,7 +4490,8 @@ const atm::GpuSnapshot &gpu,
                  const std::string &traffic_selection,
                  const atm::NetworkTrafficAlertMonitor &network_alert_monitor,
                  const atm::NetworkLinkStateMonitor &network_link_state,
-                 const atm::NetworkLinkMetricsMonitor &network_link_metrics) {
+                 const atm::NetworkLinkMetricsMonitor &network_link_metrics,
+                 const atm::NetworkInterfaceHardwareMonitor &hardware_monitor) {
   // ANSI "clear entire screen" + "cursor to home" so the multi-line frame
   // refreshes in place instead of scrolling the terminal.
   std::cout << "\033[2J\033[H";
@@ -4459,7 +4504,7 @@ const atm::GpuSnapshot &gpu,
                            disk_health, filesystems, fs_filter, network_interfaces,
                            network_traffic_history, traffic_selection,
                            network_alert_monitor, network_link_state,
-                           network_link_metrics)
+                           network_link_metrics, hardware_monitor)
             << std::flush;
 }
 
@@ -4665,6 +4710,9 @@ class ConsoleInput {
 void interactNetworkTrafficExport(const atm::NetworkTrafficHistory &traffic,
                                   const std::string &selection,
                                   const atm::NetworkLinkMetricsMonitor &link_metrics,
+                                  const atm::NetworkInterfaceMonitor &interfaces,
+                                  const atm::NetworkLinkStateMonitor &link_state,
+                                  const atm::NetworkInterfaceHardwareMonitor &hardware,
                                   ConsoleInput &input) {
   for (;;) {
     std::cout << "\033[2J\033[H";
@@ -4724,10 +4772,24 @@ void interactNetworkTrafficExport(const atm::NetworkTrafficHistory &traffic,
       continue;
     }
 
+    // Attach the hardware/driver, interface-info and link-state records for
+    // the selected series (all already-cached monitor state — the export path
+    // never reads the network). The builder treats each as optional, so a stale
+    // selection or a non-physical interface simply yields no hardware metadata.
+    const atm::NetworkInterfaceInfo *info = nullptr;
+    for (const atm::NetworkInterfaceInfo &candidate :
+         interfaces.current().interfaces) {
+      if (candidate.identity() == effective_identity) {
+        info = &candidate;
+        break;
+      }
+    }
     const atm::NetworkTrafficExportSnapshot snapshot =
         atm::buildNetworkTrafficExportSnapshot(
             *series, traffic.historyMaxSamples(),
-            link_metrics.tracked(effective_identity));
+            link_metrics.tracked(effective_identity),
+            hardware.tracked(effective_identity), info,
+            link_state.tracked(effective_identity));
     if (snapshot.samples.empty()) {
       std::cout << "\nNo network traffic history samples are available to "
                    "export for this selection (history is disabled or never "
@@ -5748,6 +5810,7 @@ std::string buildNetworkInterfacePage(
     const atm::NetworkInterfaceMonitor &monitor,
     const atm::NetworkLinkStateMonitor &link_state,
     const atm::NetworkLinkMetricsMonitor &link_metrics_monitor,
+    const atm::NetworkInterfaceHardwareMonitor &hardware_monitor,
     const atm::NetworkInterfaceStats &traffic) {
   const auto found = std::find_if(
       snapshot.interfaces.begin(), snapshot.interfaces.end(),
@@ -5772,7 +5835,8 @@ std::string buildNetworkInterfacePage(
   appendLabeled(out, "  State:", info.link.operstate.value_or("unknown"));
   appendLabeled(out, "  Carrier:", atm::formatNetworkCarrier(info.link.carrier));
   if (info.link.mac_address.has_value()) {
-    appendLabeled(out, "  MAC address:", *info.link.mac_address);
+    const std::string mac = atm::formatMacAddress(info.link.mac_address);
+    appendLabeled(out, "  MAC address:", mac.empty() ? "unavailable" : mac);
   }
   if (info.link.mtu.has_value()) {
     appendLabeled(out, "  MTU:", std::to_string(*info.link.mtu));
@@ -5805,6 +5869,62 @@ std::string buildNetworkInterfacePage(
     } else {
       appendLabeled(out, "  Last update:",
                     formatTimestamp(link_metrics->last_update));
+    }
+  }
+
+  // Hardware and driver metadata from the sysfs probe cache (fed once per tick
+  // by the monitoring loop — never probed here). Loopback and software devices
+  // report "not applicable" explicitly instead of implying physical hardware.
+  out << "\nHardware / driver\n";
+  const atm::NetworkInterfaceHardware *hardware =
+      hardware_monitor.tracked(identity);
+  if (hardware == nullptr || !hardware->present) {
+    appendLabeled(out, "  Status:", "not sampled yet");
+  } else {
+    switch (hardware->device_kind) {
+      case atm::NetworkDeviceKind::Physical:
+        appendLabeled(out, "  Kind:", "Physical device");
+        appendLabeled(
+            out, "  Bus:",
+            hardware->device_bus.empty() ? "unknown" : hardware->device_bus);
+        appendLabeled(out, "  Device state:",
+                      atm::networkHardwareStateName(hardware->device_state));
+        if (!hardware->device_id.empty()) {
+          appendLabeled(out, "  Device id:", hardware->device_id);
+        }
+        break;
+      case atm::NetworkDeviceKind::Virtual:
+        appendLabeled(
+            out, "  Kind:",
+            "Virtual device (software link \u2014 no physical hardware)");
+        appendLabeled(out, "  Device state:",
+                      atm::networkHardwareStateName(hardware->device_state));
+        break;
+      case atm::NetworkDeviceKind::Unknown:
+        if (!hardware->device_related) {
+          appendLabeled(
+              out, "  Kind:",
+              info.type == atm::NetworkInterfaceType::Loopback
+                  ? "Loopback device (not applicable \u2014 no physical link)"
+                  : "No device relationship (not applicable)");
+        } else {
+          appendLabeled(out, "  Kind:", "Unknown");
+        }
+        appendLabeled(out, "  Device state:",
+                      atm::networkHardwareStateName(hardware->device_state));
+        break;
+    }
+    appendLabeled(out, "  Driver:",
+                  hardware->driver.empty() ? "none bound" : hardware->driver);
+    appendLabeled(out, "  Driver state:",
+                  atm::networkHardwareStateName(hardware->driver_state));
+    if (hardware->name_assign_type.has_value()) {
+      appendLabeled(out, "  Name assign type:",
+                    std::to_string(*hardware->name_assign_type));
+    }
+    if (hardware->last_read != std::chrono::system_clock::time_point{}) {
+      appendLabeled(out, "  Last read:",
+                    formatTimestamp(hardware->last_read));
     }
   }
 
@@ -5933,6 +6053,7 @@ void interactNetworkDetail(const atm::NetworkSnapshot &network,
                            const atm::NetworkInterfaceMonitor &interfaces,
                            const atm::NetworkLinkStateMonitor &link_state,
                            const atm::NetworkLinkMetricsMonitor &link_metrics,
+                           const atm::NetworkInterfaceHardwareMonitor &hardware,
                            ConsoleInput &input) {
   std::cout << "\033[2J\033[H";
   const atm::NetworkInterfaceSnapshot &iface_snapshot = interfaces.current();
@@ -5968,7 +6089,7 @@ void interactNetworkDetail(const atm::NetworkSnapshot &network,
 
 const std::string page = buildNetworkInterfacePage(iface_snapshot, interfaces,
                                                       link_state, link_metrics,
-                                                      *found);
+                                                      hardware, *found);
   if (page.empty()) {
     std::cout << "Interface does not exist (not found in the current "
                  "interface list).\n";
@@ -7626,6 +7747,7 @@ int main() {
   atm::NetworkTrafficAlertMonitor network_alert_monitor(alerts);
   atm::NetworkLinkStateMonitor network_link_state(alerts);
   atm::NetworkLinkMetricsMonitor network_link_metrics;
+  atm::NetworkInterfaceHardwareMonitor network_hardware_monitor;
   atm::NotificationManager notifications;
   atm::PackageManager packages;
   atm::PackageTransaction package_transaction;
@@ -7753,6 +7875,7 @@ int main() {
   network_traffic_history.record(network_interface_details.current());
   network_link_state.update(network_interface_details.current());
   network_link_metrics.update(network_interface_details.current());
+  network_hardware_monitor.update(network_interface_details.current());
   network_alert_monitor.evaluate(network_traffic_history);
   const atm::GpuSnapshot first_gpu = gpu_monitor.read();
   const atm::SensorSnapshot first_sensors = sensor_monitor.read();
@@ -7802,7 +7925,8 @@ int main() {
              packages, refresh_interval_ms, cpu, memory, disk_health,
              filesystem_monitor, fs_filter, network_interface_details,
              network_traffic_history, network_traffic_selection,
-             network_alert_monitor, network_link_state, network_link_metrics);
+             network_alert_monitor, network_link_state, network_link_metrics,
+             network_hardware_monitor);
 
   atm::NetworkSnapshot network = first_network;
   atm::GpuSnapshot gpu = first_gpu;
@@ -7864,6 +7988,7 @@ int main() {
             network_traffic_history.record(network_interface_details.current());
             network_link_state.update(network_interface_details.current());
             network_link_metrics.update(network_interface_details.current());
+            network_hardware_monitor.update(network_interface_details.current());
             network_alert_monitor.evaluate(network_traffic_history);
             static_cast<void>(filesystem_monitor.read());
             gpu = gpu_monitor.read();
@@ -7905,7 +8030,8 @@ renderView(aggregateCpuPercent(cpu), mem_info, snapshot.processes,
                    memory, disk_health, filesystem_monitor, fs_filter,
                    network_interface_details, network_traffic_history,
                    network_traffic_selection, network_alert_monitor,
-                   network_link_state, network_link_metrics);
+                   network_link_state, network_link_metrics,
+                   network_hardware_monitor);
           }
         }
         continue;
@@ -7920,7 +8046,8 @@ renderView(aggregateCpuPercent(cpu), mem_info, snapshot.processes,
       case ConsoleInput::Command::InspectNetwork:
         if (view == ViewMode::List) {
           interactNetworkDetail(network, network_interface_details,
-                                network_link_state, network_link_metrics, input);
+                                network_link_state, network_link_metrics,
+                                network_hardware_monitor, input);
         }
         break;
       case ConsoleInput::Command::InspectDiskHealth:
@@ -8002,7 +8129,10 @@ renderView(aggregateCpuPercent(cpu), mem_info, snapshot.processes,
         if (view == ViewMode::List) {
           interactNetworkTrafficExport(network_traffic_history,
                                        network_traffic_selection,
-                                       network_link_metrics, input);
+                                       network_link_metrics,
+                                       network_interface_details,
+                                       network_link_state,
+                                       network_hardware_monitor, input);
         }
         break;
       case ConsoleInput::Command::ToggleHistory:
@@ -8058,6 +8188,7 @@ renderView(aggregateCpuPercent(cpu), mem_info, snapshot.processes,
     network_traffic_history.record(network_interface_details.current());
     network_link_state.update(network_interface_details.current());
     network_link_metrics.update(network_interface_details.current());
+    network_hardware_monitor.update(network_interface_details.current());
     network_alert_monitor.evaluate(network_traffic_history);
     static_cast<void>(filesystem_monitor.read());
     gpu = gpu_monitor.read();
@@ -8098,7 +8229,8 @@ renderView(aggregateCpuPercent(cpu), mem_info, snapshot.processes,
                startup_sort, packages, refresh_interval_ms, cpu, memory,
                disk_health, filesystem_monitor, fs_filter, network_interface_details,
                network_traffic_history, network_traffic_selection,
-               network_alert_monitor, network_link_state, network_link_metrics);
+               network_alert_monitor, network_link_state, network_link_metrics,
+               network_hardware_monitor);
   }
 
   // Clean shutdown: persist any pending settings changes.

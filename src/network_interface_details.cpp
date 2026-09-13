@@ -374,6 +374,48 @@ std::string formatNetworkCarrier(const std::optional<int> &carrier) {
   return *carrier == 0 ? "no" : "yes";
 }
 
+std::string formatMacAddress(const std::optional<std::string> &address) {
+  if (!address.has_value() || address->empty()) {
+    return "";
+  }
+  std::string mac;
+  mac.reserve(address->size());
+  int groups = 0;
+  bool expect_hex = true;
+  std::size_t digit_count = 0;
+  for (const char c : *address) {
+    if (c == ':') {
+      if (digit_count != 2) {
+        return "";  // each group must be exactly two hex digits
+      }
+      groups += 1;
+      digit_count = 0;
+      expect_hex = true;
+      mac += ':';
+      continue;
+    }
+    if (digit_count == 2) {
+      return "";  // more than two hex digits before a separator
+    }
+    if (c >= '0' && c <= '9') {
+      mac += c;
+    } else if (c >= 'a' && c <= 'f') {
+      mac += c;
+    } else if (c >= 'A' && c <= 'F') {
+      mac += static_cast<char>(c - 'A' + 'a');  // normalize to lowercase
+    } else {
+      return "";  // not a hex digit
+    }
+    ++digit_count;
+    expect_hex = false;
+  }
+  if (digit_count != 2 || groups != 5) {
+    return "";  // a MAC is exactly six two-digit groups
+  }
+  (void)expect_hex;
+  return mac;
+}
+
 std::string formatInterfaceFlagNames(unsigned flags) {
   struct FlagEntry {
     unsigned bit;

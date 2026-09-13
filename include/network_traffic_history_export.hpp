@@ -11,7 +11,9 @@
 
 namespace atm {
 
-struct NetworkLinkMetrics;  // link speed/duplex monitor state (export metadata)
+struct NetworkLinkMetrics;        // link speed/duplex monitor state (export metadata)
+struct NetworkInterfaceHardware;   // hardware/driver monitor state (export metadata)
+struct TrackedInterface;           // link-state monitor record (export metadata)
 
 /// Supported network-traffic-history export formats. CSV and JSON are the only
 /// two: both are plain-text, self-describing and easy to inspect or import.
@@ -78,6 +80,27 @@ struct NetworkTrafficExportLink {
   std::chrono::system_clock::time_point last_update{};  // fresh-read time
 };
 
+/// Hardware/driver metadata serialized alongside one exported series when it
+/// maps to a single interface. Series-scoped (one value per export, never
+/// repeated per sample in the JSON form); unavailable values follow the export
+/// conventions (empty CSV fields, null JSON values) — never fake zeros.
+struct NetworkTrafficExportHardware {
+  std::string interface_type;    // "Ethernet" / "Wifi" / ... ("" when absent)
+  std::string hardware_class;    // "physical" / "virtual" / "unknown"
+  bool device_related = false;   // the interface resolves to a device directory
+  std::string device_bus;        // "pci" / "usb" / "platform" / ... ("" absent)
+  std::string device_id;         // raw sysfs dev_id value ("" when absent)
+  std::string driver;            // basename of the bound driver ("" when absent)
+  std::string driver_state;      // "available" / "stale" / "unavailable" / ...
+  std::string mac_address;       // formatted sysfs address ("" when unavailable)
+  std::optional<int> ifindex;    // stable kernel interface index
+  std::optional<int> name_assign_type;  // raw sysfs name_assign_type
+  std::string carrier_state;     // "yes" / "no carrier" / "unknown"
+  std::string oper_state;        // "up" / "down" / ... / "unknown"
+  std::string availability;      // "Connected" / "Down" / "Unknown" / ...
+  std::chrono::system_clock::time_point last_read{};  // metadata probe time
+};
+
 /// Implementation-free, immutable snapshot of one traffic series ready for
 /// serialization. Contains only plain data — no pointers, no mutexes, no UI
 /// objects and no internal bookkeeping. Building this snapshot before
@@ -98,6 +121,10 @@ struct NetworkTrafficExportSnapshot {
   // Link speed/duplex metadata when the exported series maps to a single
   // physical interface (std::nullopt for the aggregate / non-physical links).
   std::optional<NetworkTrafficExportLink> link;
+
+  // Hardware/driver metadata when the exported series maps to a single
+  // interface (std::nullopt for the aggregate / when no hardware was captured).
+  std::optional<NetworkTrafficExportHardware> hardware;
 };
 
 /// Builds a stable snapshot of `series` for export. Reads only the series'
@@ -107,10 +134,17 @@ struct NetworkTrafficExportSnapshot {
 /// series is never mutated. `max_samples` is the current retention bound (used
 /// for coverage/completeness); pass NetworkTrafficHistory::historyMaxSamples().
 /// When `link_metrics` points to the selected interface's metrics they are
-/// captured into snapshot.link (additively — existing fields are unchanged).
+/// captured into snapshot.link; when `hardware` points at the selected
+/// interface's hardware/driver metadata it is captured into snapshot.hardware
+/// together with the underlying `info` (interface index, type name, MAC) and
+/// `link_state` (carrier/operational state). All parameters are additive —
+/// existing fields are unchanged and any missing one stays unavailable.
 [[nodiscard]] NetworkTrafficExportSnapshot buildNetworkTrafficExportSnapshot(
     const NetworkTrafficSeries &series, std::size_t max_samples,
-    const NetworkLinkMetrics *link_metrics = nullptr);
+    const NetworkLinkMetrics *link_metrics = nullptr,
+    const NetworkInterfaceHardware *hardware = nullptr,
+    const NetworkInterfaceInfo *info = nullptr,
+    const TrackedInterface *link_state = nullptr);
 
 /// Formats a wall-clock time point as ISO-8601 local time
 /// "YYYY-MM-DDTHH:MM:SS". This is the timestamp format used by every export
@@ -125,21 +159,25 @@ struct NetworkTrafficExportSnapshot {
 /// Serializes a snapshot to CSV with a stable column order:
 /// timestamp, interface, identity, rx/tx bytes per second, rx/tx bits per
 /// second, cumulative rx/tx bytes, rx/tx packets per second, rx/tx errors per
-/// second, rx/tx drops per second and — when link metrics were captured with
-/// the snapshot — the trailing link_speed/duplex columns. Link columns are
-/// append-only additions, so the leading historical columns are unchanged;
-/// without metrics the trailing columns are empty. Unavailable metrics are
-/// empty fields (never misleading zeros); headers are always emitted, so a
-/// snapshot with no rows still produces a valid, readable CSV.
+/// second, rx/tx drops per second, the trailing link_speed/duplex columns and —
+/// when hardware metadata was captured with the snapshot — the trailing
+/// interface_index/mac/type/classification/driver/device and link carrier/
+/// operstate columns. All metadata columns are append-only additions, so the
+/// leading historical columns are unchanged; without captured metadata the
+/// trailing columns are empty. Unavailable metrics are empty fields (never
+/// misleading zeros); headers are always emitted, so a snapshot with no rows
+/// still produces a valid, readable CSV.
 [[nodiscard]] std::string generateNetworkTrafficCsv(
     const NetworkTrafficExportSnapshot &snapshot);
 
 /// Serializes a snapshot to valid JSON with stable field names: export
-/// metadata, interface identity/name/aggregate flag, history span and sampling
-/// interval, unit information, the summary values, an optional "link" object
-/// (link speed/duplex metadata, null when absent) and the sample array.
-/// Unavailable values are null; an empty sample array is valid; no internal
-/// implementation state is ever serialized.
+/// metadata, interface identity/name/aggregate flag, an optional "link" object
+/// (link speed/duplex metadata, null when absent), an optional "hardware"
+/// object (interface index, MAC, type, physical/virtual classification,
+/// driver/device relationships and carrier/operational state, null when
+/// absent), history span and sampling interval, unit information, the summary
+/// values and the sample array. Unavailable values are null; an empty sample
+/// array is valid; no internal implementation state is ever serialized.
 [[nodiscard]] std::string generateNetworkTrafficJson(
     const NetworkTrafficExportSnapshot &snapshot);
 

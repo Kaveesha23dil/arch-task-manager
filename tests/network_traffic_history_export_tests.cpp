@@ -12,7 +12,9 @@
 #include <unistd.h>
 
 #include "network_interface_details.hpp"
+#include "network_interface_hardware.hpp"
 #include "network_link_metrics.hpp"
+#include "network_link_state.hpp"
 #include "network_traffic_history.hpp"
 #include "network_traffic_history_export.hpp"
 
@@ -277,6 +279,8 @@ void test_csv_header_order() {
       "tx_errors_per_second", "rx_dropped_per_second", "tx_dropped_per_second",
       "link_speed_mbps", "link_speed_unit", "link_speed_state",
       "link_duplex", "link_duplex_state", "link_last_update",
+      "interface_index", "mac_address", "interface_type", "hardware_class",
+      "device_related", "driver", "device_id", "link_carrier", "link_operstate",
   };
   const std::vector<std::string> header = csvSplit(
       csv.substr(0, csv.find('\n')));
@@ -302,7 +306,10 @@ void test_csv_normal_export() {
   CHECK(lines.size() == 5);  // header + 4 ticks
 
   const std::vector<std::string> row0 = csvSplit(lines[1]);
-  CHECK(row0.size() == 21);
+  CHECK(row0.size() == 30);
+  CHECK(row0[15].empty());            // no link metrics captured
+  CHECK(row0[21].empty());            // no hardware metadata captured
+  CHECK(row0[24].empty());            // device_related absent with no hardware
   CHECK(row0[1] == "eth0");
   CHECK(row0[2] == "idx:2");
   CHECK(row0[3] == "");              // no rate on the first tick
@@ -336,7 +343,7 @@ void test_csv_empty_history() {
 
   const std::string csv = atm::generateNetworkTrafficCsv(snapshot);
   const std::vector<std::string> lines = csvSplit(csv);
-  CHECK(lines.size() == 21);  // header columns only
+  CHECK(lines.size() == 30);  // header columns only
 
   const auto result = atm::exportNetworkTrafficHistory(
       "/tmp/network-traffic-export-empty.csv", snapshot,
@@ -560,8 +567,130 @@ void test_csv_link_metadata_stale_unavailable() {
       linesOf(atm::generateNetworkTrafficCsv(none));
   CHECK(none_lines.size() == 5);
   const std::vector<std::string> none_row = csvSplit(none_lines[1]);
-  CHECK(none_row.size() == 21);
+  CHECK(none_row.size() == 30);
   CHECK(none_row[15].empty() && none_row[16].empty() && none_row[17].empty());
+}
+
+void test_csv_hardware_metadata() {
+  run("csvHardwareMetadata");
+  atm::NetworkTrafficSeries s = makeSeries("idx:2", "eth0", false, 120);
+  fillFourTicks(s);
+
+  // A physical NIC with a bound driver, an interface info record and a healthy
+  // link-state record: the trailing hardware columns must be populated.
+  atm::NetworkInterfaceHardware hw;
+  hw.identity = "idx:2";
+  hw.name = "eth0";
+  hw.device_related = true;
+  hw.device_path = "/sys/devices/pci0000:00/0000:00:1f.6/net/eth0";
+  hw.device_bus = "pci";
+  hw.device_id = "0x0";
+  hw.name_assign_type = 1;
+  hw.device_kind = atm::NetworkDeviceKind::Physical;
+  hw.device_state = atm::NetworkHardwareState::Available;
+  hw.driver = "e1000e";
+  hw.driver_state = atm::NetworkHardwareState::Available;
+  hw.last_read = std::chrono::system_clock::now();
+
+  atm::NetworkInterfaceInfo info;
+  info.name = "eth0";
+  info.type = atm::NetworkInterfaceType::Ethernet;
+  info.link.ifindex = 2;
+  info.link.mac_address = "aa:bb:cc:dd:ee:ff";
+
+  atm::TrackedInterface link_state;
+  link_state.oper = atm::NetworkOperState::Up;
+  link_state.carrier = atm::NetworkCarrierState::Carrier;
+  link_state.has_valid_state = true;
+  link_state.link_known = true;
+
+  const atm::NetworkTrafficExportSnapshot snapshot =
+      atm::buildNetworkTrafficExportSnapshot(s, 120, nullptr, &hw, &info,
+                                            &link_state);
+
+  const std::vector<std::string> lines =
+      linesOf(atm::generateNetworkTrafficCsv(snapshot));
+  CHECK(lines.size() == 5);  // header + 4 ticks
+  const std::vector<std::string> row = csvSplit(lines[1]);
+  CHECK(row.size() == 30);
+  CHECK(row[21] == "2");               // interface_index
+  CHECK(row[22] == "aa:bb:cc:dd:ee:ff");
+  CHECK(row[23] == "Ethernet");        // interface_type
+  CHECK(row[24] == "physical");        // hardware_class
+  CHECK(row[25] == "yes");             // device_related
+  CHECK(row[26] == "e1000e");          // driver
+  CHECK(row[27] == "0x0");             // device_id
+  CHECK(row[28] == "1");               // link_carrier
+  CHECK(row[29] == "1");               // link_operstate
+}
+
+void test_json_hardware_metadata() {
+  run("jsonHardwareMetadata");
+  atm::NetworkTrafficSeries s = makeSeries("idx:2", "eth0", false, 120);
+  s.rx_bytes_total.addSample(
+      TimedSample{std::chrono::steady_clock::now(), 5.0});
+  s.last_update = std::chrono::system_clock::now();
+
+  atm::NetworkInterfaceHardware hw;
+  hw.identity = "idx:2";
+  hw.name = "eth0";
+  hw.device_related = true;
+  hw.device_path = "/sys/devices/pci0000:00/0000:00:1f.6/net/eth0";
+  hw.device_bus = "pci";
+  hw.device_id = "0x0";
+  hw.name_assign_type = 1;
+  hw.device_kind = atm::NetworkDeviceKind::Physical;
+  hw.device_state = atm::NetworkHardwareState::Available;
+  hw.driver = "e1000e";
+  hw.driver_state = atm::NetworkHardwareState::Available;
+  hw.last_read = std::chrono::system_clock::now();
+
+  atm::NetworkInterfaceInfo info;
+  info.name = "eth0";
+  info.type = atm::NetworkInterfaceType::Wifi;
+  info.link.ifindex = 2;
+  info.link.mac_address = "AA:BB:CC:DD:EE:FF";  // normalized on export
+
+  atm::TrackedInterface link_state;
+  link_state.oper = atm::NetworkOperState::LowerLayerDown;
+  link_state.carrier = atm::NetworkCarrierState::NoCarrier;
+  link_state.has_valid_state = true;
+  link_state.link_known = true;
+
+  const atm::NetworkTrafficExportSnapshot snapshot =
+      atm::buildNetworkTrafficExportSnapshot(s, 120, nullptr, &hw, &info,
+                                            &link_state);
+  const std::string json = atm::generateNetworkTrafficJson(snapshot);
+  CHECK(isValidJson(json));
+  CHECK(json.find("\"hardware\":{") != std::string::npos);
+  CHECK(json.find("\"interface_type\":\"Wifi\"") != std::string::npos);
+  CHECK(json.find("\"hardware_class\":\"physical\"") != std::string::npos);
+  CHECK(json.find("\"device_related\":true") != std::string::npos);
+  CHECK(json.find("\"device_bus\":\"pci\"") != std::string::npos);
+  CHECK(json.find("\"device_id\":\"0x0\"") != std::string::npos);
+  CHECK(json.find("\"driver\":\"e1000e\"") != std::string::npos);
+  CHECK(json.find("\"driver_state\":\"available\"") != std::string::npos);
+  CHECK(json.find("\"mac_address\":\"aa:bb:cc:dd:ee:ff\"") !=
+        std::string::npos);
+  CHECK(json.find("\"ifindex\":2") != std::string::npos);
+  CHECK(json.find("\"name_assign_type\":1") != std::string::npos);
+  CHECK(json.find("\"carrier_state\":\"no carrier\"") != std::string::npos);
+  CHECK(json.find("\"oper_state\":\"lowerlayerdown\"") != std::string::npos);
+  CHECK(json.find("\"availability\":\"Down\"") != std::string::npos);
+}
+
+void test_json_hardware_null_when_absent() {
+  run("jsonHardwareNullWhenAbsent");
+  atm::NetworkTrafficSeries s = makeSeries("idx:2", "eth0", false, 120);
+  s.rx_bytes_total.addSample(
+      TimedSample{std::chrono::steady_clock::now(), 5.0});
+  s.last_update = std::chrono::system_clock::now();
+  const atm::NetworkTrafficExportSnapshot snapshot =
+      atm::buildNetworkTrafficExportSnapshot(s, 120);
+  CHECK(!snapshot.hardware.has_value());
+  const std::string json = atm::generateNetworkTrafficJson(snapshot);
+  CHECK(isValidJson(json));
+  CHECK(json.find("\"hardware\":null") != std::string::npos);
 }
 
 // -------------------------------------------------------------------------
@@ -1198,6 +1327,7 @@ int main() {
   test_csv_numeric_precision();
   test_csv_link_metadata();
   test_csv_link_metadata_stale_unavailable();
+  test_csv_hardware_metadata();
 
   test_json_valid_output();
   test_json_metadata_presence();
@@ -1211,6 +1341,8 @@ int main() {
   test_json_link_null_when_absent();
   test_json_link_metadata();
   test_json_link_null_for_aggregate();
+  test_json_hardware_metadata();
+  test_json_hardware_null_when_absent();
   test_json_no_internal_state();
 
   test_summary_current_and_peak();
