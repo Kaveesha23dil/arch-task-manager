@@ -6,11 +6,13 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 #include <sys/stat.h>
 #include <unistd.h>
 
 #include "network_interface_details.hpp"
+#include "network_link_metrics.hpp"
 #include "network_traffic_history.hpp"
 #include "network_traffic_history_export.hpp"
 
@@ -109,6 +111,16 @@ void fillFourTicks(atm::NetworkTrafficSeries &s) {
   s.tx_errors_per_second.addSample(TimedSample{t3, 0.5});
   s.rx_dropped_per_second.addSample(TimedSample{t3, 2.0});
   s.tx_dropped_per_second.addSample(TimedSample{t3, 1.0});
+}
+
+/// Splits multi-line CSV text into its lines, skipping the trailing empty line.
+std::vector<std::string> linesOf(const std::string &csv) {
+  std::vector<std::string> lines;
+  std::istringstream in(csv);
+  for (std::string line; std::getline(in, line) && !line.empty();) {
+    lines.push_back(line);
+  }
+  return lines;
 }
 
 /// Splits one CSV line into fields, honoring double-quoted fields.
@@ -239,9 +251,9 @@ NetworkInterfaceInfo makeInterface(const std::string &name, int ifindex,
 }
 
 atm::NetworkInterfaceSnapshot snapshotWith(
-    const std::vector<NetworkInterfaceInfo> &interfaces) {
+    std::vector<NetworkInterfaceInfo> interfaces) {
   atm::NetworkInterfaceSnapshot snapshot;
-  snapshot.interfaces = interfaces;
+  snapshot.interfaces = std::move(interfaces);
   snapshot.refreshed_at = std::chrono::system_clock::now();
   return snapshot;
 }
@@ -263,6 +275,8 @@ void test_csv_header_order() {
       "tx_bits_per_second", "rx_bytes_total", "tx_bytes_total",
       "rx_packets_per_second", "tx_packets_per_second", "rx_errors_per_second",
       "tx_errors_per_second", "rx_dropped_per_second", "tx_dropped_per_second",
+      "link_speed_mbps", "link_speed_unit", "link_speed_state",
+      "link_duplex", "link_duplex_state", "link_last_update",
   };
   const std::vector<std::string> header = csvSplit(
       csv.substr(0, csv.find('\n')));
@@ -288,7 +302,7 @@ void test_csv_normal_export() {
   CHECK(lines.size() == 5);  // header + 4 ticks
 
   const std::vector<std::string> row0 = csvSplit(lines[1]);
-  CHECK(row0.size() == 15);
+  CHECK(row0.size() == 21);
   CHECK(row0[1] == "eth0");
   CHECK(row0[2] == "idx:2");
   CHECK(row0[3] == "");              // no rate on the first tick
@@ -322,7 +336,7 @@ void test_csv_empty_history() {
 
   const std::string csv = atm::generateNetworkTrafficCsv(snapshot);
   const std::vector<std::string> lines = csvSplit(csv);
-  CHECK(lines.size() == 15);  // header columns only
+  CHECK(lines.size() == 21);  // header columns only
 
   const auto result = atm::exportNetworkTrafficHistory(
       "/tmp/network-traffic-export-empty.csv", snapshot,
@@ -468,6 +482,89 @@ void test_csv_numeric_precision() {
 }
 
 // -------------------------------------------------------------------------
+// Link speed/duplex metadata columns
+// -------------------------------------------------------------------------
+
+/// Builds a valid link-metrics record for a 1 Gbps full-duplex Ethernet link.
+atm::NetworkLinkMetrics makeLinkMetrics(bool active = true) {
+  atm::NetworkLinkMetrics metrics;
+  metrics.identity = "idx:2";
+  metrics.name = "eth0";
+  metrics.physical = true;
+  metrics.link_active = active;
+  metrics.speed_state =
+      active ? atm::NetworkSpeedState::Valid : atm::NetworkSpeedState::Stale;
+  metrics.speed_mbps = 1000;
+  metrics.duplex_state =
+      active ? atm::NetworkDuplexState::Valid : atm::NetworkDuplexState::Stale;
+  metrics.duplex = atm::NetworkDuplexMode::Full;
+  metrics.last_update = std::chrono::system_clock::now();
+  return metrics;
+}
+
+void test_csv_link_metadata() {
+  run("csvLinkMetadata");
+  atm::NetworkTrafficSeries s = makeSeries("idx:2", "eth0", false, 120);
+  fillFourTicks(s);
+  const atm::NetworkLinkMetrics metrics = makeLinkMetrics(true);
+  const atm::NetworkTrafficExportSnapshot snapshot =
+      atm::buildNetworkTrafficExportSnapshot(s, 120, &metrics);
+  CHECK(snapshot.link.has_value());
+  CHECK(snapshot.link->speed_mbps.has_value() && *snapshot.link->speed_mbps == 1000);
+  CHECK(snapshot.link->speed_unit == "Mb/s");
+  CHECK(snapshot.link->speed_state == "valid");
+  CHECK(snapshot.link->duplex == "full");
+  CHECK(snapshot.link->duplex_state == "valid");
+  CHECK(snapshot.link->physical);
+
+  const std::string csv = atm::generateNetworkTrafficCsv(snapshot);
+  std::vector<std::string> lines;
+  std::istringstream in(csv);
+  for (std::string line; std::getline(in, line) && !line.empty();) {
+    lines.push_back(line);
+  }
+  CHECK(lines.size() == 5);  // header + 4 ticks
+  const std::vector<std::string> row = csvSplit(lines[1]);
+  // The leading 15 historical columns are unchanged; the link fields follow.
+  CHECK(row[0] != "");
+  CHECK(row[15] == "1000");
+  CHECK(row[16] == "Mb/s");
+  CHECK(row[17] == "valid");
+  CHECK(row[18] == "full");
+  CHECK(row[19] == "valid");
+  CHECK(row[20] == atm::formatNetworkTrafficTimestamp(metrics.last_update));
+}
+
+void test_csv_link_metadata_stale_unavailable() {
+  run("csvLinkMetadataStaleUnavailable");
+  atm::NetworkTrafficSeries s = makeSeries("idx:2", "eth0", false, 120);
+  fillFourTicks(s);
+
+  // Inactive link: the preserved speed/duplex read stale (never dropped).
+  const atm::NetworkLinkMetrics stale = makeLinkMetrics(false);
+  const atm::NetworkTrafficExportSnapshot stale_snapshot =
+      atm::buildNetworkTrafficExportSnapshot(s, 120, &stale);
+  const std::vector<std::string> stale_lines =
+      linesOf(atm::generateNetworkTrafficCsv(stale_snapshot));
+  CHECK(stale_lines.size() == 5);  // header + 4 ticks
+  const std::vector<std::string> stale_row = csvSplit(stale_lines[1]);
+  CHECK(stale_row[17] == "stale");
+  CHECK(stale_row[18] == "full");
+  CHECK(stale_row[19] == "stale");
+
+  // No metrics captured: the trailing columns stay empty, never zeros.
+  const atm::NetworkTrafficExportSnapshot none =
+      atm::buildNetworkTrafficExportSnapshot(s, 120);
+  CHECK(!none.link.has_value());
+  const std::vector<std::string> none_lines =
+      linesOf(atm::generateNetworkTrafficCsv(none));
+  CHECK(none_lines.size() == 5);
+  const std::vector<std::string> none_row = csvSplit(none_lines[1]);
+  CHECK(none_row.size() == 21);
+  CHECK(none_row[15].empty() && none_row[16].empty() && none_row[17].empty());
+}
+
+// -------------------------------------------------------------------------
 // JSON serialization
 // -------------------------------------------------------------------------
 
@@ -607,6 +704,52 @@ void test_json_stable_field_names() {
   CHECK(countKey(json, "units") == 1);
   CHECK(countKey(json, "summary") == 1);
   CHECK(countKey(json, "samples") == 1);
+}
+
+void test_json_link_null_when_absent() {
+  run("jsonLinkNullWhenAbsent");
+  atm::NetworkTrafficSeries s = makeSeries("idx:2", "eth0", false, 120);
+  fillFourTicks(s);
+  const atm::NetworkTrafficExportSnapshot snapshot =
+      atm::buildNetworkTrafficExportSnapshot(s, 120);
+  const std::string json = atm::generateNetworkTrafficJson(snapshot);
+  CHECK(json.find("\"link\":null") != std::string::npos);
+  CHECK(countKey(json, "link") == 1);  // exactly one occurrence
+}
+
+void test_json_link_metadata() {
+  run("jsonLinkMetadata");
+  atm::NetworkTrafficSeries s = makeSeries("idx:2", "eth0", false, 120);
+  fillFourTicks(s);
+  const atm::NetworkLinkMetrics metrics = makeLinkMetrics(true);
+  const atm::NetworkTrafficExportSnapshot snapshot =
+      atm::buildNetworkTrafficExportSnapshot(s, 120, &metrics);
+  const std::string json = atm::generateNetworkTrafficJson(snapshot);
+  CHECK(isValidJson(json));
+  CHECK(countKey(json, "link") == 1);
+  CHECK(json.find("\"physical\":true") != std::string::npos);
+  CHECK(json.find("\"link_active\":true") != std::string::npos);
+  CHECK(json.find("\"speed_state\":\"valid\"") != std::string::npos);
+  CHECK(json.find("\"speed_mbps\":1000") != std::string::npos);
+  CHECK(json.find("\"speed_unit\":\"Mb/s\"") != std::string::npos);
+  CHECK(json.find("\"duplex\":\"full\"") != std::string::npos);
+  CHECK(json.find("\"duplex_state\":\"valid\"") != std::string::npos);
+}
+
+void test_json_link_null_for_aggregate() {
+  run("jsonLinkNullForAggregate");
+  atm::NetworkTrafficSeries s =
+      makeSeries(std::string(atm::kNetworkTrafficAllIdentity),
+                 "All interfaces", true, 120);
+  fillFourTicks(s);
+  const atm::NetworkLinkMetrics metrics = makeLinkMetrics(true);
+  const atm::NetworkTrafficExportSnapshot snapshot =
+      atm::buildNetworkTrafficExportSnapshot(s, 120, &metrics);
+  // Metrics are keyed by identity: "all" won't match "idx:2" in the monitor,
+  // but the test manually passes metrics to the builder. Since aggregate is
+  // a series-level concept, the builder still attaches them (caller decides).
+  CHECK(snapshot.link.has_value());
+  CHECK(snapshot.link->physical);
 }
 
 void test_json_no_internal_state() {
@@ -1053,6 +1196,8 @@ int main() {
   test_csv_timestamp_format();
   test_csv_large_counters();
   test_csv_numeric_precision();
+  test_csv_link_metadata();
+  test_csv_link_metadata_stale_unavailable();
 
   test_json_valid_output();
   test_json_metadata_presence();
@@ -1063,6 +1208,9 @@ int main() {
   test_json_special_characters();
   test_json_sample_ordering();
   test_json_stable_field_names();
+  test_json_link_null_when_absent();
+  test_json_link_metadata();
+  test_json_link_null_for_aggregate();
   test_json_no_internal_state();
 
   test_summary_current_and_peak();

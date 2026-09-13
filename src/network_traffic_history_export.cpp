@@ -3,6 +3,7 @@
 #include <errno.h>
 
 #include <algorithm>
+#include <array>
 #include <charconv>
 #include <cmath>
 #include <cstdio>
@@ -13,6 +14,7 @@
 #include <map>
 #include <utility>
 
+#include "network_link_metrics.hpp"
 #include "process_report.hpp"  // sanitizeReportName (shared filename sanitizer)
 
 namespace atm {
@@ -94,6 +96,15 @@ std::string jsonNumber(const std::optional<double> &value) {
   }
   const std::string formatted = formatExportDouble(*value);
   return formatted.empty() ? "null" : formatted;
+}
+
+/// JSON number literal for an optional integer (the reported link speed in
+/// Mb/s), or "null" when unavailable.
+std::string jsonNumber(const std::optional<int> &value) {
+  if (!value.has_value()) {
+    return "null";
+  }
+  return std::to_string(*value);
 }
 
 /// Builds a JSON object literal from ordered key/value members.
@@ -207,13 +218,29 @@ std::string escapeNetworkTrafficCsvField(std::string_view field) {
 }
 
 NetworkTrafficExportSnapshot buildNetworkTrafficExportSnapshot(
-    const NetworkTrafficSeries &series, std::size_t max_samples) {
+    const NetworkTrafficSeries &series, std::size_t max_samples,
+    const NetworkLinkMetrics *link_metrics) {
   NetworkTrafficExportSnapshot snapshot;
   snapshot.aggregate = series.aggregate;
   snapshot.identity = series.identity;
   snapshot.display_name = series.display_name;
   snapshot.last_update = series.last_update;
   snapshot.max_samples = max_samples;
+
+  // Capture the link speed/duplex metadata (if the monitoring layer provided
+  // metrics for the selected interface) before any stream is touched.
+  if (link_metrics != nullptr) {
+    NetworkTrafficExportLink link;
+    link.physical = link_metrics->physical;
+    link.link_active = link_metrics->link_active;
+    link.speed_state = networkSpeedStateName(link_metrics->speed_state);
+    link.speed_mbps = link_metrics->speed_mbps;
+    link.speed_unit = "Mb/s";  // the unit the kernel reports "speed" in
+    link.duplex = networkDuplexModeName(link_metrics->duplex);
+    link.duplex_state = networkDuplexStateName(link_metrics->duplex_state);
+    link.last_update = link_metrics->last_update;
+    snapshot.link = link;
+  }
 
   // Merge every retained ring into one row per unique sample tick. A row is
   // created the first time a tick is seen; each metric is assigned only from
@@ -389,7 +416,9 @@ std::string generateNetworkTrafficCsv(
       "tx_bytes_per_second,rx_bits_per_second,tx_bits_per_second,"
       "rx_bytes_total,tx_bytes_total,rx_packets_per_second,"
       "tx_packets_per_second,rx_errors_per_second,tx_errors_per_second,"
-      "rx_dropped_per_second,tx_dropped_per_second\n";
+      "rx_dropped_per_second,tx_dropped_per_second,"
+      "link_speed_mbps,link_speed_unit,link_speed_state,"
+      "link_duplex,link_duplex_state,link_last_update\n";
 
   std::string out;
   out.reserve(kHeader.size() + snapshot.samples.size() * 96u);
@@ -398,6 +427,29 @@ std::string generateNetworkTrafficCsv(
   const std::string interface =
       escapeNetworkTrafficCsvField(snapshot.display_name);
   const std::string identity = escapeNetworkTrafficCsvField(snapshot.identity);
+
+  // The link metadata is series-scoped (one value per export), so the same
+  // six fields are repeated on every row. Without captured link metrics every
+  // field stays empty — the leading historical columns are unchanged and the
+  // trailing columns are additive only.
+  std::array<std::string, 6> link_columns =
+      std::array<std::string, 6>{};
+  if (snapshot.link.has_value()) {
+    const NetworkTrafficExportLink &link = *snapshot.link;
+    link_columns = {
+        link.speed_mbps.has_value()
+            ? formatExportDouble(static_cast<double>(*link.speed_mbps))
+            : std::string{},
+        link.speed_unit,
+        link.speed_state,
+        link.duplex,
+        link.duplex_state,
+        link.last_update == std::chrono::system_clock::time_point{}
+            ? std::string{}
+            : formatNetworkTrafficTimestamp(link.last_update),
+    };
+  }
+
   for (const NetworkTrafficExportRow &row : snapshot.samples) {
     appendCsvField(out,
                    escapeNetworkTrafficCsvField(
@@ -416,8 +468,11 @@ std::string generateNetworkTrafficCsv(
     appendCsvNumber(out, row.tx_errors_per_second);
     appendCsvNumber(out, row.rx_dropped_per_second);
     appendCsvNumber(out, row.tx_dropped_per_second);
+    for (const std::string &field : link_columns) {
+      appendCsvField(out, field);
+    }
     if (!out.empty() && out.back() == ',') {
-      out.pop_back();  // drop the trailing separator (13 fields -> 12 commas)
+      out.pop_back();  // drop the trailing separator (21 fields -> 20 commas)
     }
     out += '\n';
   }
@@ -444,6 +499,26 @@ std::string generateNetworkTrafficJson(
       {"name", jsonEscape(snapshot.display_name)},
       {"aggregate", snapshot.aggregate ? "true" : "false"},
   });
+
+  // Link speed/duplex metadata captured with the snapshot, or null when the
+  // export has none (aggregate / non-physical selection / metrics not captured).
+  const std::string link_json = [&] {
+    if (!snapshot.link.has_value()) {
+      return std::string("null");
+    }
+    const NetworkTrafficExportLink &link = *snapshot.link;
+    return jsonObject({
+        {"physical", link.physical ? "true" : "false"},
+        {"link_active", link.link_active ? "true" : "false"},
+        {"speed_state", jsonEscape(link.speed_state)},
+        {"speed_mbps", jsonNumber(link.speed_mbps)},
+        {"speed_unit", jsonEscape(link.speed_unit)},
+        {"duplex", jsonEscape(link.duplex)},
+        {"duplex_state", jsonEscape(link.duplex_state)},
+        {"last_update",
+         jsonEscape(formatNetworkTrafficTimestamp(link.last_update))},
+    });
+  }();
 
   const std::string history = jsonObject({
       {"start_timestamp", start_timestamp},
@@ -510,6 +585,7 @@ std::string generateNetworkTrafficJson(
            {"created_at", jsonEscape(created_at)},
        })},
       {"interface", interface},
+      {"link", link_json},
       {"history", history},
       {"units", units},
       {"summary", summary_json},
