@@ -209,6 +209,13 @@ class NetworkInterfaceMonitor {
 /// Formats carrier (yes/no) or "-" when the interface exposes none (virtual).
 [[nodiscard]] std::string formatNetworkCarrier(const std::optional<int> &carrier);
 
+/// Validates and formats the sysfs "address" value as a standard human-readable
+/// MAC ("aa:bb:cc:dd:ee:ff", lowercased). The underlying address bytes are
+/// preserved exactly; invalid/absent values yield an empty string so the caller
+/// can present "unavailable" explicitly instead of guessing.
+[[nodiscard]] std::string formatMacAddress(
+    const std::optional<std::string> &address);
+
 /// Human-readable names of the IFF_* flags set in `flags` ("UP RUNNING ...").
 [[nodiscard]] std::string formatInterfaceFlagNames(unsigned flags);
 

@@ -14,7 +14,9 @@
 #include <map>
 #include <utility>
 
+#include "network_interface_hardware.hpp"
 #include "network_link_metrics.hpp"
+#include "network_link_state.hpp"
 #include "process_report.hpp"  // sanitizeReportName (shared filename sanitizer)
 
 namespace atm {
@@ -219,7 +221,10 @@ std::string escapeNetworkTrafficCsvField(std::string_view field) {
 
 NetworkTrafficExportSnapshot buildNetworkTrafficExportSnapshot(
     const NetworkTrafficSeries &series, std::size_t max_samples,
-    const NetworkLinkMetrics *link_metrics) {
+    const NetworkLinkMetrics *link_metrics,
+    const NetworkInterfaceHardware *hardware,
+    const NetworkInterfaceInfo *info,
+    const TrackedInterface *link_state) {
   NetworkTrafficExportSnapshot snapshot;
   snapshot.aggregate = series.aggregate;
   snapshot.identity = series.identity;
@@ -240,6 +245,39 @@ NetworkTrafficExportSnapshot buildNetworkTrafficExportSnapshot(
     link.duplex_state = networkDuplexStateName(link_metrics->duplex_state);
     link.last_update = link_metrics->last_update;
     snapshot.link = link;
+  }
+
+  // Capture the hardware/driver metadata (if the monitoring layer provided a
+  // record for the selected interface) before any stream is touched. The
+  // interface type, MAC and index come from the details snapshot; carrier and
+  // operational state from the link-state record; everything else from the
+  // hardware monitor's cached sysfs metadata.
+  if (hardware != nullptr && info != nullptr) {
+    NetworkTrafficExportHardware hw;
+    hw.interface_type = networkInterfaceTypeName(info->type);
+    hw.hardware_class = networkDeviceKindName(hardware->device_kind);
+    hw.device_related = hardware->device_related;
+    hw.device_bus = hardware->device_bus;
+    hw.device_id = hardware->device_id;
+    hw.driver = hardware->driver;
+    hw.driver_state = networkHardwareStateName(hardware->driver_state);
+    hw.mac_address = formatMacAddress(info->link.mac_address);
+    hw.ifindex = info->link.ifindex;
+    hw.name_assign_type = hardware->name_assign_type;
+    hw.last_read = hardware->last_read;
+
+    if (link_state != nullptr) {
+      hw.carrier_state = networkCarrierStateName(link_state->carrier);
+      hw.oper_state = networkOperStateName(link_state->oper);
+      hw.availability =
+          networkLinkAvailabilityName(link_state->availability());
+    } else {
+      hw.carrier_state = networkCarrierStateName(NetworkCarrierState::Unknown);
+      hw.oper_state = networkOperStateName(NetworkOperState::Unknown);
+      hw.availability =
+          networkLinkAvailabilityName(NetworkLinkAvailability::Unknown);
+    }
+    snapshot.hardware = hw;
   }
 
   // Merge every retained ring into one row per unique sample tick. A row is
@@ -418,7 +456,9 @@ std::string generateNetworkTrafficCsv(
       "tx_packets_per_second,rx_errors_per_second,tx_errors_per_second,"
       "rx_dropped_per_second,tx_dropped_per_second,"
       "link_speed_mbps,link_speed_unit,link_speed_state,"
-      "link_duplex,link_duplex_state,link_last_update\n";
+      "link_duplex,link_duplex_state,link_last_update,"
+      "interface_index,mac_address,interface_type,hardware_class,"
+      "device_related,driver,device_id,link_carrier,link_operstate\n";
 
   std::string out;
   out.reserve(kHeader.size() + snapshot.samples.size() * 96u);
@@ -450,6 +490,31 @@ std::string generateNetworkTrafficCsv(
     };
   }
 
+  // The hardware/driver metadata is series-scoped too: nine more append-only
+  // trailing columns, empty until a hardware record is captured for the
+  // interface. Availability-driven values are null-equivalent (empty CSV
+  // fields) rather than zeros, matching the historical columns' conventions.
+  std::array<std::string, 9> hardware_columns =
+      std::array<std::string, 9>{};
+  if (snapshot.hardware.has_value()) {
+    const NetworkTrafficExportHardware &hw = *snapshot.hardware;
+    hardware_columns = {
+        hw.ifindex.has_value() ? std::to_string(*hw.ifindex) : std::string{},
+        hw.mac_address,
+        hw.interface_type,
+        hw.hardware_class,
+        hw.device_related ? "yes" : "no",
+        hw.driver,
+        hw.device_id,
+        // Carrier/operational presence uses the canonical link-state names
+        // ("yes"/"no carrier"); exported as discrete 1/0/empty markers.
+        hw.carrier_state == "yes" ? "1"
+            : hw.carrier_state == "no carrier" ? "0"
+                                               : std::string{},
+        hw.oper_state == "up" ? "1" : "0",
+    };
+  }
+
   for (const NetworkTrafficExportRow &row : snapshot.samples) {
     appendCsvField(out,
                    escapeNetworkTrafficCsvField(
@@ -471,8 +536,11 @@ std::string generateNetworkTrafficCsv(
     for (const std::string &field : link_columns) {
       appendCsvField(out, field);
     }
+    for (const std::string &field : hardware_columns) {
+      appendCsvField(out, field);
+    }
     if (!out.empty() && out.back() == ',') {
-      out.pop_back();  // drop the trailing separator (21 fields -> 20 commas)
+      out.pop_back();  // drop the trailing separator (30 fields -> 29 commas)
     }
     out += '\n';
   }
@@ -517,6 +585,29 @@ std::string generateNetworkTrafficJson(
         {"duplex_state", jsonEscape(link.duplex_state)},
         {"last_update",
          jsonEscape(formatNetworkTrafficTimestamp(link.last_update))},
+    });
+  }();
+
+  const std::string hardware_json = [&] {
+    if (!snapshot.hardware.has_value()) {
+      return std::string("null");
+    }
+    const NetworkTrafficExportHardware &hw = *snapshot.hardware;
+    return jsonObject({
+        {"interface_type", jsonEscape(hw.interface_type)},
+        {"hardware_class", jsonEscape(hw.hardware_class)},
+        {"device_related", hw.device_related ? "true" : "false"},
+        {"device_bus", jsonEscape(hw.device_bus)},
+        {"device_id", jsonEscape(hw.device_id)},
+        {"driver", jsonEscape(hw.driver)},
+        {"driver_state", jsonEscape(hw.driver_state)},
+        {"mac_address", jsonEscape(hw.mac_address)},
+        {"ifindex", jsonNumber(hw.ifindex)},
+        {"name_assign_type", jsonNumber(hw.name_assign_type)},
+        {"carrier_state", jsonEscape(hw.carrier_state)},
+        {"oper_state", jsonEscape(hw.oper_state)},
+        {"availability", jsonEscape(hw.availability)},
+        {"last_read", jsonEscape(formatNetworkTrafficTimestamp(hw.last_read))},
     });
   }();
 
@@ -586,6 +677,7 @@ std::string generateNetworkTrafficJson(
        })},
       {"interface", interface},
       {"link", link_json},
+      {"hardware", hardware_json},
       {"history", history},
       {"units", units},
       {"summary", summary_json},
