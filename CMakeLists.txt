@@ -61,6 +61,8 @@ add_executable(arch-task-manager
   src/filesystem_monitor.cpp
   src/network_monitor.cpp
   src/network_interface_details.cpp
+  src/network_traffic_history.cpp
+  src/network_traffic_history_export.cpp
   src/gpu_monitor.cpp
   src/sensor_monitor.cpp
   src/systemd_manager.cpp
@@ -382,3 +384,51 @@ target_include_directories(network-interface-details-tests PRIVATE include)
 target_link_libraries(network-interface-details-tests PRIVATE Threads::Threads)
 
 add_test(NAME network-interface-details COMMAND network-interface-details-tests)
+
+add_executable(network-monitor-tests
+  tests/network_monitor_tests.cpp
+  src/network_monitor.cpp
+)
+
+target_include_directories(network-monitor-tests PRIVATE include)
+
+target_link_libraries(network-monitor-tests PRIVATE Threads::Threads)
+
+add_test(NAME network-monitor COMMAND network-monitor-tests)
+
+add_executable(network-traffic-history-tests
+  tests/network_traffic_history_tests.cpp
+  src/network_traffic_history.cpp
+  src/network_interface_details.cpp
+)
+
+target_include_directories(network-traffic-history-tests PRIVATE include)
+
+target_link_libraries(network-traffic-history-tests PRIVATE Threads::Threads)
+
+add_test(NAME network-traffic-history COMMAND network-traffic-history-tests)
+
+add_executable(network-traffic-history-export-tests
+  tests/network_traffic_history_export_tests.cpp
+  src/network_traffic_history_export.cpp
+  src/network_traffic_history.cpp
+  src/network_interface_details.cpp
+  src/process_report.cpp
+  src/process_monitor.cpp
+  src/cpu_monitor.cpp
+  src/process_resources.cpp
+  src/process_scheduling.cpp
+  src/process_network.cpp
+  src/process_namespace.cpp
+  src/process_cgroup.cpp
+  src/process_security.cpp
+  src/process_io_details.cpp
+  src/process_environment.cpp
+  src/logger.cpp
+)
+
+target_include_directories(network-traffic-history-export-tests PRIVATE include)
+
+target_link_libraries(network-traffic-history-export-tests PRIVATE Threads::Threads)
+
+add_test(NAME network-traffic-history-export COMMAND network-traffic-history-export-tests)
