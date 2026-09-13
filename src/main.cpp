@@ -37,6 +37,7 @@
 #include "memory_monitor.hpp"
 #include "network_monitor.hpp"
 #include "network_interface_details.hpp"
+#include "network_link_state.hpp"
 #include "network_traffic_history.hpp"
 #include "network_traffic_alert.hpp"
 #include "network_traffic_history_export.hpp"
@@ -916,10 +917,26 @@ std::string renderNetworkInterfaceTableText(
 /// Renders the NETWORK INTERFACES section. The monitor reads sysfs and
 /// getifaddrs() once per tick (from the monitoring loop), so rendering is a
 /// pure read of the cached snapshot.
-void renderNetworkInterfaceSections(std::ostringstream &out,
-                                    const atm::NetworkInterfaceMonitor &monitor) {
-  out << "\n## NETWORK INTERFACES\n\n"
-      << renderNetworkInterfaceTableText(monitor.current())
+void renderNetworkInterfaceSections(
+    std::ostringstream &out,
+    const atm::NetworkInterfaceMonitor &monitor,
+    const atm::NetworkLinkStateMonitor &link_state) {
+  out << "\n## NETWORK INTERFACES\n\n";
+  const atm::NetworkLinkStateCounts &counts = link_state.counts();
+  if (counts.physical_total == 0) {
+    out << "Link state: no physical interfaces detected.\n";
+  } else {
+    appendLabeled(out, "  Physical links:", std::to_string(counts.physical_total));
+    appendLabeled(out, "  Connected:",
+                  std::to_string(counts.connected));
+    appendLabeled(out, "  With carrier:",
+                  std::to_string(counts.with_carrier));
+    appendLabeled(out, "  Down:", std::to_string(counts.down));
+    appendLabeled(out, "  Unavailable:",
+                  std::to_string(counts.unavailable));
+    out << '\n';
+  }
+  out << renderNetworkInterfaceTableText(monitor.current())
       << "\nDetailed info: press 'i' (then Enter)\n";
 }
 
@@ -940,7 +957,8 @@ std::string formatTimestamp(std::chrono::system_clock::time_point timestamp);
 void renderNetworkTrafficHistorySection(
     std::ostringstream &out, const atm::NetworkTrafficHistory &traffic,
     const std::string &selection,
-    const atm::NetworkTrafficAlertMonitor &network_alert_monitor) {
+    const atm::NetworkTrafficAlertMonitor &network_alert_monitor,
+    const atm::NetworkLinkStateMonitor &network_link_state) {
   out << "\n## NETWORK TRAFFIC HISTORY\n\n";
   const atm::NetworkTrafficSeries *series = traffic.seriesFor(selection);
   const bool stale_selection = series == nullptr;
@@ -959,6 +977,18 @@ void renderNetworkTrafficHistorySection(
   if (stale_selection && selection != atm::kNetworkTrafficAllIdentity) {
     out << "Note: selected interface '" << selection
         << "' is no longer present \u2014 showing the aggregate.\n";
+  }
+
+  if (!series->aggregate) {
+    const atm::TrackedInterface *tracked =
+        network_link_state.tracked(series->identity);
+    if (tracked != nullptr && tracked->present) {
+      out << "Link state: "
+          << atm::networkLinkAvailabilityName(tracked->availability())
+          << " (operstate " << atm::networkOperStateName(tracked->oper)
+          << ", carrier " << atm::networkCarrierStateName(tracked->carrier)
+          << ", admin " << atm::networkAdminStateName(tracked->admin) << ")\n";
+    }
   }
 
   const atm::NetworkTrafficSummary summary =
@@ -1349,6 +1379,8 @@ std::string describeAlertSubject(atm::AlertType type, const std::string &source,
       return source + " VRAM usage: " + v;
     case atm::AlertType::Temperature:
       return source + " temperature: " + v;
+    case atm::AlertType::LinkStateChanged:
+      return source + " link state: " + v;
   }
   return source + ": " + v;
 }
@@ -1652,6 +1684,17 @@ void onAlertEvent(const atm::AlertManager & /*alerts*/,
 /// applies the global settings and its own per-source cooldown. The rule's own
 /// notify_enabled/cooldown/repeat policy was already enforced by the monitor.
 void onNetworkTrafficAlertEvent(const atm::AlertEvent &event) {
+  if (g_notification_manager != nullptr) {
+    g_notification_manager->notify(event);
+  }
+}
+
+/// Event sink for the network link-state monitor: forwards each real
+/// link-state transition to the desktop notification manager, which applies
+/// the global settings (enabled, severity/recovery toggles) and its own
+/// per-source cooldown. Removal and temporary read failures never reach this
+/// sink.
+void onNetworkLinkStateEvent(const atm::AlertEvent &event) {
   if (g_notification_manager != nullptr) {
     g_notification_manager->notify(event);
   }
@@ -4208,7 +4251,8 @@ const atm::FilesystemMonitor &filesystems,
                          const atm::NetworkInterfaceMonitor &network_interfaces,
                          const atm::NetworkTrafficHistory &network_traffic_history,
                          const std::string &traffic_selection,
-                         const atm::NetworkTrafficAlertMonitor &network_alert_monitor) {
+                         const atm::NetworkTrafficAlertMonitor &network_alert_monitor,
+                         const atm::NetworkLinkStateMonitor &network_link_state) {
    if (view == ViewMode::Tree) {
     // The tree view stays deliberately focused on the hierarchy; the storage
     // and network sections are part of the table view.
@@ -4229,10 +4273,11 @@ const atm::FilesystemMonitor &filesystems,
   renderFilesystemSections(out, filesystems, fs_filter);
   renderDiskHealthSections(out, disk_health);
   renderNetworkSections(out, network);
-  renderNetworkInterfaceSections(out, network_interfaces);
+  renderNetworkInterfaceSections(out, network_interfaces, network_link_state);
   renderNetworkTrafficHistorySection(out, network_traffic_history,
                                      traffic_selection,
-                                     network_alert_monitor);
+                                     network_alert_monitor,
+                                     network_link_state);
   renderGpuSections(out, gpu);
   renderSensorSections(out, sensors, gpu);
   renderAlertsSections(out, alerts, alert_filter);
@@ -4306,7 +4351,8 @@ const atm::GpuSnapshot &gpu,
                  const atm::NetworkInterfaceMonitor &network_interfaces,
                  const atm::NetworkTrafficHistory &network_traffic_history,
                  const std::string &traffic_selection,
-                 const atm::NetworkTrafficAlertMonitor &network_alert_monitor) {
+                 const atm::NetworkTrafficAlertMonitor &network_alert_monitor,
+                 const atm::NetworkLinkStateMonitor &network_link_state) {
   // ANSI "clear entire screen" + "cursor to home" so the multi-line frame
   // refreshes in place instead of scrolling the terminal.
   std::cout << "\033[2J\033[H";
@@ -4318,7 +4364,7 @@ const atm::GpuSnapshot &gpu,
                            refresh_interval_ms, cpu_details, memory_details,
                            disk_health, filesystems, fs_filter, network_interfaces,
                            network_traffic_history, traffic_selection,
-                           network_alert_monitor)
+                           network_alert_monitor, network_link_state)
             << std::flush;
 }
 
@@ -5603,6 +5649,7 @@ void interactProcessDetail(atm::ProcessDetails &details,
 std::string buildNetworkInterfacePage(
     const atm::NetworkInterfaceSnapshot &snapshot,
     const atm::NetworkInterfaceMonitor &monitor,
+    const atm::NetworkLinkStateMonitor &link_state,
     const atm::NetworkInterfaceStats &traffic) {
   const auto found = std::find_if(
       snapshot.interfaces.begin(), snapshot.interfaces.end(),
@@ -5641,6 +5688,53 @@ std::string buildNetworkInterfacePage(
   }
   if (!info.error.empty()) {
     appendLabeled(out, "  Note:", info.error);
+  }
+
+  if (const atm::TrackedInterface *tracked = link_state.tracked(identity);
+      tracked != nullptr) {
+    out << "\nLink state\n";
+    appendLabeled(out, "  Availability:",
+                  atm::networkLinkAvailabilityName(tracked->availability()));
+    appendLabeled(out, "  Operstate:",
+                  atm::networkOperStateName(tracked->oper));
+    appendLabeled(out, "  Carrier:",
+                  atm::networkCarrierStateName(tracked->carrier));
+    appendLabeled(out, "  Admin:",
+                  atm::networkAdminStateName(tracked->admin));
+    if (tracked->has_valid_state) {
+      appendLabeled(out, "  Last change:",
+                    formatTimestamp(tracked->last_change_system));
+      const long long elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+                                    std::chrono::steady_clock::now() -
+                                    tracked->last_change_steady)
+                                    .count();
+      appendLabeled(out, "  Duration:", std::to_string(elapsed) + " s");
+      appendLabeled(out, "  Transitions:",
+                    std::to_string(tracked->transition_count));
+    } else {
+      appendLabeled(out, "  Last change:", "not yet sampled");
+      appendLabeled(out, "  Transitions:", "0");
+    }
+
+    const auto &events = link_state.history().samples();
+    std::vector<const atm::NetworkLinkStateEvent *> recent;
+    for (const atm::NetworkLinkStateEvent &event : events) {
+      if (event.identity == identity) {
+        recent.push_back(&event);
+      }
+    }
+    if (!recent.empty()) {
+      out << "  Recent history:\n";
+      const std::size_t show = std::min<std::size_t>(3, recent.size());
+      for (std::size_t i = recent.size() - show; i < recent.size(); ++i) {
+        out << "    " << formatTimestamp(recent[i]->timestamp) << " "
+            << atm::networkLinkEventTypeName(recent[i]->type);
+        if (!recent[i]->reason.empty()) {
+          out << " \u2014 " << recent[i]->reason;
+        }
+        out << '\n';
+      }
+    }
   }
 
   out << "\nAddresses\n";
@@ -5710,6 +5804,7 @@ std::string buildNetworkInterfacePage(
 /// NetworkInterfaceMonitor own all the counter/discovery state.
 void interactNetworkDetail(const atm::NetworkSnapshot &network,
                            const atm::NetworkInterfaceMonitor &interfaces,
+                           const atm::NetworkLinkStateMonitor &link_state,
                            ConsoleInput &input) {
   std::cout << "\033[2J\033[H";
   const atm::NetworkInterfaceSnapshot &iface_snapshot = interfaces.current();
@@ -5743,7 +5838,7 @@ void interactNetworkDetail(const atm::NetworkSnapshot &network,
   }
 
   const std::string page = buildNetworkInterfacePage(iface_snapshot, interfaces,
-                                                     *found);
+                                                     link_state, *found);
   if (page.empty()) {
     std::cout << "Interface does not exist (not found in the current "
                  "interface list).\n";
@@ -7399,6 +7494,7 @@ int main() {
       static_cast<std::size_t>(settings.settings().history.max_samples));
   atm::AlertManager alerts;
   atm::NetworkTrafficAlertMonitor network_alert_monitor(alerts);
+  atm::NetworkLinkStateMonitor network_link_state(alerts);
   atm::NotificationManager notifications;
   atm::PackageManager packages;
   atm::PackageTransaction package_transaction;
@@ -7420,6 +7516,7 @@ int main() {
   g_notification_manager = &notifications;
   alerts.setNotificationSink(&onAlertEvent);
   network_alert_monitor.setEventSink(&onNetworkTrafficAlertEvent);
+  network_link_state.setEventSink(&onNetworkLinkStateEvent);
 
   // Reconcile the persisted autostart preference with the desktop entry on
   // disk. This only repairs/removes arch-task-manager.desktop in the user's
@@ -7523,6 +7620,7 @@ int main() {
   const atm::NetworkSnapshot first_network = network_monitor.read();
   static_cast<void>(network_interface_details.read(first_network));
   network_traffic_history.record(network_interface_details.current());
+  network_link_state.update(network_interface_details.current());
   network_alert_monitor.evaluate(network_traffic_history);
   const atm::GpuSnapshot first_gpu = gpu_monitor.read();
   const atm::SensorSnapshot first_sensors = sensor_monitor.read();
@@ -7572,7 +7670,7 @@ int main() {
              packages, refresh_interval_ms, cpu, memory, disk_health,
              filesystem_monitor, fs_filter, network_interface_details,
              network_traffic_history, network_traffic_selection,
-             network_alert_monitor);
+             network_alert_monitor, network_link_state);
 
   atm::NetworkSnapshot network = first_network;
   atm::GpuSnapshot gpu = first_gpu;
@@ -7632,6 +7730,7 @@ int main() {
             const atm::NetworkSnapshot network = network_monitor.read();
             static_cast<void>(network_interface_details.read(network));
             network_traffic_history.record(network_interface_details.current());
+            network_link_state.update(network_interface_details.current());
             network_alert_monitor.evaluate(network_traffic_history);
             static_cast<void>(filesystem_monitor.read());
             gpu = gpu_monitor.read();
@@ -7672,7 +7771,8 @@ int main() {
                        startup_sort, packages, refresh_interval_ms, cpu,
                        memory, disk_health, filesystem_monitor, fs_filter,
                        network_interface_details, network_traffic_history,
-                       network_traffic_selection, network_alert_monitor);
+                       network_traffic_selection, network_alert_monitor,
+                       network_link_state);
           }
         }
         continue;
@@ -7686,7 +7786,8 @@ int main() {
         break;
       case ConsoleInput::Command::InspectNetwork:
         if (view == ViewMode::List) {
-          interactNetworkDetail(network, network_interface_details, input);
+          interactNetworkDetail(network, network_interface_details, network_link_state,
+                          input);
         }
         break;
       case ConsoleInput::Command::InspectDiskHealth:
@@ -7821,6 +7922,7 @@ int main() {
     network = network_monitor.read();
     static_cast<void>(network_interface_details.read(network));
     network_traffic_history.record(network_interface_details.current());
+    network_link_state.update(network_interface_details.current());
     network_alert_monitor.evaluate(network_traffic_history);
     static_cast<void>(filesystem_monitor.read());
     gpu = gpu_monitor.read();
@@ -7861,7 +7963,7 @@ int main() {
                startup_sort, packages, refresh_interval_ms, cpu, memory,
                disk_health, filesystem_monitor, fs_filter, network_interface_details,
                network_traffic_history, network_traffic_selection,
-               network_alert_monitor);
+               network_alert_monitor, network_link_state);
   }
 
   // Clean shutdown: persist any pending settings changes.
