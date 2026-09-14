@@ -370,6 +370,174 @@ struct WirelessHistorySummary {
 [[nodiscard]] WirelessHistorySummary summarizeWirelessHistory(
     const NetworkWirelessInfo &wireless, std::size_t max_samples);
 
+// -------------------------------------------------------------------------
+// Step 52 — Wireless connection quality summary and stability analysis.
+//
+// A single pure pass over the already-retained rings (sample history and
+// connection events) produces an honest, explainable picture of how stable an
+// interface's wireless connection has been: signal/bitrate statistics with
+// variability, how much time was actually spent connected/disconnected versus
+// unobserved, how long the worst outage lasted, and how the recent events
+// (disconnections, reconnections, roaming, availability flaps) add up.
+//
+// The classification is intentionally conservative and transparent:
+//  * Everything is derived from data that actually exists; a missing metric is
+//    never invented as a zero and never penalises the score.
+//  * Factors whose data was insufficient are excluded and the remaining
+//    weights are renormalised (their ratios are preserved) — so e.g. a
+//    production interface, where the native sources expose no bitrate, is not
+//    unfairly downgraded just because the bitrate factor was not applicable.
+//  * Below a data-coverage gate the grade is Unknown and no score is emitted;
+//    a sparse history does not coerce into a misleading grade.
+//  * Intervals separated by a gap longer than kWirelessConnectionResetGap
+//    (e.g. after suspend/resume) count as unobserved and break continuous
+//    runs, so pause-then-resume never fabricates connected time.
+//  * Scores are a renormalised weighted mean of the included factors, each
+//    with a documented weight and a plain-English reason, so the UI can show
+//    exactly why an interface got the grade it got.
+// -------------------------------------------------------------------------
+
+/// Qualitative stability grade. Ordering matters: Unknown < Poor < Fair < Good
+/// < Excellent.
+enum class WirelessStability {
+  Unknown,     // insufficient/absent data — no classification, no score
+  Poor,        // score below kWirelessFairThreshold
+  Fair,        // score in [fair, good)
+  Good,        // score in [good, excellent)
+  Excellent,   // score at least kWirelessExcellentThreshold
+};
+
+/// Stable, lowercase name shared by the UI and the exports: "unknown"/"poor"/
+/// "fair"/"good"/"excellent".
+[[nodiscard]] const char *wirelessStabilityName(WirelessStability stability);
+
+// --- Assessment thresholds (documented in the classification doc comment) ----
+
+/// Minimum freshly-read samples retained before a stability grade is even
+/// attempted. Below this the window is "insufficient data" (Unknown, no score),
+/// so a sparsely sampled history never coerces into a misleading grade.
+inline constexpr std::size_t kWirelessQualityMinValidSamples = 5;
+
+/// Minimum determined time (connected + disconnected, seconds) before the
+/// connectivity-derived factors are meaningful.
+inline constexpr double kWirelessQualityMinDeterminedSeconds = 5.0;
+
+/// A factor only participates when at least this many of its own values are
+/// present; below it the factor is excluded and the other weights are
+/// renormalised (ratios preserved, values never invented).
+inline constexpr std::size_t kWirelessQualityMinFactorSamples = 3;
+
+/// Score bands (score out of 100).
+inline constexpr double kWirelessExcellentThreshold = 80.0;
+inline constexpr double kWirelessGoodThreshold = 60.0;
+inline constexpr double kWirelessFairThreshold = 40.0;
+
+/// Signal-strength mapping anchors: -30 dBm is "best", -90 dBm is "worst".
+inline constexpr double kWirelessSignalBestDbm = -30.0;
+inline constexpr double kWirelessSignalWorstDbm = -90.0;
+
+/// Inter-sample gaps longer than this (steady clock) are discontinuities whose
+/// time is reported as unobserved and which break continuous connectivity runs.
+/// Mirrors kWirelessConnectionResetGap so both layers agree what "continuous"
+/// means (suspension can therefore never fabricate connected time).
+inline constexpr std::chrono::seconds kWirelessQualityMaxGap =
+    kWirelessConnectionResetGap;
+
+/// One factor used by the stability score, with a plain-English reason so the
+/// UI can explain the grade. `value` is the factor's raw quality on [0,1] when
+/// it could be computed; `weight` is its renormalised weight (these always sum
+/// to 1 among the factors actually present); `weight_reason` explains why the
+/// factor is included (or why it is not).
+struct WirelessStabilityFactor {
+  std::string name;          // e.g. "connection continuity"
+  std::string detail;        // plain-English summary of the data behind it
+  double weight = 0.0;       // renormalised contribution to the score
+  std::optional<double> value;  // quality on [0,1]; engaged only when computed
+};
+
+/// Result of the deterministic stability classification.
+struct WirelessStabilityAssessment {
+  WirelessStability stability = WirelessStability::Unknown;
+  std::optional<double> score;  // 0..100; absent (Unknown) when coverage fell short
+  std::vector<WirelessStabilityFactor> factors;  // in weight order when present
+};
+
+/// Step 52 summary of one interface's wireless connection quality, computed
+/// strictly from the retained rings (never the live kernel state). All fields
+/// are pure functions of the history samples and connection events, so the
+/// values in the UI, the CSV export and the JSON export are always identical.
+struct WirelessQualitySummary {
+  bool has_data = false;  // any retained sample or connection event at all
+
+  // Window and coverage.
+  std::chrono::system_clock::time_point window_start{};
+  std::chrono::system_clock::time_point window_end{};
+  std::size_t sample_count = 0;
+  std::size_t valid_sample_count = 0;
+  double coverage = 0.0;         // sample_count / retention bound (0..1)
+  double valid_coverage = 0.0;   // valid_sample_count / retention bound
+  double span_seconds = 0.0;     // newest - oldest retained-sample span
+  double unobserved_seconds = 0.0;  // long-gap / unknown-state interval time
+
+  // Signal (dBm) and bitrate (bps) statistics over the samples that carried a
+  // value, including the population standard deviation for variability. Values
+  // from stale/gap ticks that still carried a preserved reading are counted
+  // just like fresh ones; a tick without the metric contributes nothing.
+  std::size_t signal_sample_count = 0;
+  std::optional<double> current_signal_dbm;
+  std::optional<double> avg_signal_dbm;
+  std::optional<double> min_signal_dbm;
+  std::optional<double> max_signal_dbm;
+  std::optional<double> signal_stddev_dbm;
+  double valid_with_signal = 0.0;  // signal carriers / valid ticks (0..1)
+  std::size_t bitrate_sample_count = 0;
+  std::optional<double> current_bitrate_bps;
+  std::optional<double> avg_bitrate_bps;
+  std::optional<double> min_bitrate_bps;
+  std::optional<double> max_bitrate_bps;
+  std::optional<double> bitrate_stddev_bps;
+  double valid_with_bitrate = 0.0;  // bitrate carriers / valid ticks (0..1)
+
+  // Connectivity, derived from consecutive sample pairs: time actually spent
+  // connected/disconnected, the longest continuous single run of each, and the
+  // time that could not be attributed to either state.
+  double connected_seconds = 0.0;
+  double disconnected_seconds = 0.0;
+  double longest_connected_seconds = 0.0;
+  double longest_disconnected_seconds = 0.0;
+
+  // Events from the retained connection-event history (counts by type). These
+  // drive the frequency/recovery/availability/roaming factors.
+  std::size_t disconnection_count = 0;
+  std::size_t reconnection_count = 0;
+  std::size_t association_count = 0;
+  std::size_t roaming_count = 0;
+  std::size_t interface_unavailable_count = 0;
+  std::size_t temporary_gap_count = 0;  // retained ticks whose read was invalid
+
+  std::chrono::system_clock::time_point last_update{};
+  WirelessStabilityAssessment assessment;
+};
+
+/// Computes the Step 52 connection-quality summary for `wireless`. Pure and
+/// deterministic: a single bounded pass over the retained sample ring and the
+/// retained connection-event ring; never performs I/O, never mutates state.
+/// `max_samples` is the same retention bound the monitor and the Step 49/50
+/// summary use, so `coverage`/`valid_coverage` are consistent with the rest of
+/// the interface details. The name of the game is honesty: unobserved time is
+/// never labelled connected/disconnected, and a grade is withheld entirely
+/// when the data cannot support one.
+[[nodiscard]] WirelessQualitySummary summarizeWirelessQuality(
+    const NetworkWirelessInfo &wireless, std::size_t max_samples);
+
+/// Renders the Step 52 quality/stability section for the interface-details
+/// view. Pure and unit-testable (mirrors the other renderWireless* helpers):
+/// returns a multi-line, pure-ASCII block that also states plainly when the
+/// interface is not wireless, when there is no data, when coverage is
+/// insufficient for a grade, and why each factor contributed what it did.
+[[nodiscard]] std::string renderWirelessQualitySummary(
+    const NetworkWirelessInfo &wireless, std::size_t max_samples);
+
 /// Derives one interface's per-tick wireless view from the latest details
 /// snapshot, the cached probe and an optional /proc/net/wireless fallback, while
 /// preserving the previous record's last valid values across a temporary

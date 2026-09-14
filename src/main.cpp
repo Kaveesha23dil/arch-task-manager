@@ -1072,9 +1072,17 @@ void renderWirelessHistoryBlock(std::ostringstream &out,
                                 std::size_t max_samples, bool detailed) {
   const atm::WirelessHistorySummary summary =
       atm::summarizeWirelessHistory(wireless, max_samples);
+  const atm::WirelessQualitySummary quality =
+      atm::summarizeWirelessQuality(wireless, max_samples);
   if (!summary.has_data) {
     if (detailed) {
-      out << "  History: no samples collected yet for this interface.\n";
+      if (quality.has_data) {
+        // Connection events exist without retained samples: the quality
+        // summary still has something honest to say.
+        out << atm::renderWirelessQualitySummary(wireless, max_samples);
+      } else {
+        out << "  History: no samples collected yet for this interface.\n";
+      }
     }
     return;
   }
@@ -1165,6 +1173,9 @@ void renderWirelessHistoryBlock(std::ostringstream &out,
             << atm::describeWirelessConnectionEvent(event) << '\n';
       }
     }
+    // Step 52: connection-quality summary and stability analysis (reads only
+    // the retained rings, never the network).
+    out << atm::renderWirelessQualitySummary(wireless, max_samples);
   }
 }
 

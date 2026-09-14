@@ -428,6 +428,58 @@ NetworkTrafficExportSnapshot buildNetworkTrafficExportSnapshot(
       export_event.access_point_reliable = event.ap_identity_reliable;
       wh.events.push_back(std::move(export_event));
     }
+
+    // Step 52: capture the connection-quality summary through the same pure
+    // function the interface-details view renders, so the exported numbers
+    // always equal the UI numbers. A quality block is only attached when the
+    // summary actually has data.
+    const WirelessQualitySummary quality =
+        summarizeWirelessQuality(*wireless, max_samples);
+    if (quality.has_data) {
+      NetworkTrafficExportWirelessQuality q;
+      q.interface_name = wireless->name;
+      if (quality.window_start != std::chrono::system_clock::time_point{}) {
+        q.window_start_iso8601 =
+            formatNetworkTrafficTimestamp(quality.window_start);
+      }
+      if (quality.window_end != std::chrono::system_clock::time_point{}) {
+        q.window_end_iso8601 = formatNetworkTrafficTimestamp(quality.window_end);
+      }
+      q.coverage_duration_seconds = quality.span_seconds;
+      q.coverage = quality.coverage;
+      q.valid_coverage = quality.valid_coverage;
+      q.valid_sample_count = quality.valid_sample_count;
+      q.stability = wirelessStabilityName(quality.assessment.stability);
+      q.stability_score = quality.assessment.score;
+      q.current_signal_dbm = quality.current_signal_dbm;
+      q.avg_signal_dbm = quality.avg_signal_dbm;
+      q.min_signal_dbm = quality.min_signal_dbm;
+      q.max_signal_dbm = quality.max_signal_dbm;
+      q.signal_stddev_dbm = quality.signal_stddev_dbm;
+      q.valid_with_signal = quality.valid_with_signal;
+      q.current_bitrate_bps = quality.current_bitrate_bps;
+      q.avg_bitrate_bps = quality.avg_bitrate_bps;
+      q.min_bitrate_bps = quality.min_bitrate_bps;
+      q.max_bitrate_bps = quality.max_bitrate_bps;
+      q.bitrate_stddev_bps = quality.bitrate_stddev_bps;
+      q.valid_with_bitrate = quality.valid_with_bitrate;
+      q.connected_seconds = quality.connected_seconds;
+      q.disconnected_seconds = quality.disconnected_seconds;
+      q.unobserved_seconds = quality.unobserved_seconds;
+      q.longest_connected_seconds = quality.longest_connected_seconds;
+      q.longest_disconnected_seconds = quality.longest_disconnected_seconds;
+      q.disconnection_count = quality.disconnection_count;
+      q.reconnection_count = quality.reconnection_count;
+      q.association_count = quality.association_count;
+      q.roaming_count = quality.roaming_count;
+      q.interface_unavailable_count = quality.interface_unavailable_count;
+      q.temporary_gap_count = quality.temporary_gap_count;
+      if (quality.last_update != std::chrono::system_clock::time_point{}) {
+        q.last_update_iso8601 =
+            formatNetworkTrafficTimestamp(quality.last_update);
+      }
+      wh.quality = std::move(q);
+    }
     snapshot.wireless_history = std::move(wh);
   }
 
@@ -848,6 +900,99 @@ std::string generateNetworkTrafficCsv(
         out += '\n';
       }
     }
+
+    // Step 52 connection quality: a fourth clearly-headed section appended when
+    // the wireless summary has data. One columnar row whose numbers are exactly
+    // what the interface-details view shows (the same pure summary function
+    // feeds both), with the units spelled out in the column names. An Unknown
+    // grade or a limited-coverage window is exported honestly — no score is
+    // ever invented for it.
+    if (wh.quality.has_value()) {
+      const NetworkTrafficExportWirelessQuality &q = *wh.quality;
+      // Unavailable metrics are empty CSV fields (never "null"/"0"), matching
+      // the sample-row and event-row conventions elsewhere in the export.
+      const auto csvNumber = [](const std::optional<double> &value) {
+        return value.has_value() ? formatExportDouble(*value) : std::string{};
+      };
+      out += "\nquality,interface,window_start,window_end,"
+             "coverage_duration_seconds,coverage,valid_coverage,"
+             "valid_sample_count,stability,stability_score,"
+             "current_signal_dbm,avg_signal_dbm,min_signal_dbm,max_signal_dbm,"
+             "signal_stddev_dbm,valid_with_signal,"
+             "current_bitrate_bps,avg_bitrate_bps,min_bitrate_bps,"
+             "max_bitrate_bps,bitrate_stddev_bps,valid_with_bitrate,"
+             "connected_seconds,disconnected_seconds,unobserved_seconds,"
+             "longest_connected_seconds,longest_disconnected_seconds,"
+             "disconnection_count,reconnection_count,association_count,"
+             "roaming_count,interface_unavailable_count,temporary_gap_count,"
+             "last_update\n";
+      out += escapeNetworkTrafficCsvField(q.interface_name);
+      out += ',';
+      out += escapeNetworkTrafficCsvField(q.window_start_iso8601);
+      out += ',';
+      out += escapeNetworkTrafficCsvField(q.window_end_iso8601);
+      out += ',';
+      out += formatExportDouble(q.coverage_duration_seconds);
+      out += ',';
+      out += formatExportDouble(q.coverage);
+      out += ',';
+      out += formatExportDouble(q.valid_coverage);
+      out += ',';
+      out += std::to_string(q.valid_sample_count);
+      out += ',';
+      out += escapeNetworkTrafficCsvField(q.stability);
+      out += ',';
+      out += csvNumber(q.stability_score);
+      out += ',';
+      out += csvNumber(q.current_signal_dbm);
+      out += ',';
+      out += csvNumber(q.avg_signal_dbm);
+      out += ',';
+      out += csvNumber(q.min_signal_dbm);
+      out += ',';
+      out += csvNumber(q.max_signal_dbm);
+      out += ',';
+      out += csvNumber(q.signal_stddev_dbm);
+      out += ',';
+      out += formatExportDouble(q.valid_with_signal);
+      out += ',';
+      out += csvNumber(q.current_bitrate_bps);
+      out += ',';
+      out += csvNumber(q.avg_bitrate_bps);
+      out += ',';
+      out += csvNumber(q.min_bitrate_bps);
+      out += ',';
+      out += csvNumber(q.max_bitrate_bps);
+      out += ',';
+      out += csvNumber(q.bitrate_stddev_bps);
+      out += ',';
+      out += formatExportDouble(q.valid_with_bitrate);
+      out += ',';
+      out += formatExportDouble(q.connected_seconds);
+      out += ',';
+      out += formatExportDouble(q.disconnected_seconds);
+      out += ',';
+      out += formatExportDouble(q.unobserved_seconds);
+      out += ',';
+      out += formatExportDouble(q.longest_connected_seconds);
+      out += ',';
+      out += formatExportDouble(q.longest_disconnected_seconds);
+      out += ',';
+      out += std::to_string(q.disconnection_count);
+      out += ',';
+      out += std::to_string(q.reconnection_count);
+      out += ',';
+      out += std::to_string(q.association_count);
+      out += ',';
+      out += std::to_string(q.roaming_count);
+      out += ',';
+      out += std::to_string(q.interface_unavailable_count);
+      out += ',';
+      out += std::to_string(q.temporary_gap_count);
+      out += ',';
+      out += escapeNetworkTrafficCsvField(q.last_update_iso8601);
+      out += '\n';
+    }
   }
   return out;
 }
@@ -1003,6 +1148,59 @@ std::string generateNetworkTrafficJson(
           {"channel", jsonNumber(row.channel)},
       }));
     }
+    // Step 52 quality summary: serialized only when the pure summary produced
+    // data, with the same honesty rules as the CSV section — unknown grades
+    // export no score and unobserved time is separate from connected time.
+    const std::string quality_json = [&]() -> std::string {
+      if (!wh.quality.has_value()) {
+        return "null";
+      }
+      const NetworkTrafficExportWirelessQuality &q = *wh.quality;
+      return jsonObject({
+          {"interface_name", jsonEscape(q.interface_name)},
+          {"window_start", jsonEscape(q.window_start_iso8601)},
+          {"window_end", jsonEscape(q.window_end_iso8601)},
+          {"coverage_duration_seconds",
+           jsonNumber(std::optional<double>(q.coverage_duration_seconds))},
+          {"coverage", jsonNumber(std::optional<double>(q.coverage))},
+          {"valid_coverage", jsonNumber(std::optional<double>(q.valid_coverage))},
+          {"valid_sample_count", std::to_string(q.valid_sample_count)},
+          {"stability", jsonEscape(q.stability)},
+          {"stability_score", jsonNumber(q.stability_score)},
+          {"current_signal_dbm", jsonNumber(q.current_signal_dbm)},
+          {"avg_signal_dbm", jsonNumber(q.avg_signal_dbm)},
+          {"min_signal_dbm", jsonNumber(q.min_signal_dbm)},
+          {"max_signal_dbm", jsonNumber(q.max_signal_dbm)},
+          {"signal_stddev_dbm", jsonNumber(q.signal_stddev_dbm)},
+          {"valid_with_signal",
+           jsonNumber(std::optional<double>(q.valid_with_signal))},
+          {"current_bitrate_bps", jsonNumber(q.current_bitrate_bps)},
+          {"avg_bitrate_bps", jsonNumber(q.avg_bitrate_bps)},
+          {"min_bitrate_bps", jsonNumber(q.min_bitrate_bps)},
+          {"max_bitrate_bps", jsonNumber(q.max_bitrate_bps)},
+          {"bitrate_stddev_bps", jsonNumber(q.bitrate_stddev_bps)},
+          {"valid_with_bitrate",
+           jsonNumber(std::optional<double>(q.valid_with_bitrate))},
+          {"connected_seconds",
+           jsonNumber(std::optional<double>(q.connected_seconds))},
+          {"disconnected_seconds",
+           jsonNumber(std::optional<double>(q.disconnected_seconds))},
+          {"unobserved_seconds",
+           jsonNumber(std::optional<double>(q.unobserved_seconds))},
+          {"longest_connected_seconds",
+           jsonNumber(std::optional<double>(q.longest_connected_seconds))},
+          {"longest_disconnected_seconds",
+           jsonNumber(std::optional<double>(q.longest_disconnected_seconds))},
+          {"disconnection_count", std::to_string(q.disconnection_count)},
+          {"reconnection_count", std::to_string(q.reconnection_count)},
+          {"association_count", std::to_string(q.association_count)},
+          {"roaming_count", std::to_string(q.roaming_count)},
+          {"interface_unavailable_count",
+           std::to_string(q.interface_unavailable_count)},
+          {"temporary_gap_count", std::to_string(q.temporary_gap_count)},
+          {"last_update", jsonEscape(q.last_update_iso8601)},
+      });
+    }();
     return jsonObject({
         {"start_timestamp", start_timestamp},
         {"end_timestamp", end_timestamp},
@@ -1024,6 +1222,7 @@ std::string generateNetworkTrafficJson(
         {"samples", jsonArray(sample_objects)},
         {"connection_events_count", std::to_string(wh.events.size())},
         {"connection_events", jsonArray(event_objects)},
+        {"quality", quality_json},
     });
   }();
 

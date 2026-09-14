@@ -171,6 +171,54 @@ struct NetworkTrafficExportWirelessEvent {
   bool access_point_reliable = false; // the AP identity was reliably reported
 };
 
+/// Step 52 wireless connection-quality summary serialized with one wireless
+/// history. Mirrors `WirelessQualitySummary`: all fields are pure functions of
+/// the retained rings, missing metrics stay nullopt (never a fabricated zero),
+/// and the stability grade/score follow the same data-coverage gate as the UI
+/// (Unknown + no score when coverage is insufficient). No raw identifiers ever
+/// appear — only counts, durations and statistics.
+struct NetworkTrafficExportWirelessQuality {
+  std::string interface_name;       // current kernel name
+  std::string window_start_iso8601; // anchored window start ("" when unknown)
+  std::string window_end_iso8601;   // ""
+  double coverage_duration_seconds = 0.0;  // newest - oldest retained span
+  double coverage = 0.0;                    // sample_count / retention bound
+  double valid_coverage = 0.0;
+  std::size_t valid_sample_count = 0;
+
+  std::string stability;            // wirelessStabilityName()
+  std::optional<double> stability_score;  // 0..100; absent when Unknown
+
+  std::optional<double> current_signal_dbm;
+  std::optional<double> avg_signal_dbm;
+  std::optional<double> min_signal_dbm;
+  std::optional<double> max_signal_dbm;
+  std::optional<double> signal_stddev_dbm;
+  double valid_with_signal = 0.0;  // samples carrying signal / valid ticks
+
+  std::optional<double> current_bitrate_bps;
+  std::optional<double> avg_bitrate_bps;
+  std::optional<double> min_bitrate_bps;
+  std::optional<double> max_bitrate_bps;
+  std::optional<double> bitrate_stddev_bps;
+  double valid_with_bitrate = 0.0;  // samples carrying bitrate / valid ticks
+
+  double connected_seconds = 0.0;
+  double disconnected_seconds = 0.0;
+  double unobserved_seconds = 0.0;
+  double longest_connected_seconds = 0.0;
+  double longest_disconnected_seconds = 0.0;
+
+  std::size_t disconnection_count = 0;
+  std::size_t reconnection_count = 0;
+  std::size_t association_count = 0;
+  std::size_t roaming_count = 0;
+  std::size_t interface_unavailable_count = 0;
+  std::size_t temporary_gap_count = 0;
+
+  std::string last_update_iso8601;  // "" when unknown
+};
+
 /// Wireless history (summary + per-sample rows) captured into an export
 /// snapshot. Only present when the selected interface is wireless and its
 /// history ring holds recorded samples. The numbers match — and never exceed —
@@ -201,6 +249,12 @@ struct NetworkTrafficExportWirelessHistory {
   // (the ring is bounded at kMaxWirelessConnectionEvents). Only the boolean
   // AP-change/guarantee flags travel through the export, never AP identity.
   std::vector<NetworkTrafficExportWirelessEvent> events;  // ascending order
+
+  // Connection quality summary and stability analysis (Step 52). Mirrors the
+  // `WirelessQualitySummary` block shown in the interface-details view, so the
+  // exported numbers always equal the UI numbers. No raw identifiers are ever
+  // exported; every field here is a pure function of the retained rings.
+  std::optional<NetworkTrafficExportWirelessQuality> quality;
 };
 
 /// Implementation-free, immutable snapshot of one traffic series ready for

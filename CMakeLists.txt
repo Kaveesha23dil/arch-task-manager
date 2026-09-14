@@ -578,3 +578,20 @@ target_include_directories(network-wireless-connection-events-tests PRIVATE incl
 target_link_libraries(network-wireless-connection-events-tests PRIVATE Threads::Threads)
 
 add_test(NAME network-wireless-connection-events COMMAND network-wireless-connection-events-tests)
+
+add_executable(network-wireless-quality-tests
+  tests/network_wireless_quality_tests.cpp
+  src/network_wireless.cpp
+  src/network_interface_details.cpp
+  src/network_link_state.cpp
+  src/network_link_metrics.cpp
+  src/alert_manager.cpp
+  src/network_monitor.cpp
+  src/resource_history.cpp
+)
+
+target_include_directories(network-wireless-quality-tests PRIVATE include)
+
+target_link_libraries(network-wireless-quality-tests PRIVATE Threads::Threads)
+
+add_test(NAME network-wireless-quality COMMAND network-wireless-quality-tests)

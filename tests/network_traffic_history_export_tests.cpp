@@ -1116,6 +1116,109 @@ void test_export_wireless_events_only_passes_empty_gate() {
 }
 
 // -------------------------------------------------------------------------
+// Wireless quality-summary export (Step 52)
+// -------------------------------------------------------------------------
+
+void test_csv_wireless_quality_section() {
+  run("csvWirelessQualitySection");
+  atm::NetworkTrafficSeries s = makeSeries("idx:30", "wlp2s0", false, 120);
+  fillFourTicks(s);
+  const atm::NetworkWirelessInfo wl = makeWirelessHistoryRecordWithEvents();
+  const atm::NetworkTrafficExportSnapshot snapshot =
+      atm::buildNetworkTrafficExportSnapshot(s, 120, nullptr, nullptr, &wl);
+  const std::string csv = atm::generateNetworkTrafficCsv(snapshot);
+
+  const std::string header =
+      "\nquality,interface,window_start,window_end,"
+      "coverage_duration_seconds,coverage,valid_coverage,"
+      "valid_sample_count,stability,stability_score,"
+      "current_signal_dbm,avg_signal_dbm,min_signal_dbm,max_signal_dbm,"
+      "signal_stddev_dbm,valid_with_signal,"
+      "current_bitrate_bps,avg_bitrate_bps,min_bitrate_bps,"
+      "max_bitrate_bps,bitrate_stddev_bps,valid_with_bitrate,"
+      "connected_seconds,disconnected_seconds,unobserved_seconds,"
+      "longest_connected_seconds,longest_disconnected_seconds,"
+      "disconnection_count,reconnection_count,association_count,"
+      "roaming_count,interface_unavailable_count,temporary_gap_count,"
+      "last_update\n";
+  const std::size_t header_pos = csv.find(header);
+  CHECK(header_pos != std::string::npos);
+
+  // The quality section is the final one and is not terminated by a trailing
+  // blank line: parse the single row directly after the header.
+  const std::vector<std::string> lines =
+      linesOf(csv.substr(header_pos + header.size()));
+  CHECK(lines.size() == 1);
+
+  const std::vector<std::string> row = csvSplit(lines[0]);
+  CHECK(row.size() == 33);
+  CHECK(row[0] == "wlp2s0");   // interface_name
+  CHECK(row[3] == "2");        // coverage_duration_seconds (span)
+  CHECK(row[6] == "2");        // valid_sample_count
+  CHECK(row[7] == "unknown");  // insufficient data -> Unknown grade
+  CHECK(row[8] == "");         // no score for an Unknown grade
+  CHECK(row[9] == "-42");      // current_signal_dbm
+  CHECK(row[12] == "-42");     // max_signal_dbm
+  CHECK(row[13] == "3");       // signal_stddev_dbm (-48, -42 -> stddev 3)
+  CHECK(row[14] == "1");       // valid_with_signal (2/2)
+  CHECK(row[21] == "2");       // connected_seconds
+  CHECK(row[22] == "0");       // disconnected_seconds
+  CHECK(row[26] == "1");       // disconnection_count
+  CHECK(row[27] == "1");       // reconnection_count
+  CHECK(row[29] == "1");       // roaming_count
+  CHECK(row[30] == "0");       // interface_unavailable_count
+  CHECK(row[31] == "1");       // temporary_gap_count (one invalid tick)
+  // No raw AP identity ever crosses the export boundary.
+  CHECK(csv.find("ssid") == std::string::npos);
+  CHECK(csv.find("bssid") == std::string::npos);
+}
+
+void test_json_wireless_quality() {
+  run("jsonWirelessQuality");
+  atm::NetworkTrafficSeries s = makeSeries("idx:30", "wlp2s0", false, 120);
+  const atm::NetworkWirelessInfo wl = makeWirelessHistoryRecordWithEvents();
+  const atm::NetworkTrafficExportSnapshot snapshot =
+      atm::buildNetworkTrafficExportSnapshot(s, 120, nullptr, nullptr, &wl);
+  const std::string json = atm::generateNetworkTrafficJson(snapshot);
+  CHECK(isValidJson(json));
+  CHECK(json.find("\"quality\":{") != std::string::npos);
+  CHECK(json.find("\"stability\":\"unknown\"") != std::string::npos);
+  CHECK(json.find("\"stability_score\":null") != std::string::npos);
+  CHECK(json.find("\"valid_sample_count\":2") != std::string::npos);
+  CHECK(json.find("\"avg_signal_dbm\":-45") != std::string::npos);
+  CHECK(json.find("\"connected_seconds\":2") != std::string::npos);
+  CHECK(json.find("\"disconnection_count\":1") != std::string::npos);
+  CHECK(json.find("\"reconnection_count\":1") != std::string::npos);
+  CHECK(json.find("\"roaming_count\":1") != std::string::npos);
+  CHECK(json.find("\"temporary_gap_count\":1") != std::string::npos);
+  // No raw AP identity/fingerprint ever crosses into the export.
+  CHECK(json.find("fingerprint") == std::string::npos);
+  CHECK(json.find("ssid") == std::string::npos);
+  CHECK(json.find("bssid") == std::string::npos);
+}
+
+void test_export_quality_present_without_samples() {
+  run("exportQualityPresentWithoutSamples");
+  // A record whose only content is connection events still gets an honest
+  // quality block (Unknown grade, zero connectivity time, event counts).
+  atm::NetworkTrafficSeries s = makeSeries("idx:30", "wlp2s0", false, 120);
+  atm::NetworkWirelessInfo wl = makeWirelessHistoryRecordWithEvents();
+  wl.history.clear();
+  const atm::NetworkTrafficExportSnapshot snapshot =
+      atm::buildNetworkTrafficExportSnapshot(s, 120, nullptr, nullptr, &wl);
+  CHECK(snapshot.wireless_history.has_value());
+  CHECK(snapshot.wireless_history->quality.has_value());
+
+  const std::string csv = atm::generateNetworkTrafficCsv(snapshot);
+  CHECK(csv.find("\nquality,interface,") != std::string::npos);
+  const std::string json = atm::generateNetworkTrafficJson(snapshot);
+  CHECK(isValidJson(json));
+  CHECK(json.find("\"quality\":{") != std::string::npos);
+  CHECK(json.find("\"connected_seconds\":0") != std::string::npos);
+  CHECK(json.find("\"disconnection_count\":1") != std::string::npos);
+}
+
+// -------------------------------------------------------------------------
 // JSON serialization
 // -------------------------------------------------------------------------
 
@@ -1777,6 +1880,10 @@ int main() {
   test_csv_wireless_connection_events_section();
   test_json_wireless_connection_events();
   test_export_wireless_events_only_passes_empty_gate();
+
+  test_csv_wireless_quality_section();
+  test_json_wireless_quality();
+  test_export_quality_present_without_samples();
 
   test_summary_current_and_peak();
   test_summary_totals_valid_window();
