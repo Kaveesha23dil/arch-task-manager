@@ -17,6 +17,7 @@
 #include "network_interface_hardware.hpp"
 #include "network_link_metrics.hpp"
 #include "network_link_state.hpp"
+#include "network_wireless.hpp"
 #include "process_report.hpp"  // sanitizeReportName (shared filename sanitizer)
 
 namespace atm {
@@ -223,6 +224,7 @@ NetworkTrafficExportSnapshot buildNetworkTrafficExportSnapshot(
     const NetworkTrafficSeries &series, std::size_t max_samples,
     const NetworkLinkMetrics *link_metrics,
     const NetworkInterfaceHardware *hardware,
+    const NetworkWirelessInfo *wireless,
     const NetworkInterfaceInfo *info,
     const TrackedInterface *link_state) {
   NetworkTrafficExportSnapshot snapshot;
@@ -278,6 +280,33 @@ NetworkTrafficExportSnapshot buildNetworkTrafficExportSnapshot(
           networkLinkAvailabilityName(NetworkLinkAvailability::Unknown);
     }
     snapshot.hardware = hw;
+  }
+
+  // Capture the wireless metadata (when the monitoring layer provided a record
+  // for the selected interface and that record is a wireless interface). Only
+  // values obtainable from the native sysfs tree / /proc/net/wireless are
+  // exported; the kernel does not expose SSID/BSSID/channel/frequency/bitrate
+  // through those interfaces (they require nl80211), so they are never guessed.
+  if (wireless != nullptr && wireless->present &&
+      wireless->presence == WirelessPresence::Wireless) {
+    NetworkTrafficExportWireless wl;
+    wl.interface_name = wireless->name;
+    wl.presence = wirelessPresenceName(wireless->presence);
+    wl.phy_name = wireless->phy_name;
+    wl.phy_index = wireless->phy_index;
+    wl.phy_state = wirelessFieldStateName(wireless->phy_state);
+    wl.is_mac80211 = wireless->is_mac80211;
+    wl.link_quality = wireless->link_quality;
+    wl.signal_dbm = wireless->signal_dbm;
+    wl.noise_dbm = wireless->noise_dbm;
+    wl.association = wirelessAssociationName(wireless->association);
+    wl.enabled = wireless->enabled;
+    wl.carrier_state = wireless->carrier_exposed
+                           ? (wireless->has_carrier ? "yes" : "no carrier")
+                           : "unknown";
+    wl.field_state = wirelessFieldStateName(wireless->field_state);
+    wl.last_read = wireless->last_read;
+    snapshot.wireless = wl;
   }
 
   // Merge every retained ring into one row per unique sample tick. A row is
@@ -458,7 +487,10 @@ std::string generateNetworkTrafficCsv(
       "link_speed_mbps,link_speed_unit,link_speed_state,"
       "link_duplex,link_duplex_state,link_last_update,"
       "interface_index,mac_address,interface_type,hardware_class,"
-      "device_related,driver,device_id,link_carrier,link_operstate\n";
+      "device_related,driver,device_id,link_carrier,link_operstate,"
+      "wireless_presence,wireless_phy_name,wireless_phy_index,"
+      "wireless_signal_dbm,wireless_noise_dbm,wireless_link_quality,"
+      "wireless_association,wireless_enabled,wireless_field_state\n";
 
   std::string out;
   out.reserve(kHeader.size() + snapshot.samples.size() * 96u);
@@ -515,6 +547,33 @@ std::string generateNetworkTrafficCsv(
     };
   }
 
+  // The wireless metadata is series-scoped too: nine more append-only trailing
+  // columns, empty until a wireless record is captured for the interface.
+  // Unavailable values are empty CSV fields (never zeros); SSID/BSSID/channel/
+  // frequency/bitrate are not exposed by the kernel via sysfs and
+  // /proc/net/wireless
+  // so they are never fabricated columns.
+  std::array<std::string, 9> wireless_columns =
+      std::array<std::string, 9>{};
+  if (snapshot.wireless.has_value()) {
+    const NetworkTrafficExportWireless &wl = *snapshot.wireless;
+    wireless_columns = {
+        wl.presence,
+        wl.phy_name,
+        wl.phy_index.has_value() ? std::to_string(*wl.phy_index)
+                                 : std::string{},
+        wl.signal_dbm.has_value() ? std::to_string(*wl.signal_dbm)
+                                  : std::string{},
+        wl.noise_dbm.has_value() ? std::to_string(*wl.noise_dbm)
+                                 : std::string{},
+        wl.link_quality.has_value() ? std::to_string(*wl.link_quality)
+                                    : std::string{},
+        wl.association,
+        wl.enabled ? "1" : "0",
+        wl.field_state,
+    };
+  }
+
   for (const NetworkTrafficExportRow &row : snapshot.samples) {
     appendCsvField(out,
                    escapeNetworkTrafficCsvField(
@@ -539,8 +598,11 @@ std::string generateNetworkTrafficCsv(
     for (const std::string &field : hardware_columns) {
       appendCsvField(out, field);
     }
+    for (const std::string &field : wireless_columns) {
+      appendCsvField(out, field);
+    }
     if (!out.empty() && out.back() == ',') {
-      out.pop_back();  // drop the trailing separator (30 fields -> 29 commas)
+      out.pop_back();  // drop the trailing separator (39 fields -> 38 commas)
     }
     out += '\n';
   }
@@ -611,6 +673,33 @@ std::string generateNetworkTrafficJson(
     });
   }();
 
+  // Wireless metadata captured with the snapshot, or null when absent (aggregate
+  // / non-wireless interface). SSID/BSSID/channel/frequency/bitrate require the
+  // nl80211 netlink API and are intentionally absent from the model — the
+  // kernel does not expose them through sysfs or /proc/net/wireless.
+  const std::string wireless_json = [&] {
+    if (!snapshot.wireless.has_value()) {
+      return std::string("null");
+    }
+    const NetworkTrafficExportWireless &wl = *snapshot.wireless;
+    return jsonObject({
+        {"interface_name", jsonEscape(wl.interface_name)},
+        {"presence", jsonEscape(wl.presence)},
+        {"phy_name", jsonEscape(wl.phy_name)},
+        {"phy_index", jsonNumber(wl.phy_index)},
+        {"phy_state", jsonEscape(wl.phy_state)},
+        {"is_mac80211", wl.is_mac80211 ? "true" : "false"},
+        {"link_quality", jsonNumber(wl.link_quality)},
+        {"signal_dbm", jsonNumber(wl.signal_dbm)},
+        {"noise_dbm", jsonNumber(wl.noise_dbm)},
+        {"association", jsonEscape(wl.association)},
+        {"enabled", wl.enabled ? "true" : "false"},
+        {"carrier_state", jsonEscape(wl.carrier_state)},
+        {"field_state", jsonEscape(wl.field_state)},
+        {"last_read", jsonEscape(formatNetworkTrafficTimestamp(wl.last_read))},
+    });
+  }();
+
   const std::string history = jsonObject({
       {"start_timestamp", start_timestamp},
       {"end_timestamp", end_timestamp},
@@ -678,6 +767,7 @@ std::string generateNetworkTrafficJson(
       {"interface", interface},
       {"link", link_json},
       {"hardware", hardware_json},
+      {"wireless", wireless_json},
       {"history", history},
       {"units", units},
       {"summary", summary_json},

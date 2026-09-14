@@ -17,6 +17,7 @@
 #include "network_link_state.hpp"
 #include "network_traffic_history.hpp"
 #include "network_traffic_history_export.hpp"
+#include "network_wireless.hpp"
 
 // --- Minimal standalone test harness (no external framework) -------------
 namespace {
@@ -281,6 +282,9 @@ void test_csv_header_order() {
       "link_duplex", "link_duplex_state", "link_last_update",
       "interface_index", "mac_address", "interface_type", "hardware_class",
       "device_related", "driver", "device_id", "link_carrier", "link_operstate",
+      "wireless_presence", "wireless_phy_name", "wireless_phy_index",
+      "wireless_signal_dbm", "wireless_noise_dbm", "wireless_link_quality",
+      "wireless_association", "wireless_enabled", "wireless_field_state",
   };
   const std::vector<std::string> header = csvSplit(
       csv.substr(0, csv.find('\n')));
@@ -306,10 +310,11 @@ void test_csv_normal_export() {
   CHECK(lines.size() == 5);  // header + 4 ticks
 
   const std::vector<std::string> row0 = csvSplit(lines[1]);
-  CHECK(row0.size() == 30);
+  CHECK(row0.size() == 39);
   CHECK(row0[15].empty());            // no link metrics captured
   CHECK(row0[21].empty());            // no hardware metadata captured
   CHECK(row0[24].empty());            // device_related absent with no hardware
+  CHECK(row0[30].empty());            // no wireless metadata captured
   CHECK(row0[1] == "eth0");
   CHECK(row0[2] == "idx:2");
   CHECK(row0[3] == "");              // no rate on the first tick
@@ -343,7 +348,7 @@ void test_csv_empty_history() {
 
   const std::string csv = atm::generateNetworkTrafficCsv(snapshot);
   const std::vector<std::string> lines = csvSplit(csv);
-  CHECK(lines.size() == 30);  // header columns only
+  CHECK(lines.size() == 39);  // header columns only
 
   const auto result = atm::exportNetworkTrafficHistory(
       "/tmp/network-traffic-export-empty.csv", snapshot,
@@ -567,8 +572,9 @@ void test_csv_link_metadata_stale_unavailable() {
       linesOf(atm::generateNetworkTrafficCsv(none));
   CHECK(none_lines.size() == 5);
   const std::vector<std::string> none_row = csvSplit(none_lines[1]);
-  CHECK(none_row.size() == 30);
+  CHECK(none_row.size() == 39);
   CHECK(none_row[15].empty() && none_row[16].empty() && none_row[17].empty());
+  CHECK(none_row[30].empty() && none_row[35].empty() && none_row[38].empty());
 }
 
 void test_csv_hardware_metadata() {
@@ -605,14 +611,14 @@ void test_csv_hardware_metadata() {
   link_state.link_known = true;
 
   const atm::NetworkTrafficExportSnapshot snapshot =
-      atm::buildNetworkTrafficExportSnapshot(s, 120, nullptr, &hw, &info,
-                                            &link_state);
+      atm::buildNetworkTrafficExportSnapshot(s, 120, nullptr, &hw, nullptr,
+                                            &info, &link_state);
 
   const std::vector<std::string> lines =
       linesOf(atm::generateNetworkTrafficCsv(snapshot));
   CHECK(lines.size() == 5);  // header + 4 ticks
   const std::vector<std::string> row = csvSplit(lines[1]);
-  CHECK(row.size() == 30);
+  CHECK(row.size() == 39);
   CHECK(row[21] == "2");               // interface_index
   CHECK(row[22] == "aa:bb:cc:dd:ee:ff");
   CHECK(row[23] == "Ethernet");        // interface_type
@@ -622,6 +628,9 @@ void test_csv_hardware_metadata() {
   CHECK(row[27] == "0x0");             // device_id
   CHECK(row[28] == "1");               // link_carrier
   CHECK(row[29] == "1");               // link_operstate
+  CHECK(row[30].empty());              // no wireless record captured
+  CHECK(row[34].empty());              // no signal
+  CHECK(row[38].empty());              // no field state
 }
 
 void test_json_hardware_metadata() {
@@ -658,8 +667,8 @@ void test_json_hardware_metadata() {
   link_state.link_known = true;
 
   const atm::NetworkTrafficExportSnapshot snapshot =
-      atm::buildNetworkTrafficExportSnapshot(s, 120, nullptr, &hw, &info,
-                                            &link_state);
+      atm::buildNetworkTrafficExportSnapshot(s, 120, nullptr, &hw, nullptr,
+                                            &info, &link_state);
   const std::string json = atm::generateNetworkTrafficJson(snapshot);
   CHECK(isValidJson(json));
   CHECK(json.find("\"hardware\":{") != std::string::npos);
@@ -691,6 +700,101 @@ void test_json_hardware_null_when_absent() {
   const std::string json = atm::generateNetworkTrafficJson(snapshot);
   CHECK(isValidJson(json));
   CHECK(json.find("\"hardware\":null") != std::string::npos);
+}
+
+// -------------------------------------------------------------------------
+// Wireless export metadata
+// -------------------------------------------------------------------------
+
+atm::NetworkWirelessInfo makeWirelessRecord() {
+  atm::NetworkWirelessInfo wl;
+  wl.identity = "idx:30";
+  wl.name = "wlp2s0";
+  wl.presence = atm::WirelessPresence::Wireless;
+  wl.phy_name = "phy0";
+  wl.phy_index = 0;
+  wl.phy_state = atm::WirelessFieldState::Available;
+  wl.is_mac80211 = true;
+  wl.link_quality = 54;    // raw WIRELESS_EXT value, mac80211 "54 /70" scale
+  wl.signal_dbm = -43;
+  wl.noise_dbm = -90;
+  wl.field_state = atm::WirelessFieldState::Available;
+  wl.association = atm::WirelessAssociation::Associated;
+  wl.enabled = true;
+  wl.carrier_exposed = true;
+  wl.has_carrier = true;
+  wl.last_read = std::chrono::system_clock::now();
+  return wl;
+}
+
+void test_csv_wireless_metadata() {
+  run("csvWirelessMetadata");
+  atm::NetworkTrafficSeries s = makeSeries("idx:30", "wlp2s0", false, 120);
+  fillFourTicks(s);
+  const atm::NetworkWirelessInfo wl = makeWirelessRecord();
+  const atm::NetworkTrafficExportSnapshot snapshot =
+      atm::buildNetworkTrafficExportSnapshot(s, 120, nullptr, nullptr, &wl);
+  const std::vector<std::string> lines =
+      linesOf(atm::generateNetworkTrafficCsv(snapshot));
+  CHECK(lines.size() == 5);  // header + 4 ticks
+  const std::vector<std::string> row = csvSplit(lines[1]);
+  CHECK(row.size() == 39);
+  CHECK(row[30] == "wireless");   // wireless_presence
+  CHECK(row[31] == "phy0");       // wireless_phy_name
+  CHECK(row[32] == "0");          // wireless_phy_index
+  CHECK(row[33] == "-43");        // wireless_signal_dbm (negative preserved)
+  CHECK(row[34] == "-90");        // wireless_noise_dbm
+  CHECK(row[35] == "54");         // wireless_link_quality (raw, not percent)
+  CHECK(row[36] == "associated"); // wireless_association
+  CHECK(row[37] == "1");          // wireless_enabled
+  CHECK(row[38] == "available");  // wireless_field_state
+}
+
+void test_json_wireless_metadata() {
+  run("jsonWirelessMetadata");
+  atm::NetworkTrafficSeries s = makeSeries("idx:30", "wlp2s0", false, 120);
+  s.rx_bytes_total.addSample(
+      TimedSample{std::chrono::steady_clock::now(), 5.0});
+  s.last_update = std::chrono::system_clock::now();
+  const atm::NetworkWirelessInfo wl = makeWirelessRecord();
+  const atm::NetworkTrafficExportSnapshot snapshot =
+      atm::buildNetworkTrafficExportSnapshot(s, 120, nullptr, nullptr, &wl);
+  const std::string json = atm::generateNetworkTrafficJson(snapshot);
+  CHECK(isValidJson(json));
+  CHECK(json.find("\"wireless\":{") != std::string::npos);
+  CHECK(json.find("\"presence\":\"wireless\"") != std::string::npos);
+  CHECK(json.find("\"phy_name\":\"phy0\"") != std::string::npos);
+  CHECK(json.find("\"phy_index\":0") != std::string::npos);
+  CHECK(json.find("\"is_mac80211\":true") != std::string::npos);
+  CHECK(json.find("\"link_quality\":54") != std::string::npos);
+  CHECK(json.find("\"signal_dbm\":-43") != std::string::npos);
+  CHECK(json.find("\"noise_dbm\":-90") != std::string::npos);
+  CHECK(json.find("\"association\":\"associated\"") != std::string::npos);
+  CHECK(json.find("\"enabled\":true") != std::string::npos);
+  // The kernel exposes no SSID/BSSID/channel/frequency/bitrate via sysfs or
+  // /proc/net/wireless, so they must never appear in the export.
+  CHECK(json.find("ssid") == std::string::npos);
+  CHECK(json.find("bssid") == std::string::npos);
+  CHECK(json.find("channel") == std::string::npos);
+  CHECK(json.find("frequency") == std::string::npos);
+  CHECK(json.find("bitrate") == std::string::npos);
+}
+
+void test_export_wireless_null_for_non_wireless() {
+  run("exportWirelessNullForNonWireless");
+  atm::NetworkTrafficSeries s = makeSeries("idx:2", "eth0", false, 120);
+  fillFourTicks(s);
+  atm::NetworkWirelessInfo wl;
+  wl.identity = "idx:2";
+  wl.name = "eth0";
+  wl.presence = atm::WirelessPresence::NotWireless;
+  wl.field_state = atm::WirelessFieldState::Unavailable;
+  const atm::NetworkTrafficExportSnapshot snapshot =
+      atm::buildNetworkTrafficExportSnapshot(s, 120, nullptr, nullptr, &wl);
+  CHECK(!snapshot.wireless.has_value());  // no fabricated wireless record
+  const std::string json = atm::generateNetworkTrafficJson(snapshot);
+  CHECK(isValidJson(json));
+  CHECK(json.find("\"wireless\":null") != std::string::npos);
 }
 
 // -------------------------------------------------------------------------
@@ -1328,6 +1432,7 @@ int main() {
   test_csv_link_metadata();
   test_csv_link_metadata_stale_unavailable();
   test_csv_hardware_metadata();
+  test_csv_wireless_metadata();
 
   test_json_valid_output();
   test_json_metadata_presence();
@@ -1343,6 +1448,8 @@ int main() {
   test_json_link_null_for_aggregate();
   test_json_hardware_metadata();
   test_json_hardware_null_when_absent();
+  test_json_wireless_metadata();
+  test_export_wireless_null_for_non_wireless();
   test_json_no_internal_state();
 
   test_summary_current_and_peak();
