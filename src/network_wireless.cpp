@@ -32,6 +32,21 @@ std::string trimWhitespace(const std::string &text) {
   return text.substr(begin, end - begin);
 }
 
+/// Formats a system_clock time_point as a local "YYYY-MM-DD HH:MM:SS" string.
+std::string formatTimestamp(std::chrono::system_clock::time_point tp) {
+  if (tp == std::chrono::system_clock::time_point{}) {
+    return "N/A";
+  }
+  const std::time_t time = std::chrono::system_clock::to_time_t(tp);
+  std::tm local{};
+  if (::localtime_r(&time, &local) == nullptr) {
+    return "N/A";
+  }
+  char buffer[32];
+  std::strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", &local);
+  return buffer;
+}
+
 /// Reads and trims one sysfs attribute file. Returns std::nullopt for an
 /// absent/empty file; `denied` is set when the file exists but is not readable
 /// (a permission problem — unlike a clean absence, this is temporary).
@@ -586,6 +601,632 @@ WirelessHistorySummary summarizeWirelessHistory(const NetworkWirelessInfo &wirel
   summary.event_count = wireless.connection_events.size();
   summary.last_update = wireless.last_sample_wall;
   return summary;
+}
+
+// -------------------------------------------------------------------------
+// Step 52 — Wireless connection quality summary helpers (internal).
+// -------------------------------------------------------------------------
+
+/// Population standard deviation of the provided values. Returns nullopt for
+/// fewer than two values (stddev is undefined for zero or one sample).
+std::optional<double> populationStddev(const std::vector<double> &values) {
+  if (values.size() < 2) {
+    return std::nullopt;
+  }
+  double sum = 0.0;
+  for (double v : values) {
+    sum += v;
+  }
+  const double mean = sum / static_cast<double>(values.size());
+  double sq = 0.0;
+  for (double v : values) {
+    const double d = v - mean;
+    sq += d * d;
+  }
+  return std::sqrt(sq / static_cast<double>(values.size()));
+}
+
+/// Clamp a value into [lo, hi].
+double clampUnit(double value, double lo, double hi) {
+  if (value < lo) {
+    return lo;
+  }
+  if (value > hi) {
+    return hi;
+  }
+  return value;
+}
+
+/// Factor weights (must sum to 1.0 before exclusion/renormalisation). Each
+/// factor is fully documented in the header doc-comment for
+/// WirelessQualitySummary; these constants centralise the numeric values.
+/// Connectivity factors dominate (0.30 + 0.25) so an interface that mostly
+/// stays associated but weak/flappy cannot earn a flattering grade from the
+/// smaller signal/availability factors alone.
+constexpr double kContinuityWeight = 0.30;
+constexpr double kDisconnectionWeight = 0.25;
+constexpr double kRecoveryWeight = 0.10;
+constexpr double kSignalStrengthWeight = 0.15;
+constexpr double kSignalVariabilityWeight = 0.05;
+constexpr double kAvailabilityWeight = 0.10;
+constexpr double kRoamingWeight = 0.05;
+
+/// Reference durations/scales for the individual factors (seconds).
+constexpr double kRecoveryReferenceSeconds = 60.0;
+constexpr double kSignalVariabilityReferenceDbm = 6.0;
+constexpr double kAvailabilityReferenceCount = 3.0;
+constexpr double kRoamingReferenceCount = 2.0;
+constexpr double kDisconnectionScalePerHour = 10.0;
+
+/// Mapping from average signal dBm to [0,1]: -30 dBm → 1.0, -90 dBm → 0.0,
+/// linearly clamped to the band.
+double signalQualityFromAvgDbm(double avg_dbm) {
+  const double span = kWirelessSignalBestDbm - kWirelessSignalWorstDbm;
+  if (span <= 0.0) {
+    return 0.5;
+  }
+  return clampUnit((avg_dbm - kWirelessSignalWorstDbm) / span, 0.0, 1.0);
+}
+
+/// Weighted, clamped, renormalised stability score. Returns nullopt when the
+/// input factor list is empty (all factors excluded). Factors with nullopt
+/// value never participate.
+std::optional<double> computeWeightedScore(
+    const std::vector<WirelessStabilityFactor> &factors) {
+  double numerator = 0.0;
+  double denominator = 0.0;
+  for (const auto &f : factors) {
+    if (!f.value.has_value()) {
+      continue;
+    }
+    numerator += f.weight * *f.value;
+    denominator += f.weight;
+  }
+  if (denominator <= 0.0) {
+    return std::nullopt;
+  }
+  return 100.0 * (numerator / denominator);
+}
+
+/// Classify a score into a stability band.
+WirelessStability classifyScore(double score) {
+  if (score >= kWirelessExcellentThreshold) {
+    return WirelessStability::Excellent;
+  }
+  if (score >= kWirelessGoodThreshold) {
+    return WirelessStability::Good;
+  }
+  if (score >= kWirelessFairThreshold) {
+    return WirelessStability::Fair;
+  }
+  return WirelessStability::Poor;
+}
+
+/// Core stability classification. Builds the individual factors, renormalises
+/// their weights, computes the weighted score and assigns a stability band.
+WirelessStabilityAssessment assessWirelessStability(
+    const NetworkWirelessInfo &wireless,
+    const WirelessQualitySummary &q) {
+  WirelessStabilityAssessment result;
+  std::vector<WirelessStabilityFactor> factors;
+
+  const double determined =
+      q.connected_seconds + q.disconnected_seconds;
+
+  // Factor 1: connection continuity (connected / determined).
+  if (determined >= kWirelessQualityMinDeterminedSeconds) {
+    const double v = q.connected_seconds / determined;
+    WirelessStabilityFactor f;
+    f.name = "connection continuity";
+    f.value = clampUnit(v, 0.0, 1.0);
+    f.weight = kContinuityWeight;
+    std::ostringstream det;
+    det << std::fixed << std::setprecision(1) << q.connected_seconds
+        << " s connected / " << std::fixed << std::setprecision(1) << determined
+        << " s determined";
+    f.detail = det.str();
+    factors.push_back(std::move(f));
+  }
+
+  // Factor 2: disconnection frequency. Penalises both the fraction of the
+  // determined window actually spent disconnected and the rate of recorded
+  // disconnection events (10/h is the reference scale for the rate term), so
+  // an interface that oscillates between associated and disconnected is never
+  // rewarded just because its disconnects were short.
+  if (determined >= kWirelessQualityMinDeterminedSeconds) {
+    const double hours = determined / 3600.0;
+    const double rate =
+        hours > 0.0 ? static_cast<double>(q.disconnection_count) / hours : 0.0;
+    const double disconnected_fraction =
+        determined > 0.0 ? q.disconnected_seconds / determined : 0.0;
+    const double v = (1.0 - disconnected_fraction) *
+                     (1.0 / (1.0 + rate / kDisconnectionScalePerHour));
+    WirelessStabilityFactor f;
+    f.name = "disconnection frequency";
+    f.value = clampUnit(v, 0.0, 1.0);
+    f.weight = kDisconnectionWeight;
+    std::ostringstream det;
+    det << std::fixed << std::setprecision(1)
+        << (disconnected_fraction * 100.0) << "% time disconnected, "
+        << std::fixed << std::setprecision(2) << rate << " disconnects/hour";
+    f.detail = det.str();
+    factors.push_back(std::move(f));
+  }
+
+  // Factor 3: recovery speed (penalise long outages; 60 s is the reference).
+  {
+    const double v =
+        1.0 - clampUnit(q.longest_disconnected_seconds /
+                            kRecoveryReferenceSeconds,
+                        0.0, 1.0);
+    WirelessStabilityFactor f;
+    f.name = "recovery speed";
+    f.value = clampUnit(v, 0.0, 1.0);
+    f.weight = kRecoveryWeight;
+    std::ostringstream det;
+    det << "longest outage " << std::fixed << std::setprecision(1)
+        << q.longest_disconnected_seconds << " s";
+    f.detail = det.str();
+    factors.push_back(std::move(f));
+  }
+
+  // Factor 4: signal strength (quality from average dBm).
+  if (q.signal_sample_count >= kWirelessQualityMinFactorSamples &&
+      q.avg_signal_dbm.has_value()) {
+    const double v = signalQualityFromAvgDbm(*q.avg_signal_dbm);
+    WirelessStabilityFactor f;
+    f.name = "signal strength";
+    f.value = clampUnit(v, 0.0, 1.0);
+    f.weight = kSignalStrengthWeight;
+    std::ostringstream det;
+    det << "avg " << std::fixed << std::setprecision(1) << *q.avg_signal_dbm
+        << " dBm";
+    f.detail = det.str();
+    factors.push_back(std::move(f));
+  }
+
+  // Factor 5: signal variability (penalise high stddev; 6 dBm is the
+  // reference).
+  if (q.signal_stddev_dbm.has_value()) {
+    const double v =
+        1.0 - clampUnit(*q.signal_stddev_dbm / kSignalVariabilityReferenceDbm,
+                        0.0, 1.0);
+    WirelessStabilityFactor f;
+    f.name = "signal stability";
+    f.value = clampUnit(v, 0.0, 1.0);
+    f.weight = kSignalVariabilityWeight;
+    std::ostringstream det;
+    det << "stddev " << std::fixed << std::setprecision(1)
+        << *q.signal_stddev_dbm << " dBm";
+    f.detail = det.str();
+    factors.push_back(std::move(f));
+  }
+
+  // Factor 6: interface availability (penalise unavailable episodes; 3 is the
+  // reference).
+  {
+    const double v =
+        1.0 - clampUnit(
+                  static_cast<double>(q.interface_unavailable_count) /
+                      kAvailabilityReferenceCount,
+                  0.0, 1.0);
+    WirelessStabilityFactor f;
+    f.name = "interface availability";
+    f.value = clampUnit(v, 0.0, 1.0);
+    f.weight = kAvailabilityWeight;
+    std::ostringstream det;
+    det << q.interface_unavailable_count << " unavailable";
+    f.detail = det.str();
+    factors.push_back(std::move(f));
+  }
+
+  // Factor 7: roaming (penalise frequent roaming; 2 is the reference). Only
+  // included when the retained connection-event history shows at least one
+  // event with reliable AP identity — otherwise roaming cannot be reliably
+  // detected and the factor is omitted rather than rewarded by default.
+  {
+    bool reliable_ap_identity = false;
+    for (const auto &event : wireless.connection_events.samples()) {
+      if (event.ap_identity_reliable) {
+        reliable_ap_identity = true;
+        break;
+      }
+    }
+    if (reliable_ap_identity) {
+      const double v =
+          1.0 - clampUnit(static_cast<double>(q.roaming_count) /
+                              kRoamingReferenceCount,
+                          0.0, 1.0);
+      WirelessStabilityFactor f;
+      f.name = "roaming";
+      f.value = clampUnit(v, 0.0, 1.0);
+      f.weight = kRoamingWeight;
+      std::ostringstream det;
+      det << q.roaming_count << " roam events";
+      f.detail = det.str();
+      factors.push_back(std::move(f));
+    }
+  }
+
+  // Need at least 2 factors remaining before classifying; otherwise the
+  // renormalised weights become over-sensitive to a single measurement.
+  std::size_t present_count = 0;
+  for (const auto &f : factors) {
+    if (f.value.has_value()) {
+      ++present_count;
+    }
+  }
+  if (present_count < 2) {
+    return result;
+  }
+
+  result.factors = std::move(factors);
+  result.score = computeWeightedScore(result.factors);
+  if (result.score.has_value()) {
+    result.stability = classifyScore(*result.score);
+  }
+  return result;
+}
+
+// -------------------------------------------------------------------------
+// Step 52 — Public functions.
+// -------------------------------------------------------------------------
+
+const char *wirelessStabilityName(WirelessStability stability) {
+  switch (stability) {
+    case WirelessStability::Unknown:
+      return "unknown";
+    case WirelessStability::Poor:
+      return "poor";
+    case WirelessStability::Fair:
+      return "fair";
+    case WirelessStability::Good:
+      return "good";
+    case WirelessStability::Excellent:
+      return "excellent";
+  }
+  return "unknown";
+}
+
+WirelessQualitySummary summarizeWirelessQuality(
+    const NetworkWirelessInfo &wireless, std::size_t max_samples) {
+  WirelessQualitySummary q;
+  const auto &samples = wireless.history.samples();
+  q.sample_count = samples.size();
+  if (q.sample_count == 0 && wireless.connection_events.empty()) {
+    return q;
+  }
+  q.has_data = true;
+
+  // --- Valid / coverage counts ------------------------------------------------
+  for (const WirelessHistorySample &sample : samples) {
+    if (sample.valid) {
+      ++q.valid_sample_count;
+    }
+    if (sample.signal_dbm.has_value()) {
+      ++q.signal_sample_count;
+    }
+    if (sample.bitrate_bps.has_value()) {
+      ++q.bitrate_sample_count;
+    }
+  }
+  if (max_samples > 0) {
+    q.coverage = std::min(
+        1.0, static_cast<double>(q.sample_count) /
+                 static_cast<double>(max_samples));
+    q.valid_coverage = std::min(
+        1.0, static_cast<double>(q.valid_sample_count) /
+                 static_cast<double>(max_samples));
+  }
+  if (q.valid_sample_count > 0) {
+    q.valid_with_signal = std::min(
+        1.0, static_cast<double>(q.signal_sample_count) /
+                 static_cast<double>(q.valid_sample_count));
+    q.valid_with_bitrate = std::min(
+        1.0, static_cast<double>(q.bitrate_sample_count) /
+                 static_cast<double>(q.valid_sample_count));
+  }
+
+  // --- Temporary gaps (invalid tick count) ------------------------------------
+  q.temporary_gap_count = 0;
+  for (const WirelessHistorySample &sample : samples) {
+    if (!sample.valid) {
+      ++q.temporary_gap_count;
+    }
+  }
+
+  // --- Signal stats -----------------------------------------------------------
+  std::vector<double> signal_values;
+  signal_values.reserve(q.signal_sample_count);
+  for (const WirelessHistorySample &sample : samples) {
+    if (sample.signal_dbm.has_value()) {
+      q.current_signal_dbm = *sample.signal_dbm;
+      signal_values.push_back(*sample.signal_dbm);
+      if (!q.min_signal_dbm.has_value() || *sample.signal_dbm < *q.min_signal_dbm) {
+        q.min_signal_dbm = *sample.signal_dbm;
+      }
+      if (!q.max_signal_dbm.has_value() || *sample.signal_dbm > *q.max_signal_dbm) {
+        q.max_signal_dbm = *sample.signal_dbm;
+      }
+    }
+  }
+  if (!signal_values.empty()) {
+    double sum = 0.0;
+    for (double v : signal_values) {
+      sum += v;
+    }
+    q.avg_signal_dbm = sum / static_cast<double>(signal_values.size());
+    q.signal_stddev_dbm = populationStddev(signal_values);
+  }
+
+  // --- Bitrate stats ----------------------------------------------------------
+  std::vector<double> bitrate_values;
+  bitrate_values.reserve(q.bitrate_sample_count);
+  for (const WirelessHistorySample &sample : samples) {
+    if (sample.bitrate_bps.has_value()) {
+      q.current_bitrate_bps = *sample.bitrate_bps;
+      bitrate_values.push_back(*sample.bitrate_bps);
+      if (!q.min_bitrate_bps.has_value() ||
+          *sample.bitrate_bps < *q.min_bitrate_bps) {
+        q.min_bitrate_bps = *sample.bitrate_bps;
+      }
+      if (!q.max_bitrate_bps.has_value() ||
+          *sample.bitrate_bps > *q.max_bitrate_bps) {
+        q.max_bitrate_bps = *sample.bitrate_bps;
+      }
+    }
+  }
+  if (!bitrate_values.empty()) {
+    double sum = 0.0;
+    for (double v : bitrate_values) {
+      sum += v;
+    }
+    q.avg_bitrate_bps = sum / static_cast<double>(bitrate_values.size());
+    q.bitrate_stddev_bps = populationStddev(bitrate_values);
+  }
+
+  // --- Window and span --------------------------------------------------------
+  if (q.sample_count >= 2) {
+    q.span_seconds = std::chrono::duration<double>(
+                         samples.back().timestamp - samples.front().timestamp)
+                         .count();
+  }
+  q.window_end = wireless.last_sample_wall;
+  if (q.sample_count >= 2 && q.window_end != std::chrono::system_clock::time_point{}) {
+    q.window_start = q.window_end - std::chrono::duration_cast<std::chrono::system_clock::duration>(
+                                        std::chrono::duration<double>(q.span_seconds));
+  } else {
+    q.window_start = q.window_end;
+  }
+
+  // --- Connectivity durations -------------------------------------------------
+  const double max_gap_seconds =
+      static_cast<double>(kWirelessQualityMaxGap.count());
+
+  enum class RunState { None, Connected, Disconnected };
+  RunState current_run = RunState::None;
+  double current_run_seconds = 0.0;
+
+  for (std::size_t i = 1; i < q.sample_count; ++i) {
+    const double delta = std::chrono::duration<double>(
+                             samples[i].timestamp - samples[i - 1].timestamp)
+                             .count();
+    if (delta <= 0.0) {
+      continue;
+    }
+
+    // Long gap or unknown/unavailable state → unobserved, break any run.
+    const WirelessAssociation prev_state = samples[i - 1].association;
+    if (delta > max_gap_seconds ||
+        prev_state == WirelessAssociation::Unknown ||
+        prev_state == WirelessAssociation::Unavailable) {
+      q.unobserved_seconds += delta;
+      if (current_run == RunState::Connected &&
+          current_run_seconds > q.longest_connected_seconds) {
+        q.longest_connected_seconds = current_run_seconds;
+      }
+      if (current_run == RunState::Disconnected &&
+          current_run_seconds > q.longest_disconnected_seconds) {
+        q.longest_disconnected_seconds = current_run_seconds;
+      }
+      current_run = RunState::None;
+      current_run_seconds = 0.0;
+      continue;
+    }
+
+    if (prev_state == WirelessAssociation::Associated) {
+      q.connected_seconds += delta;
+      if (current_run == RunState::Connected) {
+        current_run_seconds += delta;
+      } else {
+        if (current_run == RunState::Connected &&
+            current_run_seconds > q.longest_connected_seconds) {
+          q.longest_connected_seconds = current_run_seconds;
+        }
+        if (current_run == RunState::Disconnected &&
+            current_run_seconds > q.longest_disconnected_seconds) {
+          q.longest_disconnected_seconds = current_run_seconds;
+        }
+        current_run = RunState::Connected;
+        current_run_seconds = delta;
+      }
+    } else {
+      // Disconnected (carrier clear, not Unknown/Unavailable which are above).
+      q.disconnected_seconds += delta;
+      if (current_run == RunState::Disconnected) {
+        current_run_seconds += delta;
+      } else {
+        if (current_run == RunState::Connected &&
+            current_run_seconds > q.longest_connected_seconds) {
+          q.longest_connected_seconds = current_run_seconds;
+        }
+        if (current_run == RunState::Disconnected &&
+            current_run_seconds > q.longest_disconnected_seconds) {
+          q.longest_disconnected_seconds = current_run_seconds;
+        }
+        current_run = RunState::Disconnected;
+        current_run_seconds = delta;
+      }
+    }
+  }
+  // Flush the final open run.
+  if (current_run == RunState::Connected &&
+      current_run_seconds > q.longest_connected_seconds) {
+    q.longest_connected_seconds = current_run_seconds;
+  }
+  if (current_run == RunState::Disconnected &&
+      current_run_seconds > q.longest_disconnected_seconds) {
+    q.longest_disconnected_seconds = current_run_seconds;
+  }
+
+  // --- Event counts -----------------------------------------------------------
+  for (const auto &event : wireless.connection_events.samples()) {
+    switch (event.type) {
+      case WirelessConnectionEventType::Disassociated:
+        ++q.disconnection_count;
+        break;
+      case WirelessConnectionEventType::Reconnected:
+        ++q.reconnection_count;
+        break;
+      case WirelessConnectionEventType::Associated:
+        ++q.association_count;
+        break;
+      case WirelessConnectionEventType::Roamed:
+        ++q.roaming_count;
+        break;
+      case WirelessConnectionEventType::InterfaceUnavailable:
+        ++q.interface_unavailable_count;
+        break;
+      default:
+        break;
+    }
+  }
+
+  // --- Last update ------------------------------------------------------------
+  q.last_update = wireless.last_sample_wall;
+
+  // --- Stability assessment ---------------------------------------------------
+  // Sufficient-data gate: at least a minimum number of freshly-read samples,
+  // plus some determined connected/disconnected time.
+  const double determined = q.connected_seconds + q.disconnected_seconds;
+  if (q.valid_sample_count >= kWirelessQualityMinValidSamples &&
+      determined >= kWirelessQualityMinDeterminedSeconds) {
+    q.assessment = assessWirelessStability(wireless, q);
+  }
+  return q;
+}
+
+std::string renderWirelessQualitySummary(const NetworkWirelessInfo &wireless,
+                                         std::size_t max_samples) {
+  if (wireless.presence != WirelessPresence::Wireless) {
+    return "not a wireless interface\n";
+  }
+
+  const WirelessQualitySummary q =
+      summarizeWirelessQuality(wireless, max_samples);
+
+  std::ostringstream out;
+
+  out << "Wireless connection quality summary:\n";
+  if (!q.has_data) {
+    out << "  no data (no retained wireless history or connection events)\n";
+    return out.str();
+  }
+
+  // --- Stability and score ----------------------------------------------------
+  out << "  Stability: " << wirelessStabilityName(q.assessment.stability);
+  if (q.assessment.score.has_value()) {
+    out << " (score " << std::fixed << std::setprecision(0)
+        << *q.assessment.score << "/100)";
+  }
+  out << "\n";
+
+  // --- Signal -----------------------------------------------------------------
+  out << "  Signal: ";
+  if (q.signal_sample_count == 0) {
+    out << "N/A (no data)";
+  } else {
+    out << "current " << formatWirelessSignal(
+               q.current_signal_dbm.has_value()
+                   ? std::optional<int>(static_cast<int>(*q.current_signal_dbm))
+                   : std::optional<int>{});
+    if (q.avg_signal_dbm.has_value()) {
+      out << ", avg " << std::fixed << std::setprecision(1) << *q.avg_signal_dbm
+          << " dBm";
+    }
+    if (q.min_signal_dbm.has_value() && q.max_signal_dbm.has_value()) {
+      out << ", range [" << std::fixed << std::setprecision(0)
+          << static_cast<long long>(*q.min_signal_dbm) << ", "
+          << static_cast<long long>(*q.max_signal_dbm) << "]";
+    }
+    if (q.signal_stddev_dbm.has_value()) {
+      out << ", stddev " << std::fixed << std::setprecision(1)
+          << *q.signal_stddev_dbm << " dBm";
+    }
+  }
+  out << "\n";
+
+  // --- Bitrate ----------------------------------------------------------------
+  out << "  Bitrate: ";
+  if (q.bitrate_sample_count == 0) {
+    out << "N/A (no data)";
+  } else {
+    out << formatWirelessBitrate(q.current_bitrate_bps);
+    if (q.avg_bitrate_bps.has_value()) {
+      out << ", avg " << formatWirelessBitrate(q.avg_bitrate_bps);
+    }
+    if (q.min_bitrate_bps.has_value() && q.max_bitrate_bps.has_value()) {
+      out << ", range [" << formatWirelessBitrate(q.min_bitrate_bps) << ", "
+          << formatWirelessBitrate(q.max_bitrate_bps) << "]";
+    }
+  }
+  out << "\n";
+
+  // --- Connectivity durations -------------------------------------------------
+  out << "  Connectivity: " << std::fixed << std::setprecision(1)
+      << q.connected_seconds << " s connected, " << std::fixed
+      << std::setprecision(1) << q.disconnected_seconds
+      << " s disconnected, " << std::fixed << std::setprecision(1)
+      << q.unobserved_seconds << " s unobserved\n";
+  out << "  Longest runs: connected " << std::fixed << std::setprecision(1)
+      << q.longest_connected_seconds << " s, disconnected " << std::fixed
+      << std::setprecision(1) << q.longest_disconnected_seconds << " s\n";
+
+  // --- Coverage ---------------------------------------------------------------
+  out << "  Coverage: " << q.valid_sample_count << " / " << max_samples
+      << " valid samples, " << std::fixed << std::setprecision(0)
+      << std::llround(q.coverage * 100.0) << "% retained window\n";
+
+  // --- Events -----------------------------------------------------------------
+  out << "  Events: " << q.disconnection_count << " disconnections, "
+      << q.reconnection_count << " reconnections, " << q.roaming_count
+      << " roams, " << q.interface_unavailable_count << " unavailable\n";
+  out << "  Gaps: " << q.temporary_gap_count << " invalid ticks\n";
+
+  // --- Factors ----------------------------------------------------------------
+  if (!q.assessment.factors.empty()) {
+    out << "  Factors:\n";
+    for (const auto &f : q.assessment.factors) {
+      out << "    " << f.name << ": " << f.detail << " (weight " << std::fixed
+          << std::setprecision(0) << std::llround(f.weight * 100.0) << "%)";
+      if (!f.value.has_value()) {
+        out << " (excluded: insufficient data)";
+      }
+      out << "\n";
+    }
+  }
+
+  // --- Last update ------------------------------------------------------------
+  out << "  Last update: " << formatTimestamp(q.last_update) << "\n";
+
+  // --- Coverage note ----------------------------------------------------------
+  if (q.valid_sample_count < kWirelessQualityMinValidSamples ||
+      (q.connected_seconds + q.disconnected_seconds) <
+          kWirelessQualityMinDeterminedSeconds) {
+    out << "  Coverage is limited; classification reflects available data only.\n";
+  }
+
+  return out.str();
 }
 
 std::string describeWirelessLine(const NetworkWirelessInfo &wireless) {
