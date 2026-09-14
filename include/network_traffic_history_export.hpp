@@ -13,6 +13,7 @@ namespace atm {
 
 struct NetworkLinkMetrics;        // link speed/duplex monitor state (export metadata)
 struct NetworkInterfaceHardware;   // hardware/driver monitor state (export metadata)
+struct NetworkWirelessInfo;        // wireless monitor state (export metadata)
 struct TrackedInterface;           // link-state monitor record (export metadata)
 
 /// Supported network-traffic-history export formats. CSV and JSON are the only
@@ -101,6 +102,31 @@ struct NetworkTrafficExportHardware {
   std::chrono::system_clock::time_point last_read{};  // metadata probe time
 };
 
+/// Wireless metadata serialized alongside one exported series when it maps to a
+/// single wireless interface. Series-scoped (one value per export, never
+/// repeated per sample in the JSON form). Only values obtainable from the
+/// kernel's native sysfs / /proc/net/wireless interfaces are exported; the
+/// kernel does not expose SSID/BSSID/channel/frequency/bitrate via those
+/// interfaces (they require nl80211), so those fields are intentionally absent
+/// from the export model — never guessed, never fabricated. No credentials or
+/// network keys are ever included.
+struct NetworkTrafficExportWireless {
+  std::string interface_name;  // current kernel name
+  std::string presence;        // "wireless" / "not wireless" / "unknown"
+  std::string phy_name;        // "phy0" ("" when absent)
+  std::optional<int> phy_index;
+  std::string phy_state;       // "available" / "stale" / "unavailable" / ...
+  bool is_mac80211 = false;    // phy80211 present -> the /70 quality-scale note
+  std::optional<int> link_quality;  // raw WIRELESS_EXT quality (driver scale)
+  std::optional<int> signal_dbm;    // received signal strength, dBm
+  std::optional<int> noise_dbm;     // noise floor, dBm
+  std::string association;          // "associated" / "disconnected" / "unknown"
+  bool enabled = false;             // administrative state
+  std::string carrier_state;        // "yes" / "no carrier" / "unknown"
+  std::string field_state;          // "available" / "stale" / "unavailable"
+  std::chrono::system_clock::time_point last_read{};
+};
+
 /// Implementation-free, immutable snapshot of one traffic series ready for
 /// serialization. Contains only plain data — no pointers, no mutexes, no UI
 /// objects and no internal bookkeeping. Building this snapshot before
@@ -125,6 +151,10 @@ struct NetworkTrafficExportSnapshot {
   // Hardware/driver metadata when the exported series maps to a single
   // interface (std::nullopt for the aggregate / when no hardware was captured).
   std::optional<NetworkTrafficExportHardware> hardware;
+
+  // Wireless metadata when the exported series maps to a single wireless
+  // interface (std::nullopt for the aggregate / non-wireless interfaces).
+  std::optional<NetworkTrafficExportWireless> wireless;
 };
 
 /// Builds a stable snapshot of `series` for export. Reads only the series'
@@ -137,12 +167,16 @@ struct NetworkTrafficExportSnapshot {
 /// captured into snapshot.link; when `hardware` points at the selected
 /// interface's hardware/driver metadata it is captured into snapshot.hardware
 /// together with the underlying `info` (interface index, type name, MAC) and
-/// `link_state` (carrier/operational state). All parameters are additive —
-/// existing fields are unchanged and any missing one stays unavailable.
+/// `link_state` (carrier/operational state). When `wireless` points at the
+/// selected interface's wireless record (and that record is a wireless
+/// interface) it is captured into snapshot.wireless. All parameters are
+/// additive — existing fields are unchanged and any missing one stays
+/// unavailable.
 [[nodiscard]] NetworkTrafficExportSnapshot buildNetworkTrafficExportSnapshot(
     const NetworkTrafficSeries &series, std::size_t max_samples,
     const NetworkLinkMetrics *link_metrics = nullptr,
     const NetworkInterfaceHardware *hardware = nullptr,
+    const NetworkWirelessInfo *wireless = nullptr,
     const NetworkInterfaceInfo *info = nullptr,
     const TrackedInterface *link_state = nullptr);
 
@@ -159,10 +193,10 @@ struct NetworkTrafficExportSnapshot {
 /// Serializes a snapshot to CSV with a stable column order:
 /// timestamp, interface, identity, rx/tx bytes per second, rx/tx bits per
 /// second, cumulative rx/tx bytes, rx/tx packets per second, rx/tx errors per
-/// second, rx/tx drops per second, the trailing link_speed/duplex columns and —
-/// when hardware metadata was captured with the snapshot — the trailing
-/// interface_index/mac/type/classification/driver/device and link carrier/
-/// operstate columns. All metadata columns are append-only additions, so the
+/// second, rx/tx drops per second, the trailing link_speed/duplex columns, the
+/// hardware metadata columns and — when wireless metadata was captured with the
+/// snapshot — the trailing wireless presence/phy/signal/noise/association/
+/// state columns. All metadata columns are append-only additions, so the
 /// leading historical columns are unchanged; without captured metadata the
 /// trailing columns are empty. Unavailable metrics are empty fields (never
 /// misleading zeros); headers are always emitted, so a snapshot with no rows
@@ -175,6 +209,8 @@ struct NetworkTrafficExportSnapshot {
 /// (link speed/duplex metadata, null when absent), an optional "hardware"
 /// object (interface index, MAC, type, physical/virtual classification,
 /// driver/device relationships and carrier/operational state, null when
+/// absent), an optional "wireless" object (wireless presence, PHY, signal/noise
+/// dBm, raw link quality, carrier-derived association and freshness, null when
 /// absent), history span and sampling interval, unit information, the summary
 /// values and the sample array. Unavailable values are null; an empty sample
 /// array is valid; no internal implementation state is ever serialized.

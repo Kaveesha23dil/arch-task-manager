@@ -74,7 +74,7 @@ struct NetworkInterfaceLink {
 /// wireless-capable (/sys/class/net/<iface>/wireless absent).
 struct WirelessInfo {
   bool present = false;             // /sys/class/net/<iface>/wireless exists
-  std::optional<int> link;          // link quality percentage (0-100)
+  std::optional<int> link;          // raw WIRELESS_EXT link value (driver scale)
   std::optional<int> level;         // signal level (dBm)
   std::optional<int> noise;         // noise level (dBm)
 };

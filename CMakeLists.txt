@@ -62,6 +62,7 @@ add_executable(arch-task-manager
   src/network_monitor.cpp
   src/network_interface_details.cpp
   src/network_interface_hardware.cpp
+  src/network_wireless.cpp
   src/network_link_metrics.cpp
   src/network_link_state.cpp
   src/network_traffic_history.cpp
@@ -424,6 +425,7 @@ add_executable(network-traffic-history-export-tests
   src/network_traffic_history.cpp
   src/network_interface_details.cpp
   src/network_interface_hardware.cpp
+  src/network_wireless.cpp
   src/network_link_metrics.cpp
   src/network_link_state.cpp
   src/alert_manager.cpp
@@ -525,3 +527,20 @@ target_include_directories(network-interface-hardware-tests PRIVATE include)
 target_link_libraries(network-interface-hardware-tests PRIVATE Threads::Threads)
 
 add_test(NAME network-interface-hardware COMMAND network-interface-hardware-tests)
+
+add_executable(network-wireless-tests
+  tests/network_wireless_tests.cpp
+  src/network_wireless.cpp
+  src/network_interface_details.cpp
+  src/network_link_state.cpp
+  src/network_link_metrics.cpp
+  src/alert_manager.cpp
+  src/network_monitor.cpp
+  src/resource_history.cpp
+)
+
+target_include_directories(network-wireless-tests PRIVATE include)
+
+target_link_libraries(network-wireless-tests PRIVATE Threads::Threads)
+
+add_test(NAME network-wireless COMMAND network-wireless-tests)
