@@ -206,22 +206,28 @@ void test_summary_bitrate_frequency_channel() {
   CHECK(atm::formatWirelessChannel(summary.current_channel) == "36");
 }
 
-void test_summary_transition_count() {
-  run("summary transition count");
+void test_summary_event_count() {
+  run("summary connection event count");
 
   NetworkWirelessInfo wireless;
   wireless.presence = WirelessPresence::Wireless;
   wireless.history = ResourceHistory<WirelessHistorySample>(4);
   wireless.history.addSample(makeSample(0, true, -45, 52));
-  wireless.transitions =
-      ResourceHistory<atm::WirelessTransitionEvent>(atm::kMaxWirelessTransitions);
-  wireless.transitions.addSample(atm::WirelessTransitionEvent{
-      {}, {}, WirelessAssociation::Associated, WirelessAssociation::Disconnected});
+  wireless.connection_events =
+      ResourceHistory<atm::WirelessConnectionEvent>(atm::kMaxWirelessConnectionEvents);
+  atm::WirelessConnectionEvent event;
+  event.type = atm::WirelessConnectionEventType::Disassociated;
+  event.interface_name = "wlan0";
+  event.previous_association = WirelessAssociation::Associated;
+  event.new_association = WirelessAssociation::Disconnected;
+  event.confident = true;
+  event.source = "carrier";
+  wireless.connection_events.addSample(event);
   wireless.last_sample_wall = std::chrono::system_clock::now();
 
   const WirelessHistorySummary summary =
       atm::summarizeWirelessHistory(wireless, 16);
-  CHECK(summary.transition_count == 1);
+  CHECK(summary.event_count == 1);
   CHECK(summary.last_update == wireless.last_sample_wall);
 }
 
@@ -231,7 +237,7 @@ int main() {
   test_summary_over_ring();
   test_summary_empty_and_complete();
   test_summary_bitrate_frequency_channel();
-  test_summary_transition_count();
+  test_summary_event_count();
 
   std::fprintf(stderr, "PASS: %d checks, %d failures\n", g_checks, g_failures);
   return g_failures == 0 ? 0 : 1;

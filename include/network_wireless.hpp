@@ -6,9 +6,11 @@
 #include <filesystem>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
+#include "alert_manager.hpp"
 #include "network_interface_details.hpp"
 #include "resource_history.hpp"
 
@@ -127,18 +129,136 @@ struct WirelessHistorySample {
   bool valid = false;                  // dynamic fields freshly read this tick
 };
 
-/// One recorded association transition (the association state changed between
-/// two consecutive samples). Deduplicated: repeated same-state ticks never
-/// append events, and the first sample establishes the baseline silently.
-struct WirelessTransitionEvent {
-  std::chrono::steady_clock::time_point timestamp{};   // ordering
-  std::chrono::system_clock::time_point wall_clock{};  // "shown at" display time
-  WirelessAssociation from = WirelessAssociation::Unknown;
-  WirelessAssociation to = WirelessAssociation::Unknown;
+/// One observed wireless connection state for connection-event detection.
+/// Values come from the existing per-tick interface snapshot (never a second
+/// polling loop); a metric the approved native sources (sysfs, /proc/net/
+/// wireless) cannot expose stays std::nullopt and never causes a guess.
+struct WirelessObservation {
+  bool present = false;             // identity discovered in the snapshot this tick
+  bool wireless = true;             // WirelessPresence::Wireless
+  WirelessAssociation association = WirelessAssociation::Unknown;
+  std::optional<double> signal_dbm;       // dBm at event time (display hint)
+  std::optional<double> frequency_mhz;    // centre frequency (nl80211-only)
+  std::optional<int> channel;             // channel index (nl80211-only)
+  std::optional<std::uint64_t> ap_fingerprint;  // one-way hash, never raw identity
+  bool ap_identity_reliable = false;  // false => fingerprints cannot be trusted
 };
 
-/// Upper bound on the retained association-transition history per interface.
-inline constexpr std::size_t kMaxWirelessTransitions = 32;
+/// The kind of wireless connection event recorded in the bounded per-interface
+/// history. Type names are stable, human-readable lowercase strings (see
+/// wirelessConnectionEventTypeName) shared by the UI and the export formats.
+enum class WirelessConnectionEventType {
+  Associated,         // association gained for the first time
+  Disassociated,      // association lost (carrier drop / carrier lost)
+  Reconnected,        // association regained after a prior association
+  Roamed,             // re-associated with a reliably different AP (handoff)
+  InterfaceUnavailable,  // the wireless interface (or its association) went away
+  InterfaceAvailable,    // an unavailable wireless interface became available
+  StateUnknown,          // association can no longer be determined
+};
+
+/// One recorded wireless connection event (Step 51). Deduplicated and
+/// debounced: repeated same-state ticks never append events, a transient
+/// change must persist for kWirelessConnectionDebounceTicks consecutive ticks
+/// before it is committed, and the very first observation establishes the
+/// baseline silently. Raw AP identity (SSID/BSSID) is never stored or exported;
+/// only the one-way fingerprint-change and reliability flags appear.
+struct WirelessConnectionEvent {
+  std::chrono::steady_clock::time_point timestamp{};   // ordering (confirm tick)
+  std::chrono::system_clock::time_point wall_clock{};  // "shown at" display time
+  WirelessConnectionEventType type = WirelessConnectionEventType::Associated;
+  bool confident = true;             // false for state_unknown / uncertain steps
+  std::string source;                // "carrier" / "presence" / "ap_identity"
+  std::string interface_name;        // kernel name at event time
+  WirelessAssociation previous_association = WirelessAssociation::Unknown;
+  WirelessAssociation new_association = WirelessAssociation::Unknown;
+  std::optional<double> previous_signal_dbm;
+  std::optional<double> new_signal_dbm;
+  std::optional<double> previous_frequency_mhz;
+  std::optional<double> new_frequency_mhz;
+  std::optional<int> previous_channel;
+  std::optional<int> new_channel;
+  bool ap_fingerprint_changed = false;  // roaming: reliable AP identity changed
+  bool ap_identity_reliable = false;    // whether AP identity was reliable
+};
+
+/// Upper bound on the retained connection-event history per interface.
+inline constexpr std::size_t kMaxWirelessConnectionEvents = 64;
+
+/// How many consecutive ticks a candidate state must persist before it is
+/// committed (and hence appears in the history, UI, alerts and exports). A
+/// flapping state that never persists this long is ignored entirely.
+inline constexpr unsigned kWirelessConnectionDebounceTicks = 2;
+
+/// Longest gap between observations (wall clock) before the tracker treats the
+/// history as discontinuous (e.g. after suspend/resume) and silently
+/// rebaselines without emitting an event. wall-clock gaps are used because the
+/// steady clock stops on many platforms during suspension.
+inline constexpr std::chrono::seconds kWirelessConnectionResetGap{30};
+
+/// Per-interface connection-event tracking state (debouncing and baselines).
+/// Not a user-facing value: it only drives when a connection event is
+/// announced. Moved along with the record so a renamed interface keeps its
+/// event continuity.
+struct WirelessConnectionTracker {
+  WirelessObservation confirmed;          // last committed observation
+  bool confirmed_valid = false;           // a baseline has been established
+  bool has_been_associated = false;       // this record has ever been associated
+
+  // Confirmation-window candidate (debounce).
+  bool pending_valid = false;
+  WirelessObservation pending;
+  unsigned pending_remaining = 0;         // consecutive ticks left to confirm
+
+  std::chrono::system_clock::time_point last_observation_wall{};
+};
+
+/// Two observations describe the same lifecycle connection state when their
+/// identity presence and carrier-derived association match. Signal/quality/
+/// frequency changes alone never constitute a state change; a reliably
+/// reported AP-identity handoff (while associated) is a state change.
+[[nodiscard]] bool sameWirelessConnectionState(const WirelessObservation &a,
+                                               const WirelessObservation &b);
+
+/// Classifies the committed change from `before` to `after`. Pure and
+/// deterministic: no I/O, no global state. Returns std::nullopt for no change
+/// (signal/frequency only). `has_been_associated` decides Associated vs
+/// Reconnected.
+[[nodiscard]] std::optional<WirelessConnectionEventType>
+classifyWirelessConnectionChange(const WirelessObservation &before,
+                                 const WirelessObservation &after,
+                                 bool has_been_associated);
+
+/// Stable, lowercase, human-readable type name shared by the UI and exports:
+/// "associated"/"disassociated"/"reconnected"/"roamed"/"interface unavailable"/
+/// "interface available"/"state unknown".
+[[nodiscard]] const char *wirelessConnectionEventTypeName(
+    WirelessConnectionEventType type);
+
+/// One-way (FNV-1a) digest of an opaque AP identity string (e.g. a BSSID).
+/// Raw identities are never stored or exported — only this digest is ever
+/// compared, so roaming can be detected without recording identifying data.
+[[nodiscard]] std::uint64_t wirelessApFingerprint(std::string_view identity);
+
+/// Advances one interface's connection-event state machine with this tick's
+/// observation: applies the confirmation debounce and the suspend/long-gap
+/// rebaseline, returns the committed event (if any) and mutates `tracker` in
+/// place. Pure and deterministic: the same tracker + observation/timestamp
+/// sequence always yields the same event stream.
+[[nodiscard]] std::optional<WirelessConnectionEvent>
+advanceWirelessConnectionTracker(
+    WirelessConnectionTracker &tracker, const WirelessObservation &observation,
+    std::chrono::steady_clock::time_point now,
+    std::chrono::system_clock::time_point wall_clock,
+    const std::string &interface_name,
+    unsigned debounce_ticks = kWirelessConnectionDebounceTicks,
+    std::chrono::seconds reset_gap = kWirelessConnectionResetGap);
+
+/// Compact human-readable description of one connection event for the UI
+/// (e.g. "disassociated  wlan0  associated -> disconnected  signal -42 dBm ->
+/// -45 dBm"). Pure ASCII, never contains '|' or a line break.
+[[nodiscard]] std::string describeWirelessConnectionEvent(
+    const WirelessConnectionEvent &event);
 
 /// One interface's tracked wireless status. The static PHY fields come from the
 /// cached probe; the dynamic fields (link quality, signal, noise, association,
@@ -175,14 +295,15 @@ struct NetworkWirelessInfo {
   // honest. The ring is cleared when the identity stops being wireless.
   ResourceHistory<WirelessHistorySample> history{0};
 
-  // Bounded association-transition events (newest last), deduplicated: events
-  // fire only when the association state actually changes.
-  ResourceHistory<WirelessTransitionEvent> transitions{0};
+  // Bounded connection-event history (newest last): association changes,
+  // reconnections, roaming, availability transitions and unknown-state events,
+  // deduplicated and debounced (Step 51).
+  ResourceHistory<WirelessConnectionEvent> connection_events{0};
 
-  // Association of the most recent recorded history sample. Transitions are
-  // recorded only when this changes, never on repeated same-state ticks, and
-  // the very first sample establishes the baseline silently.
-  WirelessAssociation last_recorded_association = WirelessAssociation::Unknown;
+  // Drives which events (if any) are announced each tick. Kept with the record
+  // so a renamed interface keeps its event continuity; reset whenever the
+  // identity stops being wireless.
+  WirelessConnectionTracker connection_tracker;
 
   // Wall clock captured when the newest history sample was recorded. The
   // exported wireless-history timestamps are anchored to this time the same way
@@ -207,7 +328,7 @@ struct WirelessHistorySummary {
   double valid_coverage = 0.0;       // valid_sample_count / retention bound
   bool history_complete = false;     // sample_count >= retention bound
   double span_seconds = 0.0;         // newest - oldest sample span
-  std::size_t transition_count = 0;  // association changes across the history
+  std::size_t event_count = 0;       // connection events across the history
 
   // Signal (dBm). Per-metric statistics include only samples that carried a
   // value; invalid/gap ticks contribute nothing.
@@ -306,28 +427,37 @@ inline constexpr std::chrono::seconds kWirelessRereadInterval{10};
 /// recreated interface (new ifindex) naturally starts a fresh record instead of
 /// inheriting an old one's values.
 ///
-/// Limitations (see Step 49/50 scope): SSID and BSSID are not available
+/// Limitations (see Step 49/50/51 scope): SSID and BSSID are not available
 /// through sysfs or /proc/net/wireless (they require the nl80211 netlink API),
-/// so they are intentionally absent. The negotiated bitrate, centre frequency
-/// and channel are likewise not exposed by those native sources and therefore
-/// stay unknown (nullopt) in production — the history model carries them so the
-/// export/summary machinery is complete and deterministically testable.
-/// Signal-worthiness alerting is out of scope: the existing network-traffic
-/// alert engine is limited to traffic-series rules, and adding wireless rules
-/// there would require an alert-engine redesign, so this monitor does not emit
-/// alerts.
+/// so they are intentionally absent (only one-way fingerprints of the AP
+/// identity are ever compared, and only booleans are displayed/exported). The
+/// negotiated bitrate, centre frequency and channel are likewise not exposed by
+/// those native sources and therefore stay unknown (nullopt) in production —
+/// the history/event model carries them so the export/summary machinery is
+/// complete and deterministically testable. Because no native source exposes an
+/// AP identity, a Roamed event is never produced in production; the detection
+/// logic is exercised end-to-end through the pure classifier/tracker functions.
+/// Connection events (disconnect/reconnect/availability) are forwarded to the
+/// central AlertManager and the desktop-notification sink; roaming is by design
+/// never notified.
 class NetworkWirelessMonitor {
  public:
   static constexpr std::size_t kMaxTrackedWirelessInterfaces = 64;
 
   explicit NetworkWirelessMonitor(
-      std::filesystem::path root = "/",
+      AlertManager &alerts, std::filesystem::path root = "/",
       std::chrono::milliseconds reread_interval = kWirelessRereadInterval,
       std::size_t history_max_samples = kDefaultInterfaceHistorySamples);
 
   NetworkWirelessMonitor(const NetworkWirelessMonitor &) = delete;
   NetworkWirelessMonitor &operator=(const NetworkWirelessMonitor &) = delete;
   ~NetworkWirelessMonitor() = default;
+
+  /// Desktop-notification delivery callback; invoked for connection events
+  /// worth surfacing. NotificationManager still applies the global settings
+  /// and its own per-source cooldown. Roaming events never reach the sink.
+  using EventSink = void (*)(const AlertEvent &);
+  void setEventSink(EventSink sink) { event_sink_ = sink; }
 
   /// Processes one discovery snapshot (produced by NetworkInterfaceMonitor).
   void update(const NetworkInterfaceSnapshot &snapshot);
@@ -342,7 +472,7 @@ class NetworkWirelessMonitor {
     return tracked_;
   }
 
-  /// The wireless sample history (incl. transitions) for an identity;
+  /// The wireless sample history (incl. connection events) for an identity;
   /// nullptr when never seen.
   [[nodiscard]] const ResourceHistory<WirelessHistorySample> *wirelessHistory(
       const std::string &identity) const;
@@ -353,12 +483,16 @@ class NetworkWirelessMonitor {
   void reset();
 
  private:
+  AlertManager &alerts_;
   std::filesystem::path root_;
   std::chrono::milliseconds reread_interval_;
   std::size_t history_max_samples_;
+  EventSink event_sink_ = nullptr;
   std::unordered_map<std::string, NetworkWirelessInfo> tracked_;
 
   void evictOverflow();
+  void recordConnectionEvent(const NetworkWirelessInfo &wireless,
+                             const WirelessConnectionEvent &event);
 };
 
 }  // namespace atm

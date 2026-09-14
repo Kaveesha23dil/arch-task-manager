@@ -146,6 +146,31 @@ struct NetworkTrafficExportWirelessRow {
   std::optional<int> channel;
 };
 
+/// One exported wireless connection event (Step 51). Mirrors the live
+/// WirelessConnectionEvent: the wall-clock display time, the stable lowercase
+/// event name, the confidence flag, the carrier/presence source and — for
+/// transitions between associations — the before/after association, signal,
+/// frequency and channel. Access-point identity is never exported: only the
+/// two booleans (fingerprint changed while an identity was reliably reported)
+/// describe a roam.
+struct NetworkTrafficExportWirelessEvent {
+  std::string timestamp_iso8601;   // wall-clock display time ("" when unknown)
+  std::string interface_name;
+  std::string event;               // wirelessConnectionEventTypeName()
+  bool confident = false;
+  std::string source;              // "carrier" / "presence" / "ap_identity"
+  std::string previous_association;  // wirelessAssociationName()
+  std::string new_association;
+  std::optional<double> previous_signal_dbm;
+  std::optional<double> new_signal_dbm;
+  std::optional<double> previous_frequency_mhz;
+  std::optional<double> new_frequency_mhz;
+  std::optional<int> previous_channel;
+  std::optional<int> new_channel;
+  bool access_point_changed = false;  // roam flagged an AP fingerprint change
+  bool access_point_reliable = false; // the AP identity was reliably reported
+};
+
 /// Wireless history (summary + per-sample rows) captured into an export
 /// snapshot. Only present when the selected interface is wireless and its
 /// history ring holds recorded samples. The numbers match — and never exceed —
@@ -170,6 +195,12 @@ struct NetworkTrafficExportWirelessHistory {
 
   std::chrono::system_clock::time_point last_update{};
   std::vector<NetworkTrafficExportWirelessRow> samples;  // ascending order
+
+  // Connection events (Step 51). Like the traffic rows these are anchored to
+  // the wireless history's newest sample; every event in the ring is exported
+  // (the ring is bounded at kMaxWirelessConnectionEvents). Only the boolean
+  // AP-change/guarantee flags travel through the export, never AP identity.
+  std::vector<NetworkTrafficExportWirelessEvent> events;  // ascending order
 };
 
 /// Implementation-free, immutable snapshot of one traffic series ready for

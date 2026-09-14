@@ -106,6 +106,33 @@ bool arphrdIsIeee80211(unsigned arphrd) {
          arphrd == 804u || arphrd == 805u;
 }
 
+/// Builds this tick's connection-event observation from a wireless record.
+/// Frequency / channel / AP identity are not exposed by the approved native
+/// sources (sysfs, /proc/net/wireless), so they always stay nullopt/unreliable
+/// in production — roaming is thereby never falsely reported.
+WirelessObservation makeWirelessObservation(const NetworkWirelessInfo &wireless,
+                                            bool present) {
+  WirelessObservation observation;
+  observation.present = present;
+  observation.wireless =
+      present && wireless.presence == WirelessPresence::Wireless;
+  observation.association = wireless.association;
+  if (wireless.signal_dbm.has_value()) {
+    observation.signal_dbm = static_cast<double>(*wireless.signal_dbm);
+  }
+  return observation;
+}
+
+/// The observation describing an interface that has vanished from the
+/// discovery snapshot this tick.
+WirelessObservation makeGoneObservation() {
+  WirelessObservation observation;
+  observation.present = false;
+  observation.wireless = false;
+  observation.association = WirelessAssociation::Unknown;
+  return observation;
+}
+
 }  // namespace
 
 const char *wirelessPresenceName(WirelessPresence presence) {
@@ -556,7 +583,7 @@ WirelessHistorySummary summarizeWirelessHistory(const NetworkWirelessInfo &wirel
       std::chrono::duration<double>(samples.back().timestamp -
                                     samples.front().timestamp)
           .count();
-  summary.transition_count = wireless.transitions.size();
+  summary.event_count = wireless.connection_events.size();
   summary.last_update = wireless.last_sample_wall;
   return summary;
 }
@@ -601,10 +628,305 @@ std::string describeWirelessLine(const NetworkWirelessInfo &wireless) {
   return line;
 }
 
+/// True when the two observations represent the same lifecycle connection
+/// state: same identity presence, same carrier-derived association, and — while
+/// associated with a reliably reported AP identity — the same access point.
+/// Signal/quality/frequency changes alone never constitute a state change.
+bool sameWirelessConnectionState(const WirelessObservation &a,
+                                 const WirelessObservation &b) {
+  if (a.present != b.present) {
+    return false;
+  }
+  if (!a.present) {
+    return true;  // both gone: association values are irrelevant
+  }
+  if (a.association != b.association) {
+    return false;
+  }
+  if (a.association == WirelessAssociation::Associated &&
+      a.ap_identity_reliable && b.ap_identity_reliable) {
+    return a.ap_fingerprint == b.ap_fingerprint;
+  }
+  return true;
+}
+
+std::optional<WirelessConnectionEventType> classifyWirelessConnectionChange(
+    const WirelessObservation &before, const WirelessObservation &after,
+    bool has_been_associated) {
+  if (!before.present && !after.present) {
+    return std::nullopt;
+  }
+  if (!before.present && after.present) {
+    return WirelessConnectionEventType::InterfaceAvailable;
+  }
+  if (before.present && !after.present) {
+    return WirelessConnectionEventType::InterfaceUnavailable;
+  }
+
+  if (before.association == after.association) {
+    // Only a reliably reported AP handoff is a roam; identical associations
+    // with signal/frequency changes (or an unreliable AP identity) never are.
+    if (before.association == WirelessAssociation::Associated &&
+        before.ap_identity_reliable && after.ap_identity_reliable &&
+        before.ap_fingerprint.has_value() && after.ap_fingerprint.has_value() &&
+        *before.ap_fingerprint != *after.ap_fingerprint) {
+      return WirelessConnectionEventType::Roamed;
+    }
+    return std::nullopt;
+  }
+
+  switch (after.association) {
+    case WirelessAssociation::Associated:
+      return has_been_associated
+                 ? WirelessConnectionEventType::Reconnected
+                 : WirelessConnectionEventType::Associated;
+    case WirelessAssociation::Disconnected:
+      return WirelessConnectionEventType::Disassociated;
+    case WirelessAssociation::Unknown:
+      return WirelessConnectionEventType::StateUnknown;
+    case WirelessAssociation::Unavailable:
+      return WirelessConnectionEventType::InterfaceUnavailable;
+  }
+  return std::nullopt;
+}
+
+const char *wirelessConnectionEventTypeName(WirelessConnectionEventType type) {
+  switch (type) {
+    case WirelessConnectionEventType::Associated:
+      return "associated";
+    case WirelessConnectionEventType::Disassociated:
+      return "disassociated";
+    case WirelessConnectionEventType::Reconnected:
+      return "reconnected";
+    case WirelessConnectionEventType::Roamed:
+      return "roamed";
+    case WirelessConnectionEventType::InterfaceUnavailable:
+      return "interface unavailable";
+    case WirelessConnectionEventType::InterfaceAvailable:
+      return "interface available";
+    case WirelessConnectionEventType::StateUnknown:
+      return "state unknown";
+  }
+  return "unknown";
+}
+
+std::uint64_t wirelessApFingerprint(std::string_view identity) {
+  std::uint64_t hash = 14695981039346656037ULL;
+  for (unsigned char ch : identity) {
+    hash ^= static_cast<std::uint64_t>(ch);
+    hash *= 1099511628211ULL;
+  }
+  return hash;
+}
+
+/// Builds the committed event for a confirmed change. Pure: consumes only the
+/// confirmed "before" observation, the new "after" observation and the type.
+WirelessConnectionEvent makeWirelessConnectionEvent(
+    WirelessConnectionEventType type, const WirelessObservation &before,
+    const WirelessObservation &after, std::chrono::steady_clock::time_point now,
+    std::chrono::system_clock::time_point wall_clock,
+    const std::string &interface_name) {
+  WirelessConnectionEvent event;
+  event.timestamp = now;
+  event.wall_clock = wall_clock;
+  event.type = type;
+  event.interface_name = interface_name;
+
+  // A vanished interface presents no association; "unavailable" is the honest
+  // reading for both its previous and its new association slot.
+  event.previous_association =
+      before.present ? before.association : WirelessAssociation::Unavailable;
+  event.new_association =
+      after.present ? after.association : WirelessAssociation::Unavailable;
+
+  event.previous_signal_dbm = before.signal_dbm;
+  event.new_signal_dbm = after.signal_dbm;
+  event.previous_frequency_mhz = before.frequency_mhz;
+  event.new_frequency_mhz = after.frequency_mhz;
+  event.previous_channel = before.channel;
+  event.new_channel = after.channel;
+
+  event.ap_identity_reliable = after.ap_identity_reliable;
+  event.ap_fingerprint_changed =
+      type == WirelessConnectionEventType::Roamed &&
+      before.ap_identity_reliable && after.ap_identity_reliable &&
+      before.ap_fingerprint.has_value() && after.ap_fingerprint.has_value() &&
+      *before.ap_fingerprint != *after.ap_fingerprint;
+
+  switch (type) {
+    case WirelessConnectionEventType::InterfaceAvailable:
+    case WirelessConnectionEventType::InterfaceUnavailable:
+    case WirelessConnectionEventType::Roamed:
+      event.confident = true;
+      event.source = type == WirelessConnectionEventType::Roamed ? "ap_identity"
+                                                                 : "presence";
+      break;
+    case WirelessConnectionEventType::StateUnknown:
+      event.confident = false;
+      event.source = "carrier";
+      break;
+    case WirelessConnectionEventType::Associated:
+    case WirelessConnectionEventType::Reconnected:
+    case WirelessConnectionEventType::Disassociated:
+      event.confident =
+          before.association != WirelessAssociation::Unknown &&
+          before.association != WirelessAssociation::Unavailable;
+      event.source = "carrier";
+      break;
+  }
+  return event;
+}
+
+std::optional<WirelessConnectionEvent> advanceWirelessConnectionTracker(
+    WirelessConnectionTracker &tracker, const WirelessObservation &observation,
+    std::chrono::steady_clock::time_point now,
+    std::chrono::system_clock::time_point wall_clock,
+    const std::string &interface_name, unsigned debounce_ticks,
+    std::chrono::seconds reset_gap) {
+  // Suspend / long-gap rebaseline: after a wall-clock jump (suspension) or a
+  // long monitoring gap the connection continuity cannot be trusted, so the
+  // tracker silently adopts the current observation instead of emitting a
+  // burst of spurious events.
+  if (tracker.last_observation_wall != std::chrono::system_clock::time_point{}) {
+    const auto elapsed = wall_clock - tracker.last_observation_wall;
+    if (elapsed > reset_gap) {
+      tracker.confirmed = observation;
+      tracker.confirmed_valid = true;
+      tracker.pending_valid = false;
+      tracker.has_been_associated =
+          observation.present &&
+          observation.association == WirelessAssociation::Associated;
+      tracker.last_observation_wall = wall_clock;
+      return std::nullopt;
+    }
+  }
+
+  // First observation absorbed for this record: establish the baseline and the
+  // "has ever been associated" fact silently.
+  if (!tracker.confirmed_valid) {
+    tracker.confirmed = observation;
+    tracker.confirmed_valid = true;
+    tracker.has_been_associated =
+        observation.present &&
+        observation.association == WirelessAssociation::Associated;
+    tracker.last_observation_wall = wall_clock;
+    return std::nullopt;
+  }
+
+  const auto commit = [&] {
+    const WirelessObservation before = tracker.confirmed;
+    const std::optional<WirelessConnectionEventType> type =
+        classifyWirelessConnectionChange(before, observation,
+                                         tracker.has_been_associated);
+    if (observation.present &&
+        observation.association == WirelessAssociation::Associated) {
+      tracker.has_been_associated = true;
+    }
+    tracker.confirmed = observation;
+    tracker.pending_valid = false;
+    tracker.last_observation_wall = wall_clock;
+    if (!type.has_value()) {
+      return std::optional<WirelessConnectionEvent>{};
+    }
+    return std::optional<WirelessConnectionEvent>(makeWirelessConnectionEvent(
+        *type, before, observation, now, wall_clock, interface_name));
+  };
+
+  // A change is announced only after the new state has been observed for
+  // `debounce_ticks` consecutive ticks (0 = announce on the first differing
+  // tick). `pending_remaining` counts the additional matching observations
+  // still required after the current one: the candidate's first observation
+  // already counts, so it starts at debounce_ticks - 1 and is decremented on
+  // each consecutive matching tick, committing when it reaches 0.
+  auto openWindow = [&]() -> std::optional<WirelessConnectionEvent> {
+    tracker.pending = observation;
+    tracker.pending_valid = true;
+    tracker.pending_remaining = debounce_ticks > 0 ? debounce_ticks - 1 : 0;
+    tracker.last_observation_wall = wall_clock;
+    return tracker.pending_remaining == 0 ? commit()
+                                          : std::optional<WirelessConnectionEvent>{};
+  };
+  auto extendWindow = [&]() -> std::optional<WirelessConnectionEvent> {
+    --tracker.pending_remaining;
+    tracker.last_observation_wall = wall_clock;
+    return tracker.pending_remaining == 0 ? commit()
+                                          : std::optional<WirelessConnectionEvent>{};
+  };
+
+  if (sameWirelessConnectionState(tracker.confirmed, observation)) {
+    tracker.pending_valid = false;  // a transient blip reverted: discard it
+    tracker.last_observation_wall = wall_clock;
+    return std::nullopt;
+  }
+
+  if (tracker.pending_valid &&
+      sameWirelessConnectionState(tracker.pending, observation)) {
+    return extendWindow();
+  }
+
+  // A new, different candidate opens (or restarts) the confirmation window.
+  return openWindow();
+}
+
+/// Local formatter for an optional signed number with up to one decimal place
+/// (used for the dBm / MHz hints in the event description).
+std::string formatOptionalDbmLike(const std::optional<double> &value) {
+  if (!value.has_value()) {
+    return "n/a";
+  }
+  const double v = *value;
+  if (std::trunc(v) == v) {
+    return std::to_string(static_cast<long long>(v));
+  }
+  std::ostringstream out;
+  out << std::fixed << std::setprecision(1) << v;
+  return out.str();
+}
+
+std::string describeWirelessConnectionEvent(const WirelessConnectionEvent &event) {
+  std::string line = wirelessConnectionEventTypeName(event.type);
+  if (!event.interface_name.empty()) {
+    line += "  " + event.interface_name;
+  }
+  if (event.previous_association != event.new_association) {
+    line += "  ";
+    line += wirelessAssociationName(event.previous_association);
+    line += " -> ";
+    line += wirelessAssociationName(event.new_association);
+  } else if (event.type == WirelessConnectionEventType::Roamed) {
+    line += "  access point changed";
+  }
+
+  std::vector<std::string> hints;
+  if (event.previous_signal_dbm.has_value() || event.new_signal_dbm.has_value()) {
+    hints.push_back("signal " + formatOptionalDbmLike(event.previous_signal_dbm) +
+                    " -> " + formatOptionalDbmLike(event.new_signal_dbm) + " dBm");
+  }
+  if (event.previous_frequency_mhz.has_value() ||
+      event.new_frequency_mhz.has_value()) {
+    hints.push_back("freq " + formatOptionalDbmLike(event.previous_frequency_mhz) +
+                    " -> " + formatOptionalDbmLike(event.new_frequency_mhz) +
+                    " MHz");
+  }
+  if (event.previous_channel.has_value() || event.new_channel.has_value()) {
+    hints.push_back(
+        "channel " + formatWirelessChannel(event.previous_channel) + " -> " +
+        formatWirelessChannel(event.new_channel));
+  }
+  for (const std::string &hint : hints) {
+    line += "  " + hint;
+  }
+  if (!event.confident) {
+    line += "  (low confidence)";
+  }
+  return line;
+}
+
 NetworkWirelessMonitor::NetworkWirelessMonitor(
-    std::filesystem::path root, std::chrono::milliseconds reread_interval,
-    std::size_t history_max_samples)
-    : root_(std::move(root)),
+    AlertManager &alerts, std::filesystem::path root,
+    std::chrono::milliseconds reread_interval, std::size_t history_max_samples)
+    : alerts_(alerts),
+      root_(std::move(root)),
       reread_interval_(reread_interval),
       history_max_samples_(history_max_samples) {}
 
@@ -618,6 +940,48 @@ const ResourceHistory<WirelessHistorySample> *
 NetworkWirelessMonitor::wirelessHistory(const std::string &identity) const {
   const auto it = tracked_.find(identity);
   return it == tracked_.end() ? nullptr : &it->second.history;
+}
+
+void NetworkWirelessMonitor::recordConnectionEvent(
+    const NetworkWirelessInfo &wireless,
+    const WirelessConnectionEvent &event) {
+  // Roaming is by design never notified (and, being Normal non-recovery, never
+  // transitions the per-source severity), so only carrier/presence changes
+  // reach the alert/notification path. The NotificationManager still applies
+  // the device-wide settings and its own per-source cooldown.
+  if (event.type == WirelessConnectionEventType::Roamed) {
+    return;
+  }
+  AlertSeverity severity = AlertSeverity::Normal;
+  bool is_recovery = false;
+  switch (event.type) {
+    case WirelessConnectionEventType::Associated:
+    case WirelessConnectionEventType::Reconnected:
+    case WirelessConnectionEventType::InterfaceAvailable:
+      is_recovery = true;
+      break;
+    case WirelessConnectionEventType::Disassociated:
+    case WirelessConnectionEventType::InterfaceUnavailable:
+    case WirelessConnectionEventType::StateUnknown:
+      severity = AlertSeverity::Warning;
+      break;
+    case WirelessConnectionEventType::Roamed:
+      return;
+  }
+  AlertEvent alert;
+  alert.type = AlertType::WirelessConnectionChanged;
+  alert.severity = severity;
+  alert.source = wireless.identity;
+  alert.value = 0.0;
+  alert.threshold = 0.0;
+  alert.is_recovery = is_recovery;
+  alert.message = describeWirelessConnectionEvent(event);
+  alert.timestamp = event.wall_clock;
+  alerts_.recordRuleEvent(alert.type, alert.source, alert.severity, alert.value,
+                          alert.threshold, alert.message);
+  if (event_sink_ != nullptr) {
+    event_sink_(alert);
+  }
 }
 
 void NetworkWirelessMonitor::update(const NetworkInterfaceSnapshot &snapshot) {
@@ -653,8 +1017,8 @@ void NetworkWirelessMonitor::update(const NetworkInterfaceSnapshot &snapshot) {
       base.identity = identity;
       base.first_seen = now;
       base.history = ResourceHistory<WirelessHistorySample>(history_max_samples_);
-      base.transitions =
-          ResourceHistory<WirelessTransitionEvent>(kMaxWirelessTransitions);
+      base.connection_events =
+          ResourceHistory<WirelessConnectionEvent>(kMaxWirelessConnectionEvents);
     } else {
       base = it->second;  // preserves PHY fields and history across renames
     }
@@ -720,76 +1084,94 @@ void NetworkWirelessMonitor::update(const NetworkInterfaceSnapshot &snapshot) {
 
     // One self-contained wireless sample per tick (never more, never on the
     // render path). A sample is recorded for EVERY present wireless interface
-    // regardless of value availability so association, coverage and honest gaps
-    // are tracked; unavailable metrics stay nullopt (never a fabricated zero),
-    // and an unavailable/stale tick is marked invalid — the preserved display
-    // values from judgeWireless() are NOT copied into the history.
-    if (next.presence == WirelessPresence::Wireless) {
-      WirelessHistorySample sample;
-      sample.timestamp = now;
-      sample.association = next.association;
-      sample.is_mac80211 = next.is_mac80211;
-      if (next.field_state == WirelessFieldState::Available) {
-        sample.valid = true;
-        if (next.signal_dbm.has_value()) {
-          sample.signal_dbm = static_cast<double>(*next.signal_dbm);
+    // regardless of value availability so association, coverage and honest
+    // gaps are tracked; unavailable metrics stay nullopt (never a fabricated
+    // zero), and an unavailable/stale tick is marked invalid — the preserved
+    // display values from judgeWireless() are NOT copied into the history.
+      if (next.presence == WirelessPresence::Wireless) {
+        WirelessHistorySample sample;
+        sample.timestamp = now;
+        sample.association = next.association;
+        sample.is_mac80211 = next.is_mac80211;
+        if (next.field_state == WirelessFieldState::Available) {
+          sample.valid = true;
+          if (next.signal_dbm.has_value()) {
+            sample.signal_dbm = static_cast<double>(*next.signal_dbm);
+          }
+          if (next.link_quality.has_value()) {
+            sample.link_quality = *next.link_quality;
+          }
+          // Bitrate / frequency / channel are not exposed by the approved
+          // native sources (sysfs, /proc/net/wireless) and therefore stay
+          // unavailable here; the sample carries the fields so the
+          // export/summary/test machinery is complete and deterministic.
         }
-        if (next.link_quality.has_value()) {
-          sample.link_quality = *next.link_quality;
+
+        next.history.addSample(std::move(sample));
+        next.last_sample_wall = snapshot.refreshed_at;
+
+        // Connection-event state machine (Step 51): feeds one observation per
+        // tick. A confirmed (debounced, deduplicated) change becomes a bounded
+        // connection event and — for carrier/presence changes — an alert
+        // record plus an optional desktop notification.
+        WirelessObservation observation = makeWirelessObservation(next, true);
+        if (std::optional<WirelessConnectionEvent> event =
+                advanceWirelessConnectionTracker(
+                    next.connection_tracker, observation, now,
+                    snapshot.refreshed_at, next.name);
+            event.has_value()) {
+          next.connection_events.addSample(*event);
+          recordConnectionEvent(next, *event);
         }
-        // Bitrate / frequency / channel are not exposed by the approved native
-        // sources (sysfs, /proc/net/wireless) and therefore stay unavailable
-        // here; the sample carries the fields so the export/summary/test
-        // machinery is complete and deterministic.
+      } else {
+        next.history.clear();
+        next.connection_events.clear();
+        next.connection_tracker = WirelessConnectionTracker{};
+        next.last_sample_wall = {};
+        // The identity is no longer managed by this monitor; a lingering
+        // wireless alert (e.g. from a recent disconnect) must not stay active.
+        alerts_.clearSubject(AlertType::WirelessConnectionChanged, identity);
       }
 
-      // Association transitions: recorded only when the state actually
-      // changed, so repeated same-state ticks never spam the event log. The
-      // first sample establishes the baseline silently (no "unknown ->" event).
-      const bool baseline =
-          next.transitions.empty() &&
-          next.last_recorded_association == WirelessAssociation::Unknown;
-      if (baseline) {
-        next.last_recorded_association = next.association;
-      } else if (next.last_recorded_association != next.association) {
-        next.transitions.addSample(WirelessTransitionEvent{
-            now, snapshot.refreshed_at, next.last_recorded_association,
-            next.association});
-        next.last_recorded_association = next.association;
-      }
-
-      next.history.addSample(std::move(sample));
-      next.last_sample_wall = snapshot.refreshed_at;
-    } else {
-      next.history.clear();
-      next.transitions.clear();
-      next.last_recorded_association = WirelessAssociation::Unknown;
-      next.last_sample_wall = {};
+      next.last_read = snapshot.refreshed_at;
+      next.present = true;
+      tracked_[identity] = std::move(next);
     }
 
-    next.last_read = snapshot.refreshed_at;
-    next.present = true;
-    tracked_[identity] = std::move(next);
-  }
-
-  // Identities that are no longer discovered are kept but marked gone so a
-  // temporary removal is not misreported and a recreated interface (new
-  // ifindex) naturally starts a fresh record instead of inheriting an old one.
-  for (auto &kv : tracked_) {
-    if (std::find(present.begin(), present.end(), kv.first) == present.end()) {
+    // Identities that are no longer discovered are kept, marked gone, and fed
+    // to the connection-event state machine (debounced: the interface must stay
+    // gone for the confirmation window before an "interface unavailable" event
+    // is announced, and a reappearance rebuilds an "interface available" event).
+    // A recreated interface (new ifindex) naturally starts a fresh record
+    // instead of inheriting an old one.
+    for (auto &kv : tracked_) {
+      if (std::find(present.begin(), present.end(), kv.first) != present.end()) {
+        continue;
+      }
+      if (!kv.second.present) {
+        continue;
+      }
       kv.second.present = false;
+      const WirelessObservation gone = makeGoneObservation();
+      if (std::optional<WirelessConnectionEvent> event =
+              advanceWirelessConnectionTracker(
+                  kv.second.connection_tracker, gone, now,
+                  snapshot.refreshed_at, kv.second.name);
+          event.has_value()) {
+        kv.second.connection_events.addSample(*event);
+        recordConnectionEvent(kv.second, *event);
+      }
     }
-  }
 
-  evictOverflow();
-}
+    evictOverflow();
+  }
 
 void NetworkWirelessMonitor::setHistoryMaxSamples(std::size_t max_samples) {
   history_max_samples_ = max_samples;
   for (auto &kv : tracked_) {
     kv.second.history = ResourceHistory<WirelessHistorySample>(max_samples);
-    kv.second.transitions =
-        ResourceHistory<WirelessTransitionEvent>(kMaxWirelessTransitions);
+    kv.second.connection_events =
+        ResourceHistory<WirelessConnectionEvent>(kMaxWirelessConnectionEvents);
   }
 }
 
@@ -815,6 +1197,9 @@ void NetworkWirelessMonitor::evictOverflow() {
     if (excess == 0) {
       break;
     }
+    // A gone entry with an active warning (e.g. interface unplugged) must not
+    // leave a stale active alert behind once its record is evicted.
+    alerts_.clearSubject(AlertType::WirelessConnectionChanged, identity);
     tracked_.erase(identity);
     --excess;
   }

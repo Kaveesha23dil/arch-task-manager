@@ -12,6 +12,10 @@
 #include "network_interface_details.hpp"
 #include "network_link_state.hpp"
 
+// One shared AlertManager for every monitor constructed in these tests
+// (NetworkWirelessMonitor requires the alert history it records into).
+atm::AlertManager g_wireless_alerts;
+
 // --- Minimal standalone test harness (no external framework) -------------
 namespace {
 int g_checks = 0;
@@ -94,8 +98,15 @@ NetworkInterfaceInfo makeInfo(const std::string &name, int ifindex,
 
 NetworkInterfaceSnapshot makeSnapshot(
     const std::vector<NetworkInterfaceInfo> &interfaces) {
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wmaybe-uninitialized"
+#endif
   NetworkInterfaceSnapshot snapshot;
   snapshot.interfaces = interfaces;
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
   snapshot.sysfs_readable = true;
   snapshot.addresses_readable = true;
   snapshot.error = atm::NetworkInterfaceError::None;
@@ -439,7 +450,7 @@ void test_monitor_lifecycle() {
   std::filesystem::remove_all(root);
   makeWirelessTree(root, "wlan0");
 
-  NetworkWirelessMonitor monitor(root, std::chrono::seconds(60), 8);
+  NetworkWirelessMonitor monitor(g_wireless_alerts, root, std::chrono::seconds(60), 8);
 
   NetworkInterfaceInfo wlan = makeInfo("wlan0", 30, NetworkInterfaceType::Wifi);
   wlan.link.link_type = 801u;
@@ -525,7 +536,7 @@ void test_monitor_global_unreadable() {
   std::filesystem::remove_all(root);
   makeWirelessTree(root, "wlan0");
 
-  NetworkWirelessMonitor monitor(root, std::chrono::seconds(60), 8);
+  NetworkWirelessMonitor monitor(g_wireless_alerts, root, std::chrono::seconds(60), 8);
   NetworkInterfaceInfo wlan = makeInfo("wlan0", 40, NetworkInterfaceType::Wifi);
   wlan.link.link_type = 801u;
   wlan.wireless.present = true;
@@ -569,7 +580,7 @@ void test_monitor_proc_fallback_and_eviction() {
             "Inter-| sta-|   Quality  |   Discarded packets    | Missed | WE\n"
             " wlan0    0000  54.  -50.  -100.  0  0  0  0  0  0  0  54\n");
 
-  NetworkWirelessMonitor monitor(root, std::chrono::seconds(60), 8);
+  NetworkWirelessMonitor monitor(g_wireless_alerts, root, std::chrono::seconds(60), 8);
   NetworkInterfaceInfo wlan = makeInfo("wlan0", 50, NetworkInterfaceType::Wifi);
   wlan.link.link_type = 801u;
   monitor.update(makeSnapshot({wlan}));
@@ -584,7 +595,7 @@ void test_monitor_proc_fallback_and_eviction() {
 
   // Eviction: over the tracked bound, the oldest GONE identities are dropped
   // while live entries are never evicted.
-  NetworkWirelessMonitor eviction_monitor(root, std::chrono::seconds(60), 2);
+  NetworkWirelessMonitor eviction_monitor(g_wireless_alerts, root, std::chrono::seconds(60), 2);
   std::vector<NetworkInterfaceInfo> batch;
   for (int i = 0; i < 70; ++i) {
     NetworkInterfaceInfo iface = makeInfo(
@@ -624,7 +635,7 @@ void test_monitor_empty_wireless_dir_proc_fallback() {
             "Inter-| sta-|   Quality  |   Discarded packets    | Missed | WE\n"
             " wlan0    0000  65.  -45.  -256.  0  0  0  0  0  0  0  54\n");
 
-  NetworkWirelessMonitor monitor(root, std::chrono::seconds(60), 8);
+  NetworkWirelessMonitor monitor(g_wireless_alerts, root, std::chrono::seconds(60), 8);
   NetworkInterfaceInfo wlan = makeInfo("wlan0", 60, NetworkInterfaceType::Wifi);
   wlan.link.link_type = 801u;
   wlan.wireless.present = true;  // the /wireless directory exists, but empty
@@ -659,7 +670,7 @@ void test_reset_and_wireless_history_api() {
   std::filesystem::remove_all(root);
   makeWirelessTree(root, "wlan0");
 
-  NetworkWirelessMonitor monitor(root, std::chrono::seconds(60), 8);
+  NetworkWirelessMonitor monitor(g_wireless_alerts, root, std::chrono::seconds(60), 8);
   NetworkInterfaceInfo wlan = makeInfo("wlan0", 70, NetworkInterfaceType::Wifi);
   wlan.link.link_type = 801u;
   wlan.wireless.present = true;
@@ -690,7 +701,7 @@ void test_monitor_history_sampling_and_gaps() {
   std::filesystem::remove_all(root);
   makeWirelessTree(root, "wlan0");
 
-  NetworkWirelessMonitor monitor(root, std::chrono::seconds(60), 16);
+  NetworkWirelessMonitor monitor(g_wireless_alerts, root, std::chrono::seconds(60), 16);
   NetworkInterfaceInfo wlan = makeInfo("wlan0", 80, NetworkInterfaceType::Wifi);
   wlan.link.link_type = 801u;
   wlan.link.carrier = 1;
@@ -758,7 +769,7 @@ void test_monitor_non_wireless_clears_history() {
   std::filesystem::remove_all(root);
   makeWirelessTree(root, "wlan0");
 
-  NetworkWirelessMonitor monitor(root, std::chrono::seconds(60), 8);
+  NetworkWirelessMonitor monitor(g_wireless_alerts, root, std::chrono::seconds(60), 8);
   NetworkInterfaceInfo wlan = makeInfo("wlan0", 90, NetworkInterfaceType::Wifi);
   wlan.link.link_type = 801u;
   wlan.link.carrier = 1;
@@ -768,8 +779,8 @@ void test_monitor_non_wireless_clears_history() {
   CHECK(monitor.tracked(wlan.identity())->history.size() == 1);
 
   // The identity stops being wireless (here via a rename, which forces a fresh
-  // sysfs probe): history, transitions and the recorded association baseline
-  // all reset — nothing is carried into a non-wireless link.
+  // sysfs probe): history, connection events and the event state machine all
+  // reset — nothing is carried into a non-wireless link.
   wlan.name = "wlan0-nw";        // rename forces a re-probe of the new path
   wlan.link.link_type = 1u;      // ARPHRD_ETHER
   wlan.wireless.present = false;
@@ -778,62 +789,87 @@ void test_monitor_non_wireless_clears_history() {
   CHECK(w != nullptr);
   CHECK(w->presence == WirelessPresence::NotWireless);
   CHECK(w->history.empty());
-  CHECK(w->transitions.empty());
-  CHECK(w->last_recorded_association == WirelessAssociation::Unknown);
+  CHECK(w->connection_events.empty());
   CHECK(w->last_sample_wall == std::chrono::system_clock::time_point{});
 
   std::filesystem::remove_all(root);
 }
 
-void test_monitor_transitions() {
-  run("monitor association transitions");
+void test_monitor_connection_events() {
+  run("monitor debounced connection events");
 
   const std::filesystem::path root =
       std::filesystem::temp_directory_path() /
-      ("atm_wireless_trans_" + std::to_string(::getpid()));
+      ("atm_wireless_conn_" + std::to_string(::getpid()));
   std::filesystem::remove_all(root);
   makeWirelessTree(root, "wlan0");
 
-  NetworkWirelessMonitor monitor(root, std::chrono::seconds(60), 8);
+  atm::AlertManager alerts;
+  NetworkWirelessMonitor monitor(alerts, root, std::chrono::seconds(60), 8);
   NetworkInterfaceInfo wlan = makeInfo("wlan0", 100, NetworkInterfaceType::Wifi);
   wlan.link.link_type = 801u;
   wlan.wireless.present = true;
   wlan.wireless.level = -42;
 
-  // The first sample establishes the baseline silently: no "unknown ->" event.
+  // The first sample establishes the baseline silently: no "unknown ->" event
+  // is ever emitted for the initial association.
   wlan.link.carrier = 1;
   monitor.update(makeSnapshot({wlan}));
   const NetworkWirelessInfo *w = monitor.tracked(wlan.identity());
   CHECK(w->association == WirelessAssociation::Associated);
-  CHECK(w->transitions.empty());
+  CHECK(w->connection_events.empty());
+  CHECK(alerts.history().empty());
 
-  // Repeated same-state ticks never append transition events.
+  // Repeated same-state ticks never append connection events.
   wlan.wireless.level = -43;
   monitor.update(makeSnapshot({wlan}));
   wlan.wireless.level = -44;
   monitor.update(makeSnapshot({wlan}));
   w = monitor.tracked(wlan.identity());
-  CHECK(w->transitions.empty());
-  CHECK(w->last_recorded_association == WirelessAssociation::Associated);
+  CHECK(w->connection_events.empty());
 
-  // Association disconnects: exactly one associated -> disconnected event.
+  // A single disassociated tick is only a pending candidate (debounce): the
+  // event is not committed until the state persists for a second tick.
   wlan.link.carrier = 0;
   monitor.update(makeSnapshot({wlan}));
   w = monitor.tracked(wlan.identity());
   CHECK(w->association == WirelessAssociation::Disconnected);
-  CHECK(w->transitions.size() == 1);
-  const atm::WirelessTransitionEvent &first = w->transitions.samples().front();
-  CHECK(first.from == WirelessAssociation::Associated);
-  CHECK(first.to == WirelessAssociation::Disconnected);
+  CHECK(w->connection_events.empty());
 
-  // And back: a second event, in order.
+  wlan.wireless.level = -45;
+  monitor.update(makeSnapshot({wlan}));
+  w = monitor.tracked(wlan.identity());
+  CHECK(w->connection_events.size() == 1);
+  const atm::WirelessConnectionEvent &first =
+      w->connection_events.samples().front();
+  CHECK(first.type == atm::WirelessConnectionEventType::Disassociated);
+  CHECK(first.previous_association == WirelessAssociation::Associated);
+  CHECK(first.new_association == WirelessAssociation::Disconnected);
+  CHECK(first.interface_name == "wlan0");
+  CHECK(first.confident);
+  CHECK(!alerts.history().empty());
+  const atm::AlertEvent &warning = alerts.history().back();
+  CHECK(warning.type == atm::AlertType::WirelessConnectionChanged);
+  CHECK(warning.severity == atm::AlertSeverity::Warning);
+  CHECK(!warning.is_recovery);
+
+  // Re-associated: also debounced, and announced as a recovery.
   wlan.link.carrier = 1;
   monitor.update(makeSnapshot({wlan}));
   w = monitor.tracked(wlan.identity());
-  CHECK(w->transitions.size() == 2);
-  const atm::WirelessTransitionEvent &second = w->transitions.samples().back();
-  CHECK(second.from == WirelessAssociation::Disconnected);
-  CHECK(second.to == WirelessAssociation::Associated);
+  CHECK(w->connection_events.size() == 1);  // still pending
+  monitor.update(makeSnapshot({wlan}));
+  w = monitor.tracked(wlan.identity());
+  CHECK(w->connection_events.size() == 2);
+  const atm::WirelessConnectionEvent &second =
+      w->connection_events.samples().back();
+  CHECK(second.type == atm::WirelessConnectionEventType::Reconnected);
+  CHECK(second.previous_association == WirelessAssociation::Disconnected);
+  CHECK(second.new_association == WirelessAssociation::Associated);
+  const atm::AlertEvent &recovery = alerts.history().back();
+  CHECK(recovery.type == atm::AlertType::WirelessConnectionChanged);
+  CHECK(recovery.severity == atm::AlertSeverity::Normal);
+  CHECK(recovery.is_recovery);
 
   std::filesystem::remove_all(root);
 }
@@ -852,7 +888,7 @@ int main() {
   test_reset_and_wireless_history_api();
   test_monitor_history_sampling_and_gaps();
   test_monitor_non_wireless_clears_history();
-  test_monitor_transitions();
+  test_monitor_connection_events();
 
   std::fprintf(stderr, "PASS: %d checks, %d failures\n", g_checks, g_failures);
   return g_failures == 0 ? 0 : 1;
