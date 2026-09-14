@@ -478,8 +478,8 @@ void test_monitor_lifecycle() {
   w = monitor.tracked(wlan.identity());
   CHECK(*w->signal_dbm == -43);
   CHECK(w->last_probe == first_probe);  // cached probe — no sysfs re-read
-  CHECK(w->signal_history.size() == 2);
-  CHECK(monitor.signalHistory(wlan.identity()) != nullptr);
+  CHECK(w->history.size() == 2);
+  CHECK(monitor.wirelessHistory(wlan.identity()) != nullptr);
 
   // Rename keeps the stable identity and re-probes (new sysfs path).
   wlan.name = "wlan0-up";
@@ -510,7 +510,7 @@ void test_monitor_lifecycle() {
     monitor.update(makeSnapshot({recreated, eth}));
   }
   const NetworkWirelessInfo *bounded = monitor.tracked(recreated.identity());
-  CHECK(bounded->signal_history.size() <= 3);
+  CHECK(bounded->history.size() <= 3);
   CHECK(monitor.historyMaxSamples() == 3);
 
   std::filesystem::remove_all(root);
@@ -580,7 +580,7 @@ void test_monitor_proc_fallback_and_eviction() {
   CHECK(*w->signal_dbm == -50);   // /proc/net/wireless dBm fallback used
   CHECK(w->noise_dbm.has_value());
   CHECK(*w->noise_dbm == -100);
-  CHECK(w->signal_history.size() == 1);
+  CHECK(w->history.size() == 1);
 
   // Eviction: over the tracked bound, the oldest GONE identities are dropped
   // while live entries are never evicted.
@@ -636,7 +636,7 @@ void test_monitor_empty_wireless_dir_proc_fallback() {
   CHECK(w->signal_dbm.has_value());
   CHECK(*w->signal_dbm == -45);       // from /proc/net/wireless, not guessed
   CHECK(!w->noise_dbm.has_value());   // -256 sentinel -> absent, never "-256 dBm"
-  CHECK(w->signal_history.size() == 1);
+  CHECK(w->history.size() == 1);
 
   // A wired interface never consults the table and stays cleanly NotWireless.
   NetworkInterfaceInfo eth = makeInfo("enp0s3", 61, NetworkInterfaceType::Ethernet);
@@ -650,8 +650,8 @@ void test_monitor_empty_wireless_dir_proc_fallback() {
   std::filesystem::remove_all(root);
 }
 
-void test_reset_and_signal_history_api() {
-  run("reset and signalHistory");
+void test_reset_and_wireless_history_api() {
+  run("reset and wirelessHistory");
 
   const std::filesystem::path root =
       std::filesystem::temp_directory_path() /
@@ -665,14 +665,175 @@ void test_reset_and_signal_history_api() {
   wlan.wireless.present = true;
   wlan.wireless.level = -42;
   monitor.update(makeSnapshot({wlan}));
-  CHECK(monitor.signalHistory(wlan.identity()) != nullptr);
-  CHECK(monitor.signalHistory("no-such") == nullptr);
+  CHECK(monitor.wirelessHistory(wlan.identity()) != nullptr);
+  CHECK(monitor.wirelessHistory("no-such") == nullptr);
   CHECK(monitor.entries().size() == 1);
 
   monitor.reset();
   CHECK(monitor.entries().empty());
   CHECK(monitor.tracked(wlan.identity()) == nullptr);
-  CHECK(monitor.signalHistory(wlan.identity()) == nullptr);
+  CHECK(monitor.wirelessHistory(wlan.identity()) == nullptr);
+
+  std::filesystem::remove_all(root);
+}
+
+// -------------------------------------------------------------------------
+// Step 50: per-tick history sampling, honest gaps, transition events
+// -------------------------------------------------------------------------
+
+void test_monitor_history_sampling_and_gaps() {
+  run("monitor history sampling + gaps");
+
+  const std::filesystem::path root =
+      std::filesystem::temp_directory_path() /
+      ("atm_wireless_whistory_" + std::to_string(::getpid()));
+  std::filesystem::remove_all(root);
+  makeWirelessTree(root, "wlan0");
+
+  NetworkWirelessMonitor monitor(root, std::chrono::seconds(60), 16);
+  NetworkInterfaceInfo wlan = makeInfo("wlan0", 80, NetworkInterfaceType::Wifi);
+  wlan.link.link_type = 801u;
+  wlan.link.carrier = 1;
+  wlan.wireless.present = true;
+  wlan.wireless.link = 54;
+  wlan.wireless.level = -42;
+  wlan.wireless.noise = -96;
+
+  monitor.update(makeSnapshot({wlan}));
+  const NetworkWirelessInfo *w = monitor.tracked(wlan.identity());
+  CHECK(w != nullptr);
+  CHECK(w->history.size() == 1);
+  CHECK(w->history.samples().front().valid);
+
+  // A stale tick (fresh values temporarily gone) still records one sample per
+  // tick — marked invalid, values nullopt — so coverage/span stay honest and
+  // a gap is never interpolated into a fake reading.
+  NetworkInterfaceInfo stale_info =
+      makeInfo("wlan0", 80, NetworkInterfaceType::Wifi);
+  stale_info.link.link_type = 801u;
+  stale_info.link.carrier = 1;
+  stale_info.wireless.present = true;  // directory present, files unreadable
+  std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  monitor.update(makeSnapshot({stale_info}));
+  w = monitor.tracked(wlan.identity());
+  CHECK(w->history.size() == 2);
+  const atm::WirelessHistorySample &gap = w->history.samples().back();
+  CHECK(!gap.valid);
+  CHECK(!gap.signal_dbm.has_value());  // preserved display value is NOT copied
+  CHECK(!gap.link_quality.has_value());
+  CHECK(gap.association == WirelessAssociation::Associated);
+
+  // Recovery: the third tick is a valid sample again, with no fabricated zeros
+  // anywhere in the ring.
+  wlan.wireless.level = -40;
+  monitor.update(makeSnapshot({wlan}));
+  w = monitor.tracked(wlan.identity());
+  CHECK(w->history.size() == 3);
+  CHECK(w->history.samples().back().valid);
+  CHECK(*w->history.samples().back().signal_dbm == -40.0);
+
+  // Exactly one sample per tick: four more updates stay at one per tick and
+  // bitrate/frequency/channel stay nullopt (unavailable through native sources).
+  for (int i = 0; i < 4; ++i) {
+    wlan.wireless.level = -40 - i;
+    monitor.update(makeSnapshot({wlan}));
+  }
+  w = monitor.tracked(wlan.identity());
+  CHECK(w->history.size() == 7);
+  for (const atm::WirelessHistorySample &s : w->history.samples()) {
+    CHECK(!s.bitrate_bps.has_value());
+    CHECK(!s.frequency_mhz.has_value());
+    CHECK(!s.channel.has_value());
+  }
+
+  std::filesystem::remove_all(root);
+}
+
+void test_monitor_non_wireless_clears_history() {
+  run("monitor non-wireless clears history");
+
+  const std::filesystem::path root =
+      std::filesystem::temp_directory_path() /
+      ("atm_wireless_clear_" + std::to_string(::getpid()));
+  std::filesystem::remove_all(root);
+  makeWirelessTree(root, "wlan0");
+
+  NetworkWirelessMonitor monitor(root, std::chrono::seconds(60), 8);
+  NetworkInterfaceInfo wlan = makeInfo("wlan0", 90, NetworkInterfaceType::Wifi);
+  wlan.link.link_type = 801u;
+  wlan.link.carrier = 1;
+  wlan.wireless.present = true;
+  wlan.wireless.level = -42;
+  monitor.update(makeSnapshot({wlan}));
+  CHECK(monitor.tracked(wlan.identity())->history.size() == 1);
+
+  // The identity stops being wireless (here via a rename, which forces a fresh
+  // sysfs probe): history, transitions and the recorded association baseline
+  // all reset — nothing is carried into a non-wireless link.
+  wlan.name = "wlan0-nw";        // rename forces a re-probe of the new path
+  wlan.link.link_type = 1u;      // ARPHRD_ETHER
+  wlan.wireless.present = false;
+  monitor.update(makeSnapshot({wlan}));
+  const NetworkWirelessInfo *w = monitor.tracked(wlan.identity());
+  CHECK(w != nullptr);
+  CHECK(w->presence == WirelessPresence::NotWireless);
+  CHECK(w->history.empty());
+  CHECK(w->transitions.empty());
+  CHECK(w->last_recorded_association == WirelessAssociation::Unknown);
+  CHECK(w->last_sample_wall == std::chrono::system_clock::time_point{});
+
+  std::filesystem::remove_all(root);
+}
+
+void test_monitor_transitions() {
+  run("monitor association transitions");
+
+  const std::filesystem::path root =
+      std::filesystem::temp_directory_path() /
+      ("atm_wireless_trans_" + std::to_string(::getpid()));
+  std::filesystem::remove_all(root);
+  makeWirelessTree(root, "wlan0");
+
+  NetworkWirelessMonitor monitor(root, std::chrono::seconds(60), 8);
+  NetworkInterfaceInfo wlan = makeInfo("wlan0", 100, NetworkInterfaceType::Wifi);
+  wlan.link.link_type = 801u;
+  wlan.wireless.present = true;
+  wlan.wireless.level = -42;
+
+  // The first sample establishes the baseline silently: no "unknown ->" event.
+  wlan.link.carrier = 1;
+  monitor.update(makeSnapshot({wlan}));
+  const NetworkWirelessInfo *w = monitor.tracked(wlan.identity());
+  CHECK(w->association == WirelessAssociation::Associated);
+  CHECK(w->transitions.empty());
+
+  // Repeated same-state ticks never append transition events.
+  wlan.wireless.level = -43;
+  monitor.update(makeSnapshot({wlan}));
+  wlan.wireless.level = -44;
+  monitor.update(makeSnapshot({wlan}));
+  w = monitor.tracked(wlan.identity());
+  CHECK(w->transitions.empty());
+  CHECK(w->last_recorded_association == WirelessAssociation::Associated);
+
+  // Association disconnects: exactly one associated -> disconnected event.
+  wlan.link.carrier = 0;
+  monitor.update(makeSnapshot({wlan}));
+  w = monitor.tracked(wlan.identity());
+  CHECK(w->association == WirelessAssociation::Disconnected);
+  CHECK(w->transitions.size() == 1);
+  const atm::WirelessTransitionEvent &first = w->transitions.samples().front();
+  CHECK(first.from == WirelessAssociation::Associated);
+  CHECK(first.to == WirelessAssociation::Disconnected);
+
+  // And back: a second event, in order.
+  wlan.link.carrier = 1;
+  monitor.update(makeSnapshot({wlan}));
+  w = monitor.tracked(wlan.identity());
+  CHECK(w->transitions.size() == 2);
+  const atm::WirelessTransitionEvent &second = w->transitions.samples().back();
+  CHECK(second.from == WirelessAssociation::Disconnected);
+  CHECK(second.to == WirelessAssociation::Associated);
 
   std::filesystem::remove_all(root);
 }
@@ -688,7 +849,10 @@ int main() {
   test_monitor_global_unreadable();
   test_monitor_proc_fallback_and_eviction();
   test_monitor_empty_wireless_dir_proc_fallback();
-  test_reset_and_signal_history_api();
+  test_reset_and_wireless_history_api();
+  test_monitor_history_sampling_and_gaps();
+  test_monitor_non_wireless_clears_history();
+  test_monitor_transitions();
 
   std::fprintf(stderr, "PASS: %d checks, %d failures\n", g_checks, g_failures);
   return g_failures == 0 ? 0 : 1;

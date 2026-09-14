@@ -309,6 +309,96 @@ NetworkTrafficExportSnapshot buildNetworkTrafficExportSnapshot(
     snapshot.wireless = wl;
   }
 
+  // Capture the wireless history (summary + per-sample rows) when the selected
+  // interface is wireless and its ring holds recorded samples. Timestamps are
+  // anchored to the newest recorded sample's wall clock (last_sample_wall) the
+  // same way the traffic rows anchor to the series' last update; per-metric
+  // statistics are computed only over samples that carried each value, so
+  // invalid/stale gaps contribute nothing and never read as a fabricated zero.
+  if (wireless != nullptr && wireless->present &&
+      wireless->presence == WirelessPresence::Wireless &&
+      !wireless->history.empty()) {
+    NetworkTrafficExportWirelessHistory wh;
+    const auto &samples = wireless->history.samples();
+    wh.sample_count = samples.size();
+
+    const auto anchor_wall =
+        wireless->last_sample_wall != std::chrono::system_clock::time_point{}
+            ? wireless->last_sample_wall
+            : wireless->last_read;
+    const std::chrono::steady_clock::time_point newest_tick =
+        samples.back().timestamp;
+
+    double signal_sum = 0.0;
+    std::optional<double> signal_min, signal_max;
+    std::size_t signal_count = 0;
+    for (const WirelessHistorySample &sample : samples) {
+      NetworkTrafficExportWirelessRow row;
+      const double offset_seconds =
+          std::chrono::duration<double>(newest_tick - sample.timestamp).count();
+      row.timestamp =
+          anchor_wall -
+          std::chrono::duration_cast<std::chrono::system_clock::duration>(
+              std::chrono::duration<double>(offset_seconds));
+      row.association = wirelessAssociationName(sample.association);
+      row.valid = sample.valid;
+      row.signal_dbm = sample.signal_dbm;
+      row.link_quality = sample.link_quality;
+      if (sample.link_quality.has_value()) {
+        row.link_quality_scale = sample.is_mac80211 ? "mac80211 /70"
+                                                    : "driver-defined";
+      }
+      row.bitrate_bps = sample.bitrate_bps;
+      row.frequency_mhz = sample.frequency_mhz;
+      row.channel = sample.channel;
+      wh.samples.push_back(std::move(row));
+
+      if (sample.valid) {
+        ++wh.valid_sample_count;
+      }
+      if (sample.signal_dbm.has_value()) {
+        ++signal_count;
+        const double value = *sample.signal_dbm;
+        signal_sum += value;
+        wh.current_signal_dbm = value;
+        if (!signal_min.has_value() || value < *signal_min) {
+          signal_min = value;
+        }
+        if (!signal_max.has_value() || value > *signal_max) {
+          signal_max = value;
+        }
+      }
+      if (sample.link_quality.has_value()) {
+        wh.current_link_quality = *sample.link_quality;
+      }
+      if (sample.bitrate_bps.has_value()) {
+        wh.current_bitrate_bps = *sample.bitrate_bps;
+      }
+      if (sample.frequency_mhz.has_value()) {
+        wh.current_frequency_mhz = *sample.frequency_mhz;
+      }
+      if (sample.channel.has_value()) {
+        wh.current_channel = *sample.channel;
+      }
+    }
+    if (signal_count > 0) {
+      wh.min_signal_dbm = signal_min;
+      wh.max_signal_dbm = signal_max;
+      wh.avg_signal_dbm = signal_sum / static_cast<double>(signal_count);
+    }
+    wh.span_seconds =
+        std::chrono::duration<double>(newest_tick - samples.front().timestamp)
+            .count();
+    if (max_samples > 0) {
+      wh.coverage =
+          std::min(1.0, static_cast<double>(wh.sample_count) /
+                            static_cast<double>(max_samples));
+      wh.history_complete = wh.sample_count >= max_samples;
+    }
+    wh.last_update = anchor_wall;
+    snapshot.wireless_history = std::move(wh);
+  }
+
   // Merge every retained ring into one row per unique sample tick. A row is
   // created the first time a tick is seen; each metric is assigned only from
   // the ring that actually sampled it, so a partially populated history (no
@@ -606,6 +696,68 @@ std::string generateNetworkTrafficCsv(
     }
     out += '\n';
   }
+
+  // Wireless history: a clearly-headed second section, appended only when the
+  // interface is wireless and its history ring holds recorded samples. It uses
+  // its own stable column order (wireless_timestamp first), a leading blank
+  // separator line, and the same conventions as the main table: unavailable
+  // metrics are empty fields (never zeros) and the association/quality-scale
+  // columns are human-readable text. Includes the summary as a trailing line.
+  if (snapshot.wireless_history.has_value() &&
+      !snapshot.wireless_history->samples.empty()) {
+    const NetworkTrafficExportWirelessHistory &wh = *snapshot.wireless_history;
+    out += "\ntimestamp,interface,association,valid,signal_dbm,"
+           "link_quality,link_quality_scale,bitrate_bps,frequency_mhz,"
+           "channel\n";
+    for (const NetworkTrafficExportWirelessRow &row : wh.samples) {
+      out += escapeNetworkTrafficCsvField(
+                 formatNetworkTrafficTimestamp(row.timestamp));
+      out += ',';
+      out += interface;
+      out += ',';
+      out += row.association;
+      out += ',';
+      out += row.valid ? "1" : "0";
+      out += ',';
+      out += row.signal_dbm.has_value()
+                 ? formatExportDouble(*row.signal_dbm)
+                 : std::string{};
+      out += ',';
+      out += row.link_quality.has_value() ? std::to_string(*row.link_quality)
+                                          : std::string{};
+      out += ',';
+      out += escapeNetworkTrafficCsvField(row.link_quality_scale);
+      out += ',';
+      out += row.bitrate_bps.has_value()
+                 ? formatExportDouble(*row.bitrate_bps)
+                 : std::string{};
+      out += ',';
+      out += row.frequency_mhz.has_value()
+                 ? formatExportDouble(*row.frequency_mhz)
+                 : std::string{};
+      out += ',';
+      out += row.channel.has_value() ? std::to_string(*row.channel)
+                                     : std::string{};
+      out += '\n';
+    }
+    // A one-line summary, clearly prefixed so it can never be mistaken for a
+    // sample row.
+    out += "summary,signal_dbm_current=";
+    out += jsonNumber(wh.current_signal_dbm);
+    out += ",signal_dbm_min=";
+    out += jsonNumber(wh.min_signal_dbm);
+    out += ",signal_dbm_max=";
+    out += jsonNumber(wh.max_signal_dbm);
+    out += ",signal_dbm_avg=";
+    out += jsonNumber(wh.avg_signal_dbm);
+    out += ",valid_samples=";
+    out += std::to_string(wh.valid_sample_count);
+    out += ",coverage=";
+    out += formatExportDouble(wh.coverage);
+    out += ",span_seconds=";
+    out += formatExportDouble(wh.span_seconds);
+    out += '\n';
+  }
   return out;
 }
 
@@ -700,6 +852,64 @@ std::string generateNetworkTrafficJson(
     });
   }();
 
+  // Wireless history captured with the snapshot, or null when absent (aggregate
+  // / non-wireless interface / no recorded samples). Per-sample rows plus the
+  // summary the wireless-history view shows; unavailable metrics are null and
+  // never fabricated zeros. SSID/BSSID are not exposed by the kernel via sysfs
+  // or /proc/net/wireless and stay absent.
+  const std::string wireless_history_json = [&] {
+    if (!snapshot.wireless_history.has_value() ||
+        snapshot.wireless_history->samples.empty()) {
+      return std::string("null");
+    }
+    const NetworkTrafficExportWirelessHistory &wh =
+        *snapshot.wireless_history;
+    std::string start_timestamp = "null";
+    std::string end_timestamp = "null";
+    if (!wh.samples.empty()) {
+      start_timestamp =
+          jsonEscape(formatNetworkTrafficTimestamp(wh.samples.front().timestamp));
+      end_timestamp =
+          jsonEscape(formatNetworkTrafficTimestamp(wh.samples.back().timestamp));
+    }
+    std::vector<std::string> sample_objects;
+    sample_objects.reserve(wh.samples.size());
+    for (const NetworkTrafficExportWirelessRow &row : wh.samples) {
+      sample_objects.push_back(jsonObject({
+          {"timestamp",
+           jsonEscape(formatNetworkTrafficTimestamp(row.timestamp))},
+          {"association", jsonEscape(row.association)},
+          {"valid", row.valid ? "true" : "false"},
+          {"signal_dbm", jsonNumber(row.signal_dbm)},
+          {"link_quality", jsonNumber(row.link_quality)},
+          {"link_quality_scale", jsonEscape(row.link_quality_scale)},
+          {"bitrate_bps", jsonNumber(row.bitrate_bps)},
+          {"frequency_mhz", jsonNumber(row.frequency_mhz)},
+          {"channel", jsonNumber(row.channel)},
+      }));
+    }
+    return jsonObject({
+        {"start_timestamp", start_timestamp},
+        {"end_timestamp", end_timestamp},
+        {"sample_count", std::to_string(wh.sample_count)},
+        {"valid_sample_count", std::to_string(wh.valid_sample_count)},
+        {"coverage", jsonNumber(std::optional<double>(wh.coverage))},
+        {"complete", wh.history_complete ? "true" : "false"},
+        {"span_seconds", jsonNumber(std::optional<double>(wh.span_seconds))},
+        {"current_signal_dbm", jsonNumber(wh.current_signal_dbm)},
+        {"min_signal_dbm", jsonNumber(wh.min_signal_dbm)},
+        {"max_signal_dbm", jsonNumber(wh.max_signal_dbm)},
+        {"avg_signal_dbm", jsonNumber(wh.avg_signal_dbm)},
+        {"current_link_quality", jsonNumber(wh.current_link_quality)},
+        {"current_bitrate_bps", jsonNumber(wh.current_bitrate_bps)},
+        {"current_frequency_mhz", jsonNumber(wh.current_frequency_mhz)},
+        {"current_channel", jsonNumber(wh.current_channel)},
+        {"last_update",
+         jsonEscape(formatNetworkTrafficTimestamp(wh.last_update))},
+        {"samples", jsonArray(sample_objects)},
+    });
+  }();
+
   const std::string history = jsonObject({
       {"start_timestamp", start_timestamp},
       {"end_timestamp", end_timestamp},
@@ -768,6 +978,7 @@ std::string generateNetworkTrafficJson(
       {"link", link_json},
       {"hardware", hardware_json},
       {"wireless", wireless_json},
+      {"wireless_history", wireless_history_json},
       {"history", history},
       {"units", units},
       {"summary", summary_json},
@@ -852,7 +1063,9 @@ NetworkTrafficExportResult exportNetworkTrafficHistory(
       format != NetworkTrafficExportFormat::Json) {
     return {NetworkTrafficExportStatus::UnsupportedFormat, 0, 0, {}};
   }
-  if (snapshot.samples.empty()) {
+  if (snapshot.samples.empty() &&
+      (!snapshot.wireless_history.has_value() ||
+       snapshot.wireless_history->samples.empty())) {
     return {NetworkTrafficExportStatus::EmptyHistory, 0, 0, {}};
   }
   const std::string contents =

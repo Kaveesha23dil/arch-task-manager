@@ -6,6 +6,7 @@
 #include <string>
 
 #include "network_traffic_history.hpp"
+#include "network_wireless.hpp"
 #include "resource_history.hpp"
 
 namespace atm {
@@ -59,5 +60,27 @@ struct NetworkTrafficChartConfig {
     const ResourceHistory<TimedSample> &rx_rates,
     const ResourceHistory<TimedSample> &tx_rates,
     const NetworkTrafficChartConfig &config);
+
+/// Chart geometry for the wireless signal-strength (dBm) history graph.
+struct WirelessHistoryChartConfig {
+  std::size_t data_width = 40;   // plot columns
+  std::size_t data_height = 6;   // plot grid rows
+};
+
+/// Renders the received-signal-strength (dBm) history graph for one wireless
+/// interface as monochrome-safe ASCII. Values are never interpolated: each
+/// column shows the last measurement inside its time window and is left blank
+/// when there is none, so stale/unavailable ticks (valid == false) render as
+/// honest gaps and never as a fabricated reading. The y-axis is a padded,
+/// human-friendly dBm scale (negative values kept negative), the legend uses
+/// the same '~' / '.' glyph conventions as the traffic chart, and the footer is
+/// a relative time axis ("-<span>s ... Now").
+///
+/// Deterministic and bounded (O(cols * samples) per render over the retained
+/// ring only). When the ring holds no signal measurement at all a short
+/// "(no data)" marker is returned.
+[[nodiscard]] std::string renderWirelessSignalChart(
+    const ResourceHistory<WirelessHistorySample> &history,
+    const WirelessHistoryChartConfig &config);
 
 }  // namespace atm

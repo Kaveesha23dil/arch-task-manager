@@ -20,6 +20,11 @@ constexpr char kTxFillGlyph = ':';
 constexpr char kOverlapPeakGlyph = '#';
 constexpr char kOverlapFillGlyph = '+';
 
+// Wireless signal chart glyphs (same peak/flow conventions as the traffic
+// chart; a blank column is the honest way to draw a gap — never interpolated).
+constexpr char kSignalPeakGlyph = '~';
+constexpr char kSignalFillGlyph = '.';
+
 /// Same 1/2/5 rounding the rest of the app uses to keep y-axis labels
 /// human-friendly (mirrors GraphRenderer::roundScale).
 double roundScale(double value) {
@@ -90,6 +95,18 @@ std::string formatRelativeSpan(double seconds) {
         << std::setfill(' ');
   } else {
     out << secs << 's';
+  }
+  return out.str();
+}
+
+/// dBm y-axis label: integral values print without a decimal point, fractional
+/// ones with a single digit. Never locale-dependent.
+std::string formatDbmLabel(double value) {
+  std::ostringstream out;
+  if (std::trunc(value) == value) {
+    out << static_cast<long long>(value);
+  } else {
+    out << std::fixed << std::setprecision(1) << value;
   }
   return out.str();
 }
@@ -286,6 +303,183 @@ std::string renderNetworkTrafficChart(
   const std::size_t left_x = label_w + 2;
   // Place the middle label centered between the end of the left label and the
   // right "Now", clamped so the three tokens never overlap.
+  std::string footer(now_x + 4, ' ');
+  const std::size_t left_end = left_x + left.size();
+  const std::size_t now_width = 3;
+  const std::size_t mid_center = left_end + (now_x - 1 - left_end) / 2;
+  std::size_t mid_x = mid.size() / 2 <= mid_center
+                          ? mid_center - mid.size() / 2
+                          : left_end;
+  if (mid_x < left_end) {
+    mid_x = left_end;
+  }
+  if (mid_x + mid.size() > now_x) {
+    mid_x = now_x >= mid.size() && now_x - mid.size() >= left_end
+                ? now_x - mid.size()
+                : left_end;
+  }
+  footer.replace(left_x, left.size(), left);
+  if (mid_x + mid.size() <= now_x) {
+    footer.replace(mid_x, mid.size(), mid);
+  }
+  footer.replace(now_x, now_width, "Now");
+  out << footer << '\n';
+
+  return out.str();
+}
+
+std::string renderWirelessSignalChart(
+    const ResourceHistory<WirelessHistorySample> &history,
+    const WirelessHistoryChartConfig &config) {
+  const std::size_t cols = config.data_width > 0 ? config.data_width : 1;
+  const std::size_t rows = config.data_height > 0 ? config.data_height : 1;
+
+  const auto &samples = history.samples();
+  if (samples.empty()) {
+    return "Signal (dBm)  (no data)\n";
+  }
+
+  // Only samples that actually carried a signal value plot anything; a gap
+  // (unavailable/stale tick, valid == false) contributes nothing and is never
+  // interpolated into a misleading line or a fabricated reading.
+  std::optional<double> data_min, data_max;
+  for (const WirelessHistorySample &sample : samples) {
+    if (sample.signal_dbm.has_value()) {
+      const double value = *sample.signal_dbm;
+      if (!data_min.has_value() || value < *data_min) {
+        data_min = value;
+      }
+      if (!data_max.has_value() || value > *data_max) {
+        data_max = value;
+      }
+    }
+  }
+  if (!data_min.has_value()) {
+    return "Signal (dBm)  (no data)\n";
+  }
+
+  // The whole retained span is the x-axis, so gaps at the edges stay honest.
+  const Clock::time_point origin = samples.front().timestamp;
+  const double span =
+      std::max(0.0, toSeconds(samples.back().timestamp, origin));
+
+  // One value per column: the LAST measurement whose timestamp falls inside the
+  // column's time window; a column with none stays blank.
+  std::vector<std::optional<double>> column(cols);
+  if (span <= 0.0) {
+    for (auto it = samples.rbegin(); it != samples.rend(); ++it) {
+      if (it->signal_dbm.has_value()) {
+        column.back() = *it->signal_dbm;
+        break;
+      }
+    }
+  } else {
+    for (std::size_t c = 0; c < cols; ++c) {
+      const double w_start = span * static_cast<double>(c) /
+                             static_cast<double>(cols);
+      const double w_end = span * static_cast<double>(c + 1) /
+                           static_cast<double>(cols);
+      for (auto it = samples.rbegin(); it != samples.rend(); ++it) {
+        if (!it->signal_dbm.has_value()) {
+          continue;
+        }
+        const double time = toSeconds(it->timestamp, origin);
+        if (time >= w_start && time <= w_end) {
+          column[c] = *it->signal_dbm;
+          break;
+        }
+      }
+    }
+  }
+
+  // Padded, human-friendly dBm scale: negative signals are kept negative, the
+  // padding (>= 3 dBm) keeps a single reading from begging for a huge scale,
+  // and the step snaps to the app's usual 1/2/5 series.
+  double lo = *data_min;
+  double hi = *data_max;
+  const double pad = std::max(3.0, (hi - lo) * 0.10);
+  lo -= pad;
+  hi += pad;
+  double step = roundScale(
+      (hi - lo) /
+      static_cast<double>(rows > 1 ? rows - 1 : 1));
+  if (step <= 0.0) {
+    step = 1.0;
+  }
+  lo = std::floor(lo / step) * step;
+  hi = std::ceil(hi / step) * step;
+  if (hi <= lo) {
+    hi = lo + step;
+  }
+  const double range = hi - lo;
+  const double mid_value = (lo + hi) / 2.0;
+
+  // Per-column boundary row: rows [boundary .. baseline] are filled; a blank
+  // column has no boundary at all.
+  const auto boundaryRow = [rows, lo, range](double value) -> std::size_t {
+    const double normalized =
+        std::clamp((value - lo) / range, 0.0, 1.0);
+    std::size_t from_top = static_cast<std::size_t>(
+        std::llround(normalized * static_cast<double>(rows - 1)));
+    from_top = std::min(from_top, rows - 1);
+    return rows - 1 - from_top;
+  };
+  std::vector<std::optional<std::size_t>> boundary(cols);
+  for (std::size_t c = 0; c < cols; ++c) {
+    if (column[c].has_value()) {
+      boundary[c] = boundaryRow(*column[c]);
+    }
+  }
+
+  std::ostringstream out;
+  out << "Signal dBm  peak " << kSignalPeakGlyph << " flow " << kSignalFillGlyph
+      << "  (blank column = no measurement in that window)\n";
+
+  const std::string top_label = formatDbmLabel(hi);
+  const std::string mid_label = formatDbmLabel(mid_value);
+  const std::string bottom_label = formatDbmLabel(lo);
+  const std::size_t label_w =
+      std::max({top_label.size(), mid_label.size(), bottom_label.size()});
+  const auto paddedLabel = [label_w](const std::string &text) {
+    return text.size() < label_w ? std::string(label_w - text.size(), ' ') + text
+                                 : text;
+  };
+
+  // Plot grid. A blank column (no measurement) is all spaces — never a flat
+  // line invented across a gap.
+  std::vector<std::vector<char>> grid(rows, std::vector<char>(cols, ' '));
+  for (std::size_t c = 0; c < cols; ++c) {
+    if (!boundary[c].has_value()) {
+      continue;
+    }
+    for (std::size_t r = *boundary[c]; r < rows; ++r) {
+      grid[r][c] = r == *boundary[c] ? kSignalPeakGlyph : kSignalFillGlyph;
+    }
+  }
+
+  for (std::size_t r = 0; r < rows; ++r) {
+    if (r == 0) {
+      out << paddedLabel(top_label) << " |";
+    } else if (r + 1 == rows) {
+      out << paddedLabel(bottom_label) << " |";
+    } else if (r == rows / 2) {
+      out << paddedLabel(mid_label) << " |";
+    } else {
+      out << std::string(label_w, ' ') << " |";
+    }
+    for (const char cell : grid[r]) {
+      out << cell;
+    }
+    out << '\n';
+  }
+
+  // Baseline and relative time axis (same layout as the traffic chart).
+  out << std::string(label_w, ' ') << " +" << std::string(cols, '-') << '\n';
+
+  const std::size_t now_x = label_w + 1 + cols;
+  const std::string left = formatRelativeSpan(span);
+  const std::string mid = formatRelativeSpan(span / 2.0);
+  const std::size_t left_x = label_w + 2;
   std::string footer(now_x + 4, ' ');
   const std::size_t left_end = left_x + left.size();
   const std::size_t now_width = 3;

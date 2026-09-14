@@ -288,6 +288,126 @@ void testChartDeterministic() {
 }
 
 // -------------------------------------------------------------------------
+// renderWirelessSignalChart
+// -------------------------------------------------------------------------
+
+using atm::WirelessHistorySample;
+
+/// Builds a wireless history ring from (seconds-from-base, signal or gap)
+/// pairs; an empty optional is a tick with no fresh measurement (gap).
+ResourceHistory<WirelessHistorySample> makeSignalRing(
+    const std::vector<std::pair<double, std::optional<double>>> &samples) {
+  ResourceHistory<WirelessHistorySample> ring(
+      atm::kDefaultInterfaceHistorySamples);
+  const Clock::time_point base = Clock::now();
+  for (const auto &[seconds, signal] : samples) {
+    WirelessHistorySample sample;
+    sample.timestamp = base + std::chrono::duration_cast<Clock::duration>(
+                                  std::chrono::duration<double>(seconds));
+    sample.association = atm::WirelessAssociation::Associated;
+    sample.valid = signal.has_value();
+    sample.signal_dbm = signal;
+    ring.addSample(sample);
+  }
+  return ring;
+}
+
+/// The plot columns of every grid row (text after the y-axis label + '|'),
+/// skipping the header, baseline and footer lines.
+std::vector<std::string> plotColumns(const std::string &output) {
+  std::vector<std::string> rows;
+  std::istringstream in(output);
+  std::string line;
+  std::size_t pipe = 0;
+  bool first = true;
+  while (std::getline(in, line) && !line.empty()) {
+    if (line.find('|') == std::string::npos) {
+      continue;
+    }
+    const std::size_t p = line.find('|');
+    if (first) {
+      pipe = p;
+      first = false;
+    }
+    rows.push_back(line.substr(pipe + 1));
+  }
+  return rows;
+}
+
+/// One column read top-to-bottom (a blank measurement is a run of spaces).
+std::string columnString(const std::vector<std::string> &rows,
+                         std::size_t col) {
+  std::string values;
+  for (const std::string &row : rows) {
+    if (col < row.size()) {
+      values.push_back(row[col]);
+    }
+  }
+  return values;
+}
+
+void testWirelessChartNoData() {
+  run("wireless chart: no data");
+  atm::WirelessHistoryChartConfig config;
+  const std::string output =
+      atm::renderWirelessSignalChart(ResourceHistory<WirelessHistorySample>(120),
+                                     config);
+  CHECK(output.find("no data") != std::string::npos);
+}
+
+void testWirelessChartGapColumn() {
+  run("wireless chart: gap column stays blank");
+  atm::WirelessHistoryChartConfig config;
+  config.data_width = 3;
+  config.data_height = 6;
+  const std::string output = atm::renderWirelessSignalChart(
+      makeSignalRing({{0.0, -40.0}, {30.0, std::nullopt}, {60.0, -50.0}}),
+      config);
+  CHECK(output.find("blank column = no measurement") != std::string::npos);
+  CHECK(output.find("peak ~") != std::string::npos);
+  const std::vector<std::string> grid = plotColumns(output);
+  CHECK(grid.size() == 6);
+  // The two measured windows plot normally...
+  CHECK(columnString(grid, 0).find('~') != std::string::npos);
+  CHECK(columnString(grid, 0).find('.') != std::string::npos);
+  CHECK(columnString(grid, 2).find('~') != std::string::npos);
+  // ...but the middle window had no measurement: all spaces, never a line
+  // invented across the gap.
+  CHECK(columnString(grid, 1).find_first_of("~.") == std::string::npos);
+  CHECK(output.find("Now") != std::string::npos);
+}
+
+void testWirelessChartSingleSampleLastColumn() {
+  run("wireless chart: single instant goes to the last column");
+  atm::WirelessHistoryChartConfig config;
+  config.data_width = 5;
+  config.data_height = 6;
+  const std::string output =
+      atm::renderWirelessSignalChart(makeSignalRing({{0.0, -42.0}}), config);
+  const std::vector<std::string> grid = plotColumns(output);
+  CHECK(grid.size() == 6);
+  CHECK(columnString(grid, 4).find('~') != std::string::npos);
+  for (std::size_t c = 0; c < 4; ++c) {
+    CHECK(columnString(grid, c).find_first_of("~.") == std::string::npos);
+  }
+  // The padded dBm scale stays negative (never flipped to +1 dBm).
+  CHECK(output.find('-') != std::string::npos);
+}
+
+void testWirelessChartDeterministic() {
+  run("wireless chart: deterministic output");
+  atm::WirelessHistoryChartConfig config;
+  config.data_width = 8;
+  config.data_height = 6;
+  const auto ring =
+      makeSignalRing({{0.0, -56.0}, {10.0, -50.0}, {20.0, -44.0},
+                      {30.0, std::nullopt}, {40.0, -60.0}});
+  const std::string a = atm::renderWirelessSignalChart(ring, config);
+  const std::string b = atm::renderWirelessSignalChart(ring, config);
+  CHECK(a == b);
+}
+
+// -------------------------------------------------------------------------
 
 int main() {
   testSummaryEmptySeries();
@@ -300,6 +420,10 @@ int main() {
   testChartOverlap();
   testChartTimeAxis();
   testChartDeterministic();
+  testWirelessChartNoData();
+  testWirelessChartGapColumn();
+  testWirelessChartSingleSampleLastColumn();
+  testWirelessChartDeterministic();
 
   std::fprintf(stderr, "%d checks, %d failures\n", g_checks, g_failures);
   return g_failures == 0 ? 0 : 1;
