@@ -2,8 +2,10 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <cmath>
 #include <cstdlib>
 #include <fstream>
+#include <iomanip>
 #include <iterator>
 #include <limits>
 #include <sstream>
@@ -388,6 +390,177 @@ std::string formatWirelessNoise(const std::optional<int> &noise_dbm) {
   return std::to_string(*noise_dbm) + " dBm";
 }
 
+std::string formatWirelessBitrate(const std::optional<double> &bps) {
+  if (!bps.has_value() || !std::isfinite(*bps) || *bps < 0.0) {
+    return "N/A";
+  }
+  const double value = *bps;
+  const double kbps = value / 1000.0;
+  const double mbps = kbps / 1000.0;
+  const double gbps = mbps / 1000.0;
+  std::ostringstream out;
+  if (gbps >= 1.0) {
+    out << std::fixed << std::setprecision(1) << gbps << " Gb/s";
+  } else if (mbps >= 1.0) {
+    const double rounded = std::round(mbps);
+    if (std::abs(mbps - rounded) < 0.05) {
+      out << static_cast<long long>(rounded) << " Mb/s";
+    } else {
+      out << std::fixed << std::setprecision(1) << mbps << " Mb/s";
+    }
+  } else if (kbps >= 1.0) {
+    out << std::fixed << std::setprecision(0) << kbps << " Kb/s";
+  } else {
+    out << std::fixed << std::setprecision(0) << value << " b/s";
+  }
+  return out.str();
+}
+
+std::string formatWirelessFrequency(const std::optional<double> &mhz) {
+  if (!mhz.has_value() || !std::isfinite(*mhz) || *mhz < 0.0) {
+    return "N/A";
+  }
+  const double rounded = std::round(*mhz);
+  if (std::abs(*mhz - rounded) < 0.05) {
+    return std::to_string(static_cast<long long>(rounded)) + " MHz";
+  }
+  std::ostringstream out;
+  out << std::fixed << std::setprecision(1) << *mhz << " MHz";
+  return out.str();
+}
+
+std::string formatWirelessChannel(const std::optional<int> &channel) {
+  if (!channel.has_value()) {
+    return "N/A";
+  }
+  return std::to_string(*channel);
+}
+
+WirelessHistorySummary summarizeWirelessHistory(const NetworkWirelessInfo &wireless,
+                                                std::size_t max_samples) {
+  WirelessHistorySummary summary;
+  const auto &samples = wireless.history.samples();
+  summary.sample_count = samples.size();
+  if (summary.sample_count == 0) {
+    return summary;
+  }
+  summary.has_data = true;
+
+  for (const WirelessHistorySample &sample : samples) {
+    if (sample.valid) {
+      ++summary.valid_sample_count;
+    }
+    if (sample.signal_dbm.has_value()) {
+      ++summary.signal_sample_count;
+      const double value = *sample.signal_dbm;
+      summary.current_signal_dbm = value;
+      if (!summary.min_signal_dbm.has_value() ||
+          value < *summary.min_signal_dbm) {
+        summary.min_signal_dbm = value;
+      }
+      if (!summary.max_signal_dbm.has_value() ||
+          value > *summary.max_signal_dbm) {
+        summary.max_signal_dbm = value;
+      }
+      summary.avg_signal_dbm = summary.avg_signal_dbm.value_or(0.0) + value;
+    }
+    if (sample.link_quality.has_value()) {
+      ++summary.link_quality_sample_count;
+      const int value = *sample.link_quality;
+      summary.current_link_quality = value;
+      if (!summary.min_link_quality.has_value() ||
+          value < *summary.min_link_quality) {
+        summary.min_link_quality = value;
+      }
+      if (!summary.max_link_quality.has_value() ||
+          value > *summary.max_link_quality) {
+        summary.max_link_quality = value;
+      }
+      summary.avg_link_quality =
+          summary.avg_link_quality.value_or(0.0) +
+          static_cast<double>(value);
+    }
+    if (sample.bitrate_bps.has_value()) {
+      ++summary.bitrate_sample_count;
+      const double value = *sample.bitrate_bps;
+      summary.current_bitrate_bps = value;
+      if (!summary.min_bitrate_bps.has_value() ||
+          value < *summary.min_bitrate_bps) {
+        summary.min_bitrate_bps = value;
+      }
+      if (!summary.max_bitrate_bps.has_value() ||
+          value > *summary.max_bitrate_bps) {
+        summary.max_bitrate_bps = value;
+      }
+      summary.avg_bitrate_bps = summary.avg_bitrate_bps.value_or(0.0) + value;
+    }
+    if (sample.frequency_mhz.has_value()) {
+      ++summary.frequency_sample_count;
+      const double value = *sample.frequency_mhz;
+      summary.current_frequency_mhz = value;
+      if (!summary.min_frequency_mhz.has_value() ||
+          value < *summary.min_frequency_mhz) {
+        summary.min_frequency_mhz = value;
+      }
+      if (!summary.max_frequency_mhz.has_value() ||
+          value > *summary.max_frequency_mhz) {
+        summary.max_frequency_mhz = value;
+      }
+      summary.avg_frequency_mhz =
+          summary.avg_frequency_mhz.value_or(0.0) + value;
+    }
+    if (sample.channel.has_value()) {
+      ++summary.channel_sample_count;
+      summary.current_channel = *sample.channel;
+    }
+  }
+
+  if (summary.signal_sample_count > 0) {
+    summary.avg_signal_dbm =
+        *summary.avg_signal_dbm / static_cast<double>(summary.signal_sample_count);
+  } else {
+    summary.avg_signal_dbm.reset();
+  }
+  if (summary.link_quality_sample_count > 0) {
+    summary.avg_link_quality =
+        *summary.avg_link_quality /
+        static_cast<double>(summary.link_quality_sample_count);
+  } else {
+    summary.avg_link_quality.reset();
+  }
+  if (summary.bitrate_sample_count > 0) {
+    summary.avg_bitrate_bps =
+        *summary.avg_bitrate_bps /
+        static_cast<double>(summary.bitrate_sample_count);
+  } else {
+    summary.avg_bitrate_bps.reset();
+  }
+  if (summary.frequency_sample_count > 0) {
+    summary.avg_frequency_mhz =
+        *summary.avg_frequency_mhz /
+        static_cast<double>(summary.frequency_sample_count);
+  } else {
+    summary.avg_frequency_mhz.reset();
+  }
+
+  if (max_samples > 0) {
+    summary.coverage = std::min(
+        1.0, static_cast<double>(summary.sample_count) /
+                 static_cast<double>(max_samples));
+    summary.valid_coverage = std::min(
+        1.0, static_cast<double>(summary.valid_sample_count) /
+                 static_cast<double>(max_samples));
+    summary.history_complete = summary.sample_count >= max_samples;
+  }
+  summary.span_seconds =
+      std::chrono::duration<double>(samples.back().timestamp -
+                                    samples.front().timestamp)
+          .count();
+  summary.transition_count = wireless.transitions.size();
+  summary.last_update = wireless.last_sample_wall;
+  return summary;
+}
+
 std::string describeWirelessLine(const NetworkWirelessInfo &wireless) {
   if (wireless.presence != WirelessPresence::Wireless) {
     return "not a wireless interface";
@@ -441,10 +614,10 @@ const NetworkWirelessInfo *NetworkWirelessMonitor::tracked(
   return it == tracked_.end() ? nullptr : &it->second;
 }
 
-const ResourceHistory<TimedSample> *NetworkWirelessMonitor::signalHistory(
-    const std::string &identity) const {
+const ResourceHistory<WirelessHistorySample> *
+NetworkWirelessMonitor::wirelessHistory(const std::string &identity) const {
   const auto it = tracked_.find(identity);
-  return it == tracked_.end() ? nullptr : &it->second.signal_history;
+  return it == tracked_.end() ? nullptr : &it->second.history;
 }
 
 void NetworkWirelessMonitor::update(const NetworkInterfaceSnapshot &snapshot) {
@@ -479,7 +652,9 @@ void NetworkWirelessMonitor::update(const NetworkInterfaceSnapshot &snapshot) {
     if (it == tracked_.end()) {
       base.identity = identity;
       base.first_seen = now;
-      base.signal_history = ResourceHistory<TimedSample>(history_max_samples_);
+      base.history = ResourceHistory<WirelessHistorySample>(history_max_samples_);
+      base.transitions =
+          ResourceHistory<WirelessTransitionEvent>(kMaxWirelessTransitions);
     } else {
       base = it->second;  // preserves PHY fields and history across renames
     }
@@ -543,15 +718,53 @@ void NetworkWirelessMonitor::update(const NetworkInterfaceSnapshot &snapshot) {
       next.last_probe = base.last_probe;
     }
 
-    // One signal sample per tick (never more, never on the render path). A
-    // stale/gap tick is simply not sampled, keeping the ring honest.
-    if (next.presence == WirelessPresence::Wireless &&
-        next.field_state == WirelessFieldState::Available &&
-        next.signal_dbm.has_value()) {
-      next.signal_history.addSample(
-          TimedSample{now, static_cast<double>(*next.signal_dbm)});
-    } else if (next.presence != WirelessPresence::Wireless) {
-      next.signal_history.clear();
+    // One self-contained wireless sample per tick (never more, never on the
+    // render path). A sample is recorded for EVERY present wireless interface
+    // regardless of value availability so association, coverage and honest gaps
+    // are tracked; unavailable metrics stay nullopt (never a fabricated zero),
+    // and an unavailable/stale tick is marked invalid — the preserved display
+    // values from judgeWireless() are NOT copied into the history.
+    if (next.presence == WirelessPresence::Wireless) {
+      WirelessHistorySample sample;
+      sample.timestamp = now;
+      sample.association = next.association;
+      sample.is_mac80211 = next.is_mac80211;
+      if (next.field_state == WirelessFieldState::Available) {
+        sample.valid = true;
+        if (next.signal_dbm.has_value()) {
+          sample.signal_dbm = static_cast<double>(*next.signal_dbm);
+        }
+        if (next.link_quality.has_value()) {
+          sample.link_quality = *next.link_quality;
+        }
+        // Bitrate / frequency / channel are not exposed by the approved native
+        // sources (sysfs, /proc/net/wireless) and therefore stay unavailable
+        // here; the sample carries the fields so the export/summary/test
+        // machinery is complete and deterministic.
+      }
+
+      // Association transitions: recorded only when the state actually
+      // changed, so repeated same-state ticks never spam the event log. The
+      // first sample establishes the baseline silently (no "unknown ->" event).
+      const bool baseline =
+          next.transitions.empty() &&
+          next.last_recorded_association == WirelessAssociation::Unknown;
+      if (baseline) {
+        next.last_recorded_association = next.association;
+      } else if (next.last_recorded_association != next.association) {
+        next.transitions.addSample(WirelessTransitionEvent{
+            now, snapshot.refreshed_at, next.last_recorded_association,
+            next.association});
+        next.last_recorded_association = next.association;
+      }
+
+      next.history.addSample(std::move(sample));
+      next.last_sample_wall = snapshot.refreshed_at;
+    } else {
+      next.history.clear();
+      next.transitions.clear();
+      next.last_recorded_association = WirelessAssociation::Unknown;
+      next.last_sample_wall = {};
     }
 
     next.last_read = snapshot.refreshed_at;
@@ -574,7 +787,9 @@ void NetworkWirelessMonitor::update(const NetworkInterfaceSnapshot &snapshot) {
 void NetworkWirelessMonitor::setHistoryMaxSamples(std::size_t max_samples) {
   history_max_samples_ = max_samples;
   for (auto &kv : tracked_) {
-    kv.second.signal_history = ResourceHistory<TimedSample>(max_samples);
+    kv.second.history = ResourceHistory<WirelessHistorySample>(max_samples);
+    kv.second.transitions =
+        ResourceHistory<WirelessTransitionEvent>(kMaxWirelessTransitions);
   }
 }
 

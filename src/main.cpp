@@ -4,6 +4,7 @@
 #include <cerrno>
 #include <chrono>
 #include <climits>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -1059,6 +1060,110 @@ std::string describeNetworkHardwareLine(
   return "Not applicable (no device relationship)";
 }
 
+/// Renders the wireless signal-history block (Step 50) for one interface: the
+/// gap-safe dBm chart plus the summarized current/min/max/avg values, sample
+/// counts/coverage/span and — in full form — the per-metric quality/bitrate/
+/// frequency/channel lines and the association-transition log. Everything comes
+/// from the monitor's retained rings and the pure summary function; the render
+/// path never touches the network, never interpolates gaps, and never invents a
+/// metric that the native kernel sources do not expose.
+void renderWirelessHistoryBlock(std::ostringstream &out,
+                                const atm::NetworkWirelessInfo &wireless,
+                                std::size_t max_samples, bool detailed) {
+  const atm::WirelessHistorySummary summary =
+      atm::summarizeWirelessHistory(wireless, max_samples);
+  if (!summary.has_data) {
+    if (detailed) {
+      out << "  History: no samples collected yet for this interface.\n";
+    }
+    return;
+  }
+
+  const auto formatMetric = [](const std::optional<double> &value) {
+    if (!value.has_value()) {
+      return std::string("n/a");
+    }
+    if (std::trunc(*value) == *value) {
+      return std::to_string(static_cast<long long>(*value));
+    }
+    std::ostringstream oss;
+    oss << std::fixed << std::setprecision(1) << *value;
+    return oss.str();
+  };
+  const auto formatAvg = [&formatMetric](const std::optional<double> &value) {
+    if (!value.has_value()) {
+      return std::string("n/a");
+    }
+    std::ostringstream oss;
+    oss << std::fixed << std::setprecision(1) << *value;
+    return oss.str();
+  };
+  const auto formatCoverage = [](double coverage) {
+    return std::to_string(
+               static_cast<long long>(std::llround(coverage * 100.0))) +
+           "%";
+  };
+  const auto formatSpan = [](double seconds) {
+    return seconds < 1.0
+               ? std::string("<1 s")
+               : std::to_string(static_cast<long long>(seconds)) + " s";
+  };
+
+  atm::WirelessHistoryChartConfig chart;
+  chart.data_width = 40;
+  chart.data_height = 6;
+  out << atm::renderWirelessSignalChart(wireless.history, chart) << '\n';
+
+  out << "Signal (dBm): current " << formatMetric(summary.current_signal_dbm)
+      << "  min " << formatMetric(summary.min_signal_dbm)
+      << "  max " << formatMetric(summary.max_signal_dbm)
+      << "  avg " << formatAvg(summary.avg_signal_dbm) << '\n';
+
+  out << "Link quality: current "
+      << (summary.current_link_quality.has_value()
+              ? atm::formatWirelessLinkQuality(summary.current_link_quality,
+                                               wireless.is_mac80211)
+              : "N/A");
+  if (summary.min_link_quality.has_value() &&
+      summary.max_link_quality.has_value()) {
+    out << "  min " << *summary.min_link_quality
+        << "  max " << *summary.max_link_quality;
+  }
+  if (summary.avg_link_quality.has_value()) {
+    out << "  avg " << formatAvg(summary.avg_link_quality);
+  }
+  out << '\n';
+
+  if (detailed) {
+    // Bitrate / frequency / channel come from the model's optional fields,
+    // which the approved native sources (sysfs /proc/net/wireless) never
+    // populate (they require nl80211) — the N/A is stated, never fabricated.
+    out << "Bitrate: "
+        << atm::formatWirelessBitrate(summary.current_bitrate_bps)
+        << "  Frequency: "
+        << atm::formatWirelessFrequency(summary.current_frequency_mhz)
+        << "  Channel: " << atm::formatWirelessChannel(summary.current_channel)
+        << "   (native interfaces expose no negotiated rate/frequency)\n";
+  }
+
+  out << "Samples: " << summary.sample_count << " ("
+      << summary.valid_sample_count << " valid)"
+      << "  Coverage: " << formatCoverage(summary.coverage) << " of "
+      << max_samples << " retained"
+      << "  Span: " << formatSpan(summary.span_seconds)
+      << "  Updated: " << formatTimestamp(summary.last_update) << '\n';
+
+  if (detailed && !wireless.transitions.empty()) {
+    out << "Association transitions: " << summary.transition_count << '\n';
+    for (const atm::WirelessTransitionEvent &event :
+         wireless.transitions.samples()) {
+      out << "  " << formatTimestamp(event.wall_clock) << "  "
+          << atm::wirelessAssociationName(event.from) << " -> "
+          << atm::wirelessAssociationName(event.to) << '\n';
+    }
+  }
+}
+
 /// Renders the NETWORK TRAFFIC HISTORY section: one overlaid RX/TX throughput
 /// chart plus current/peak/in-window-total/samples/span/last-update for one
 /// selected series (the aggregate or a tracked interface). Everything is read
@@ -1134,6 +1239,14 @@ void renderNetworkTrafficHistorySection(
     if (wireless != nullptr && wireless->present &&
         wireless->presence == atm::WirelessPresence::Wireless) {
       out << "Wireless: " << atm::describeWirelessLine(*wireless) << '\n';
+      // Compact wireless signal-history block for the selected wireless
+      // interface (gap-safe dBm chart + summary). Reads only the monitor's
+      // retained rings; never reads the network on the render path.
+      if (!wireless->history.empty()) {
+        out << "\nWireless signal history\n";
+        renderWirelessHistoryBlock(out, *wireless,
+                                   wireless_monitor.historyMaxSamples(), false);
+      }
     }
   }
 
@@ -4809,10 +4922,11 @@ void interactNetworkTrafficExport(const atm::NetworkTrafficHistory &traffic,
             hardware.tracked(effective_identity),
             wireless.tracked(effective_identity), info,
             link_state.tracked(effective_identity));
-    if (snapshot.samples.empty()) {
-      std::cout << "\nNo network traffic history samples are available to "
-                   "export for this selection (history is disabled or never "
-                   "collected).\n"
+    if (snapshot.samples.empty() &&
+        (!snapshot.wireless_history.has_value() ||
+         snapshot.wireless_history->samples.empty())) {
+      std::cout << "\nNo network history samples are available to export for "
+                   "this selection (history is disabled or never collected).\n"
                    "Press Enter to continue.\n"
                 << std::flush;
       static_cast<void>(input.readLine());
@@ -6086,6 +6200,9 @@ std::string buildNetworkInterfacePage(
     out << "  Note: channel, frequency, bitrate, SSID and BSSID are not "
            "exposed by the kernel's sysfs and /proc/net/wireless interfaces "
            "(nl80211 only) and are therefore not shown.\n";
+    out << "\n  History:\n";
+    renderWirelessHistoryBlock(out, *wireless,
+                               wireless_monitor.historyMaxSamples(), true);
   }
 
   out << "\nTraffic\n" << buildInterfaceDetail(traffic);

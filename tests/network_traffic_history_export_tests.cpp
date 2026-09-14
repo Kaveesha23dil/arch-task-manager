@@ -36,6 +36,8 @@ void run(const char *name) { std::fprintf(stderr, "TEST %s\n", name); }
 
 #define CHECK(expr) ::expect((expr), #expr, __FILE__, __LINE__)
 
+std::string tempPath(const std::string &suffix);
+
 using atm::NetworkInterfaceInfo;
 using atm::NetworkInterfaceSnapshot;
 using atm::NetworkInterfaceStats;
@@ -798,6 +800,176 @@ void test_export_wireless_null_for_non_wireless() {
 }
 
 // -------------------------------------------------------------------------
+// Wireless history export
+// -------------------------------------------------------------------------
+
+atm::NetworkWirelessInfo makeWirelessHistoryRecord() {
+  atm::NetworkWirelessInfo wl = makeWirelessRecord();
+  wl.history = atm::ResourceHistory<atm::WirelessHistorySample>(120);
+  const auto t0 = std::chrono::steady_clock::now() - std::chrono::seconds(3);
+  atm::WirelessHistorySample s1;
+  s1.timestamp = t0;
+  s1.association = atm::WirelessAssociation::Associated;
+  s1.valid = true;
+  s1.is_mac80211 = true;
+  s1.signal_dbm = -48;
+  s1.link_quality = 50;
+  wl.history.addSample(s1);
+  atm::WirelessHistorySample s2;
+  s2.timestamp = t0 + std::chrono::seconds(1);
+  s2.association = atm::WirelessAssociation::Associated;
+  s2.valid = false;  // one tick with no fresh read: an honest gap
+  wl.history.addSample(s2);
+  atm::WirelessHistorySample s3;
+  s3.timestamp = t0 + std::chrono::seconds(2);
+  s3.association = atm::WirelessAssociation::Associated;
+  s3.valid = true;
+  s3.is_mac80211 = true;
+  s3.signal_dbm = -42;
+  s3.link_quality = 58;
+  s3.bitrate_bps = 54000000.0;
+  s3.frequency_mhz = 2412.0;
+  s3.channel = 6;
+  wl.history.addSample(s3);
+  wl.last_sample_wall = std::chrono::system_clock::now();
+  return wl;
+}
+
+void test_csv_wireless_history_section() {
+  run("csvWirelessHistorySection");
+  atm::NetworkTrafficSeries s = makeSeries("idx:30", "wlp2s0", false, 120);
+  fillFourTicks(s);
+  const atm::NetworkWirelessInfo wl = makeWirelessHistoryRecord();
+  const atm::NetworkTrafficExportSnapshot snapshot =
+      atm::buildNetworkTrafficExportSnapshot(s, 120, nullptr, nullptr, &wl);
+  const std::string csv = atm::generateNetworkTrafficCsv(snapshot);
+  // The wireless section is separated from the 39-column table by a blank
+  // line; linesOf() stops at the first blank line, so split the sections first.
+  const std::size_t separator = csv.find("\n\n");
+  CHECK(separator != std::string::npos);
+  const std::vector<std::string> table_lines = linesOf(csv.substr(0, separator));
+  const std::vector<std::string> lines =
+      linesOf(csv.substr(separator + 2));
+  CHECK(table_lines.size() == 5);  // header + 4 ticks
+  // wireless section (header + 3 rows + summary)
+  CHECK(lines.size() == 5);
+
+  const std::vector<std::string> header = csvSplit(lines[0]);
+  CHECK(header.size() == 10);
+  CHECK(header[0] == "timestamp");
+  CHECK(header[1] == "interface");
+  CHECK(header[2] == "association");
+  CHECK(header[3] == "valid");
+  CHECK(header[4] == "signal_dbm");
+  CHECK(header[5] == "link_quality");
+  CHECK(header[6] == "link_quality_scale");
+  CHECK(header[7] == "bitrate_bps");
+  CHECK(header[8] == "frequency_mhz");
+  CHECK(header[9] == "channel");
+
+  // Oldest sample carries signal but no bitrate/frequency/channel.
+  const std::vector<std::string> oldest = csvSplit(lines[1]);
+  CHECK(oldest[1] == "wlp2s0");
+  CHECK(oldest[2] == "associated");
+  CHECK(oldest[3] == "1");
+  CHECK(oldest[4] == "-48");
+  CHECK(oldest[5] == "50");
+  CHECK(oldest[6] == "mac80211 /70");
+  CHECK(oldest[7] == "");
+  CHECK(oldest[8] == "");
+  CHECK(oldest[9] == "");
+
+  // The invalid gap tick is a blank measurement, never a fabricated zero.
+  const std::vector<std::string> gap = csvSplit(lines[2]);
+  CHECK(gap[2] == "associated");
+  CHECK(gap[3] == "0");
+  CHECK(gap[4] == "");
+  CHECK(gap[5] == "");
+  CHECK(gap[6] == "");
+  CHECK(gap[7] == "");
+  CHECK(gap[8] == "");
+  CHECK(gap[9] == "");
+
+  const std::vector<std::string> newest = csvSplit(lines[3]);
+  CHECK(newest[2] == "associated");
+  CHECK(newest[3] == "1");
+  CHECK(newest[4] == "-42");
+  CHECK(newest[5] == "58");
+  CHECK(newest[6] == "mac80211 /70");
+  CHECK(newest[7] == "54000000");
+  CHECK(newest[8] == "2412");
+  CHECK(newest[9] == "6");
+
+  // The trailing summary line is clearly prefixed to never look like a sample.
+  CHECK(lines[4].find("summary,") == 0);
+  CHECK(lines[4].find("signal_dbm_current=-42") != std::string::npos);
+  CHECK(lines[4].find("signal_dbm_min=-48") != std::string::npos);
+  CHECK(lines[4].find("signal_dbm_max=-42") != std::string::npos);
+  CHECK(lines[4].find("signal_dbm_avg=-45") != std::string::npos);
+  CHECK(lines[4].find("valid_samples=2") != std::string::npos);
+}
+
+void test_json_wireless_history() {
+  run("jsonWirelessHistory");
+  atm::NetworkTrafficSeries s = makeSeries("idx:30", "wlp2s0", false, 120);
+  const atm::NetworkWirelessInfo wl = makeWirelessHistoryRecord();
+  const atm::NetworkTrafficExportSnapshot snapshot =
+      atm::buildNetworkTrafficExportSnapshot(s, 120, nullptr, nullptr, &wl);
+  const std::string json = atm::generateNetworkTrafficJson(snapshot);
+  CHECK(isValidJson(json));
+  CHECK(json.find("\"wireless_history\":{") != std::string::npos);
+  CHECK(json.find("\"sample_count\":3") != std::string::npos);
+  CHECK(json.find("\"valid_sample_count\":2") != std::string::npos);
+  CHECK(json.find("\"valid\":true") != std::string::npos);
+  CHECK(json.find("\"valid\":false") != std::string::npos);
+  CHECK(json.find("\"signal_dbm\":-42") != std::string::npos);
+  CHECK(json.find("\"signal_dbm\":-48") != std::string::npos);
+  CHECK(json.find("\"signal_dbm\":null") != std::string::npos);  // gap stays null
+  CHECK(json.find("\"current_link_quality\":null") == std::string::npos);
+  CHECK(json.find("\"bitrate_bps\":54000000") != std::string::npos);
+  CHECK(json.find("\"frequency_mhz\":2412") != std::string::npos);
+  CHECK(json.find("\"channel\":6") != std::string::npos);
+  CHECK(json.find("\"channel\":null") != std::string::npos);
+  CHECK(json.find("\"current_signal_dbm\":-42") != std::string::npos);
+  CHECK(json.find("\"min_signal_dbm\":-48") != std::string::npos);
+  CHECK(json.find("\"max_signal_dbm\":-42") != std::string::npos);
+  CHECK(json.find("\"avg_signal_dbm\":-45") != std::string::npos);
+  CHECK(json.find("\"current_link_quality\":58") != std::string::npos);
+  CHECK(json.find("\"current_bitrate_bps\":54000000") != std::string::npos);
+  CHECK(json.find("\"current_frequency_mhz\":2412") != std::string::npos);
+  CHECK(json.find("\"current_channel\":6") != std::string::npos);
+  // SSID/BSSID are not exposed by the kernel via sysfs or /proc/net/wireless
+  // and must never appear even in the wireless history section.
+  CHECK(json.find("ssid") == std::string::npos);
+  CHECK(json.find("bssid") == std::string::npos);
+}
+
+void test_export_wireless_history_alone_passes_empty_gate() {
+  run("exportWirelessHistoryAlone");
+  atm::NetworkTrafficSeries s = makeSeries("idx:30", "wlp2s0", false, 120);
+  const atm::NetworkWirelessInfo wl = makeWirelessHistoryRecord();
+  const atm::NetworkTrafficExportSnapshot snapshot =
+      atm::buildNetworkTrafficExportSnapshot(s, 120, nullptr, nullptr, &wl);
+  CHECK(snapshot.samples.empty());
+  CHECK(snapshot.wireless_history.has_value());
+
+  // A wireless-history-only snapshot must not be rejected as "empty history".
+  const std::string path = tempPath("wireless-only.csv");
+  std::remove(path.c_str());
+  const auto result = atm::exportNetworkTrafficHistory(
+      path, snapshot, NetworkTrafficExportFormat::Csv);
+  CHECK(result.status == NetworkTrafficExportStatus::Success);
+  std::remove(path.c_str());
+
+  const std::string csv = atm::generateNetworkTrafficCsv(snapshot);
+  CHECK(csv.find("timestamp,interface,association,valid,signal_dbm") !=
+        std::string::npos);
+  const std::string json = atm::generateNetworkTrafficJson(snapshot);
+  CHECK(isValidJson(json));
+  CHECK(json.find("\"wireless_history\":{") != std::string::npos);
+}
+
+// -------------------------------------------------------------------------
 // JSON serialization
 // -------------------------------------------------------------------------
 
@@ -1451,6 +1623,10 @@ int main() {
   test_json_wireless_metadata();
   test_export_wireless_null_for_non_wireless();
   test_json_no_internal_state();
+
+  test_csv_wireless_history_section();
+  test_json_wireless_history();
+  test_export_wireless_history_alone_passes_empty_gate();
 
   test_summary_current_and_peak();
   test_summary_totals_valid_window();

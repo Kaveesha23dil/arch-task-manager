@@ -127,6 +127,51 @@ struct NetworkTrafficExportWireless {
   std::chrono::system_clock::time_point last_read{};
 };
 
+/// One exported wireless-history sample row (Step 50). Mirrors the live
+/// WirelessHistorySample model: every metric is an explicit null when it was
+/// unavailable for that tick — never a fabricated zero. `valid` marks ticks
+/// whose dynamic fields were freshly read (invalid ticks create honest gaps,
+/// never interpolated values). The wall-clock `timestamp` is anchored to the
+/// wireless history's newest sample the same way the traffic rows anchor to the
+/// series' last update.
+struct NetworkTrafficExportWirelessRow {
+  std::chrono::system_clock::time_point timestamp{};
+  std::string association;          // "associated" / "disconnected" / "unknown"
+  bool valid = false;
+  std::optional<double> signal_dbm;
+  std::optional<int> link_quality;
+  std::string link_quality_scale;   // "mac80211 /70" / "driver-defined" / ""
+  std::optional<double> bitrate_bps;
+  std::optional<double> frequency_mhz;
+  std::optional<int> channel;
+};
+
+/// Wireless history (summary + per-sample rows) captured into an export
+/// snapshot. Only present when the selected interface is wireless and its
+/// history ring holds recorded samples. The numbers match — and never exceed —
+/// what the wireless-history view displays: signal/quality per-metric basic
+/// statistics are computed over the retained valid samples only.
+struct NetworkTrafficExportWirelessHistory {
+  std::size_t sample_count = 0;
+  std::size_t valid_sample_count = 0;
+  double coverage = 0.0;
+  bool history_complete = false;
+  double span_seconds = 0.0;
+
+  std::optional<double> current_signal_dbm;
+  std::optional<double> min_signal_dbm;
+  std::optional<double> max_signal_dbm;
+  std::optional<double> avg_signal_dbm;
+
+  std::optional<int> current_link_quality;
+  std::optional<double> current_bitrate_bps;
+  std::optional<double> current_frequency_mhz;
+  std::optional<int> current_channel;
+
+  std::chrono::system_clock::time_point last_update{};
+  std::vector<NetworkTrafficExportWirelessRow> samples;  // ascending order
+};
+
 /// Implementation-free, immutable snapshot of one traffic series ready for
 /// serialization. Contains only plain data — no pointers, no mutexes, no UI
 /// objects and no internal bookkeeping. Building this snapshot before
@@ -155,6 +200,11 @@ struct NetworkTrafficExportSnapshot {
   // Wireless metadata when the exported series maps to a single wireless
   // interface (std::nullopt for the aggregate / non-wireless interfaces).
   std::optional<NetworkTrafficExportWireless> wireless;
+
+  // Wireless history when the exported series maps to a wireless interface with
+  // recorded samples (std::nullopt otherwise). The values match what the
+  // wireless-history view displays — see NetworkTrafficExportWirelessHistory.
+  std::optional<NetworkTrafficExportWirelessHistory> wireless_history;
 };
 
 /// Builds a stable snapshot of `series` for export. Reads only the series'
@@ -169,9 +219,11 @@ struct NetworkTrafficExportSnapshot {
 /// together with the underlying `info` (interface index, type name, MAC) and
 /// `link_state` (carrier/operational state). When `wireless` points at the
 /// selected interface's wireless record (and that record is a wireless
-/// interface) it is captured into snapshot.wireless. All parameters are
-/// additive — existing fields are unchanged and any missing one stays
-/// unavailable.
+/// interface) it is captured into snapshot.wireless, and when its history ring
+/// holds recorded samples those are captured into snapshot.wireless_history
+/// (per-sample rows anchored to the newest sample plus the summary numbers the
+/// wireless-history view shows). All parameters are additive — existing fields
+/// are unchanged and any missing one stays unavailable.
 [[nodiscard]] NetworkTrafficExportSnapshot buildNetworkTrafficExportSnapshot(
     const NetworkTrafficSeries &series, std::size_t max_samples,
     const NetworkLinkMetrics *link_metrics = nullptr,
@@ -198,9 +250,11 @@ struct NetworkTrafficExportSnapshot {
 /// snapshot — the trailing wireless presence/phy/signal/noise/association/
 /// state columns. All metadata columns are append-only additions, so the
 /// leading historical columns are unchanged; without captured metadata the
-/// trailing columns are empty. Unavailable metrics are empty fields (never
-/// misleading zeros); headers are always emitted, so a snapshot with no rows
-/// still produces a valid, readable CSV.
+/// trailing columns are empty. When a wireless history was captured it is
+/// appended as a clearly-headed second section (its own header, one row per
+/// wireless sample and a prefixed summary line). Unavailable metrics are empty
+/// fields (never misleading zeros); headers are always emitted, so a snapshot
+/// with no rows still produces a valid, readable CSV.
 [[nodiscard]] std::string generateNetworkTrafficCsv(
     const NetworkTrafficExportSnapshot &snapshot);
 
@@ -211,7 +265,9 @@ struct NetworkTrafficExportSnapshot {
 /// driver/device relationships and carrier/operational state, null when
 /// absent), an optional "wireless" object (wireless presence, PHY, signal/noise
 /// dBm, raw link quality, carrier-derived association and freshness, null when
-/// absent), history span and sampling interval, unit information, the summary
+/// absent), an optional "wireless_history" object (per-sample rows plus the
+/// signal/quality summary the wireless-history view shows, null when absent)
+/// and history span and sampling interval, unit information, the summary
 /// values and the sample array. Unavailable values are null; an empty sample
 /// array is valid; no internal implementation state is ever serialized.
 [[nodiscard]] std::string generateNetworkTrafficJson(

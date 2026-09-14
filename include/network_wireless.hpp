@@ -102,13 +102,51 @@ struct ProcWirelessStats {
 [[nodiscard]] ProcWirelessStats readProcNetWirelessStats(
     const std::filesystem::path &path, const std::string &iface);
 
+/// One wireless-history sample, captured at most once per interface per refresh
+/// cycle (never on the UI-render path). Every metric is strongly optional: an
+/// unavailable metric is std::nullopt — never a fabricated zero — and
+/// `valid == false` marks a tick whose dynamic fields could not be freshly read
+/// (stale/unavailable), so consumers can compute honest coverage and never
+/// mistake a gap for a real measurement. Samples are never interpolated; a
+/// missing/stale tick is simply a gap.
+///
+/// Bitrate, frequency and channel are not exposed by the kernel's sysfs or
+/// /proc/net/wireless interfaces (they require the nl80211 netlink API), so in
+/// production they stay std::nullopt; the model carries them anyway so the
+/// export/summary machinery is complete and unit-testable with deterministic
+/// fixtures.
+struct WirelessHistorySample {
+  std::chrono::steady_clock::time_point timestamp{};  // ordering
+  WirelessAssociation association = WirelessAssociation::Unknown;
+  std::optional<double> signal_dbm;    // received signal strength in dBm
+  std::optional<int> link_quality;     // raw WIRELESS_EXT value (driver scale)
+  bool is_mac80211 = false;            // link-quality scale metadata (mac80211 "/70")
+  std::optional<double> bitrate_bps;   // canonical bits per second
+  std::optional<double> frequency_mhz; // centre frequency, MHz
+  std::optional<int> channel;          // channel index, when reliably known
+  bool valid = false;                  // dynamic fields freshly read this tick
+};
+
+/// One recorded association transition (the association state changed between
+/// two consecutive samples). Deduplicated: repeated same-state ticks never
+/// append events, and the first sample establishes the baseline silently.
+struct WirelessTransitionEvent {
+  std::chrono::steady_clock::time_point timestamp{};   // ordering
+  std::chrono::system_clock::time_point wall_clock{};  // "shown at" display time
+  WirelessAssociation from = WirelessAssociation::Unknown;
+  WirelessAssociation to = WirelessAssociation::Unknown;
+};
+
+/// Upper bound on the retained association-transition history per interface.
+inline constexpr std::size_t kMaxWirelessTransitions = 32;
+
 /// One interface's tracked wireless status. The static PHY fields come from the
 /// cached probe; the dynamic fields (link quality, signal, noise, association,
 /// carrier) are re-derived every tick from the existing interface-details
 /// snapshot — there is no second polling loop. Fields are only ever filled from
 /// native kernel metadata; an unknown value is its explicit state, never a
-/// guessed zero. Settings such as SSID/BSSID/channel/frequency/bitrate are
-/// intentionally absent because the kernel does not expose them via sysfs.
+/// guessed zero. Settings such as SSID/BSSID are intentionally absent because
+/// the kernel does not expose them via sysfs.
 struct NetworkWirelessInfo {
   std::string identity;          // stable key ("idx:<ifindex>" / "name:<name>")
   std::string name;              // current kernel name
@@ -130,15 +168,86 @@ struct NetworkWirelessInfo {
   bool carrier_exposed = false;     // the driver exposes a "carrier" file
   bool has_carrier = false;
 
-  // Per-identity received-signal-strength history (one sample per tick; the
-  // ring is bounded and rebuilt when the history retention changes).
-  ResourceHistory<TimedSample> signal_history{0};
+  // Per-identity wireless sample history: one self-contained sample per tick
+  // (never on the render path), bounded and rebuilt when the history retention
+  // changes. Replaces the Step 49 per-metric signal ring so association, scale
+  // metadata and the optional metrics travel with each sample, and gaps stay
+  // honest. The ring is cleared when the identity stops being wireless.
+  ResourceHistory<WirelessHistorySample> history{0};
+
+  // Bounded association-transition events (newest last), deduplicated: events
+  // fire only when the association state actually changes.
+  ResourceHistory<WirelessTransitionEvent> transitions{0};
+
+  // Association of the most recent recorded history sample. Transitions are
+  // recorded only when this changes, never on repeated same-state ticks, and
+  // the very first sample establishes the baseline silently.
+  WirelessAssociation last_recorded_association = WirelessAssociation::Unknown;
+
+  // Wall clock captured when the newest history sample was recorded. The
+  // exported wireless-history timestamps are anchored to this time the same way
+  // the traffic export anchors to the series' last update.
+  std::chrono::system_clock::time_point last_sample_wall{};
 
   std::chrono::system_clock::time_point last_read{};  // last successful tick
   std::chrono::steady_clock::time_point first_seen{};
   std::chrono::steady_clock::time_point last_probe{};
   bool probe_ok = true;  // last static-probe attempt succeeded (internal flag)
 };
+
+/// Derived summary of one interface's wireless history — the numbers the
+/// wireless-history section shows (current/min/max/average over the retained
+/// valid samples, sample counts, coverage, span and transition count). Pure and
+/// computed strictly from the retained ring, never from the live kernel state.
+struct WirelessHistorySummary {
+  bool has_data = false;
+  std::size_t sample_count = 0;      // retained samples
+  std::size_t valid_sample_count = 0;  // ticks with freshly-read dynamic fields
+  double coverage = 0.0;             // sample_count / retention bound (0..1)
+  double valid_coverage = 0.0;       // valid_sample_count / retention bound
+  bool history_complete = false;     // sample_count >= retention bound
+  double span_seconds = 0.0;         // newest - oldest sample span
+  std::size_t transition_count = 0;  // association changes across the history
+
+  // Signal (dBm). Per-metric statistics include only samples that carried a
+  // value; invalid/gap ticks contribute nothing.
+  std::optional<double> current_signal_dbm;
+  std::optional<double> min_signal_dbm;
+  std::optional<double> max_signal_dbm;
+  std::optional<double> avg_signal_dbm;
+  std::size_t signal_sample_count = 0;
+
+  // Link quality (raw WIRELESS_EXT value on its driver scale).
+  std::optional<int> current_link_quality;
+  std::optional<int> min_link_quality;
+  std::optional<int> max_link_quality;
+  std::optional<double> avg_link_quality;
+  std::size_t link_quality_sample_count = 0;
+
+  // Connection bitrate (canonical bits per second; unavailable on this stack).
+  std::optional<double> current_bitrate_bps;
+  std::optional<double> min_bitrate_bps;
+  std::optional<double> max_bitrate_bps;
+  std::optional<double> avg_bitrate_bps;
+  std::size_t bitrate_sample_count = 0;
+
+  // Centre frequency (MHz) and channel (unavailable on this stack).
+  std::optional<double> current_frequency_mhz;
+  std::optional<double> min_frequency_mhz;
+  std::optional<double> max_frequency_mhz;
+  std::optional<double> avg_frequency_mhz;
+  std::size_t frequency_sample_count = 0;
+
+  std::optional<int> current_channel;
+  std::size_t channel_sample_count = 0;
+
+  std::chrono::system_clock::time_point last_update{};  // newest sample wall time
+};
+
+/// Summarises `wireless`'s retained history. Never touches the live kernel
+/// state; the returned summary is a pure function of the retained ring.
+[[nodiscard]] WirelessHistorySummary summarizeWirelessHistory(
+    const NetworkWirelessInfo &wireless, std::size_t max_samples);
 
 /// Derives one interface's per-tick wireless view from the latest details
 /// snapshot, the cached probe and an optional /proc/net/wireless fallback, while
@@ -163,6 +272,17 @@ struct NetworkWirelessInfo {
 /// "-96 dBm" or "N/A" when the noise floor is unknown.
 [[nodiscard]] std::string formatWirelessNoise(const std::optional<int> &noise_dbm);
 
+/// "866.7 Mb/s" or "1.5 Gb/s" or "54 Mb/s" from the canonical bits-per-second
+/// value (decimal 1000-based), or "N/A" when the rate is unknown. The internal
+/// unit is always bits per second; only the display scales.
+[[nodiscard]] std::string formatWirelessBitrate(const std::optional<double> &bps);
+
+/// "2412 MHz" or "N/A" when the centre frequency is unknown.
+[[nodiscard]] std::string formatWirelessFrequency(const std::optional<double> &mhz);
+
+/// "6" or "N/A" when the channel is unknown or not reliably reported.
+[[nodiscard]] std::string formatWirelessChannel(const std::optional<int> &channel);
+
 /// Compact one-line wireless summary for the traffic-history section
 /// ("associated (carrier) \u2014 signal -42 dBm, link quality 54 /70").
 [[nodiscard]] std::string describeWirelessLine(const NetworkWirelessInfo &wireless);
@@ -186,13 +306,16 @@ inline constexpr std::chrono::seconds kWirelessRereadInterval{10};
 /// recreated interface (new ifindex) naturally starts a fresh record instead of
 /// inheriting an old one's values.
 ///
-/// Limitations (see Step 49 scope): SSID, BSSID, channel, frequency and
-/// negotiated bitrate are not available through sysfs or /proc/net/wireless
-/// (they require the nl80211 netlink API, which this monitoring-only step does
-/// not add), so they are intentionally absent. Signal-worthiness alerting is
-/// likewise out of scope: the existing network-traffic alert engine is limited
-/// to traffic-series rules, and adding wireless rules there would require an
-/// alert-engine redesign, so this monitor does not emit alerts.
+/// Limitations (see Step 49/50 scope): SSID and BSSID are not available
+/// through sysfs or /proc/net/wireless (they require the nl80211 netlink API),
+/// so they are intentionally absent. The negotiated bitrate, centre frequency
+/// and channel are likewise not exposed by those native sources and therefore
+/// stay unknown (nullopt) in production — the history model carries them so the
+/// export/summary machinery is complete and deterministically testable.
+/// Signal-worthiness alerting is out of scope: the existing network-traffic
+/// alert engine is limited to traffic-series rules, and adding wireless rules
+/// there would require an alert-engine redesign, so this monitor does not emit
+/// alerts.
 class NetworkWirelessMonitor {
  public:
   static constexpr std::size_t kMaxTrackedWirelessInterfaces = 64;
@@ -219,8 +342,9 @@ class NetworkWirelessMonitor {
     return tracked_;
   }
 
-  /// The received-signal-strength history for an identity (or nullptr).
-  [[nodiscard]] const ResourceHistory<TimedSample> *signalHistory(
+  /// The wireless sample history (incl. transitions) for an identity;
+  /// nullptr when never seen.
+  [[nodiscard]] const ResourceHistory<WirelessHistorySample> *wirelessHistory(
       const std::string &identity) const;
 
   void setHistoryMaxSamples(std::size_t max_samples);
