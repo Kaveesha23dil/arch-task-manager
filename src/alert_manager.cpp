@@ -61,6 +61,7 @@ const char *alertTypeName(AlertType type) {
     case AlertType::GpuMemoryUsage:   return "GPU memory";
     case AlertType::Temperature:      return "Temperature";
     case AlertType::LinkStateChanged: return "Link state";
+    case AlertType::WirelessConnectionChanged: return "Wireless connection";
   }
   return "Unknown";
 }
@@ -128,6 +129,11 @@ AlertThreshold AlertDefaults::forType(AlertType type) {
       // (recordRuleEvent), never by threshold evaluation.
       t.enabled = false;
       break;
+    case AlertType::WirelessConnectionChanged:
+      // Wireless connection transitions are recorded directly by the wireless
+      // monitor (recordConnectionEvent), never by threshold evaluation.
+      t.enabled = false;
+      break;
     case AlertType::GpuUsage:
       t.warning = 85.0; t.critical = 95.0; t.recovery = 80.0; t.enabled = true;
       break;
@@ -143,7 +149,8 @@ AlertThreshold AlertDefaults::forType(AlertType type) {
 
 AlertManager::AlertManager(std::size_t max_history) : max_history_(max_history) {
   // Initialise thresholds for every alert type.
-  for (int i = 0; i <= static_cast<int>(AlertType::LinkStateChanged); ++i) {
+  for (int i = 0; i <= static_cast<int>(AlertType::WirelessConnectionChanged);
+       ++i) {
     const AlertType type = static_cast<AlertType>(i);
     thresholds_[type] = AlertDefaults::forType(type);
   }

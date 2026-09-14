@@ -561,3 +561,20 @@ target_include_directories(network-wireless-history-tests PRIVATE include)
 target_link_libraries(network-wireless-history-tests PRIVATE Threads::Threads)
 
 add_test(NAME network-wireless-history COMMAND network-wireless-history-tests)
+
+add_executable(network-wireless-connection-events-tests
+  tests/network_wireless_connection_events_tests.cpp
+  src/network_wireless.cpp
+  src/network_interface_details.cpp
+  src/network_link_state.cpp
+  src/network_link_metrics.cpp
+  src/alert_manager.cpp
+  src/network_monitor.cpp
+  src/resource_history.cpp
+)
+
+target_include_directories(network-wireless-connection-events-tests PRIVATE include)
+
+target_link_libraries(network-wireless-connection-events-tests PRIVATE Threads::Threads)
+
+add_test(NAME network-wireless-connection-events COMMAND network-wireless-connection-events-tests)

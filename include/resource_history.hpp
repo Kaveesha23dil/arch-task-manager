@@ -24,7 +24,7 @@ class ResourceHistory {
       : max_samples_(max_samples) {}
 
   void addSample(const T& sample) {
-    if (buffer_.size() >= max_samples_) {
+    if (max_samples_ != 0 && buffer_.size() >= max_samples_) {
       buffer_.pop_front();
     }
     buffer_.push_back(sample);

@@ -1153,13 +1153,17 @@ void renderWirelessHistoryBlock(std::ostringstream &out,
       << "  Span: " << formatSpan(summary.span_seconds)
       << "  Updated: " << formatTimestamp(summary.last_update) << '\n';
 
-  if (detailed && !wireless.transitions.empty()) {
-    out << "Association transitions: " << summary.transition_count << '\n';
-    for (const atm::WirelessTransitionEvent &event :
-         wireless.transitions.samples()) {
-      out << "  " << formatTimestamp(event.wall_clock) << "  "
-          << atm::wirelessAssociationName(event.from) << " -> "
-          << atm::wirelessAssociationName(event.to) << '\n';
+  if (detailed) {
+    out << "Connection events: " << summary.event_count << " (of "
+        << atm::kMaxWirelessConnectionEvents << " retained)\n";
+    if (wireless.connection_events.empty()) {
+      out << "  none recorded yet\n";
+    } else {
+      for (const atm::WirelessConnectionEvent &event :
+           wireless.connection_events.samples()) {
+        out << "  " << formatTimestamp(event.wall_clock) << "  "
+            << atm::describeWirelessConnectionEvent(event) << '\n';
+      }
     }
   }
 }
@@ -1640,6 +1644,8 @@ std::string describeAlertSubject(atm::AlertType type, const std::string &source,
       return source + " temperature: " + v;
     case atm::AlertType::LinkStateChanged:
       return source + " link state: " + v;
+    case atm::AlertType::WirelessConnectionChanged:
+      return source + " wireless connection: " + v;
   }
   return source + ": " + v;
 }
@@ -1954,6 +1960,17 @@ void onNetworkTrafficAlertEvent(const atm::AlertEvent &event) {
 /// per-source cooldown. Removal and temporary read failures never reach this
 /// sink.
 void onNetworkLinkStateEvent(const atm::AlertEvent &event) {
+  if (g_notification_manager != nullptr) {
+    g_notification_manager->notify(event);
+  }
+}
+
+/// Event sink for the wireless connection monitor: forwards each confirmed
+/// association/availability transition to the desktop notification manager,
+/// which applies the global settings (enabled, severity/recovery toggles) and
+/// its own per-source cooldown. Roaming is never emitted and therefore never
+/// reaches this sink.
+void onNetworkWirelessEvent(const atm::AlertEvent &event) {
   if (g_notification_manager != nullptr) {
     g_notification_manager->notify(event);
   }
@@ -4924,7 +4941,8 @@ void interactNetworkTrafficExport(const atm::NetworkTrafficHistory &traffic,
             link_state.tracked(effective_identity));
     if (snapshot.samples.empty() &&
         (!snapshot.wireless_history.has_value() ||
-         snapshot.wireless_history->samples.empty())) {
+         (snapshot.wireless_history->samples.empty() &&
+          snapshot.wireless_history->events.empty()))) {
       std::cout << "\nNo network history samples are available to export for "
                    "this selection (history is disabled or never collected).\n"
                    "Press Enter to continue.\n"
@@ -7931,7 +7949,7 @@ int main() {
   atm::NetworkLinkStateMonitor network_link_state(alerts);
   atm::NetworkLinkMetricsMonitor network_link_metrics;
   atm::NetworkInterfaceHardwareMonitor network_hardware_monitor;
-  atm::NetworkWirelessMonitor network_wireless;
+  atm::NetworkWirelessMonitor network_wireless(alerts);
   atm::NotificationManager notifications;
   atm::PackageManager packages;
   atm::PackageTransaction package_transaction;
@@ -7956,6 +7974,7 @@ int main() {
   alerts.setNotificationSink(&onAlertEvent);
   network_alert_monitor.setEventSink(&onNetworkTrafficAlertEvent);
   network_link_state.setEventSink(&onNetworkLinkStateEvent);
+  network_wireless.setEventSink(&onNetworkWirelessEvent);
 
   // Reconcile the persisted autostart preference with the desktop entry on
   // disk. This only repairs/removes arch-task-manager.desktop in the user's

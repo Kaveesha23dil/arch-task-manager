@@ -970,6 +970,152 @@ void test_export_wireless_history_alone_passes_empty_gate() {
 }
 
 // -------------------------------------------------------------------------
+// Wireless connection-events export (Step 51)
+// -------------------------------------------------------------------------
+
+/// A wireless record with both signal-history samples and connection events.
+atm::NetworkWirelessInfo makeWirelessHistoryRecordWithEvents() {
+  atm::NetworkWirelessInfo wl = makeWirelessHistoryRecord();
+
+  const std::chrono::system_clock::time_point wall =
+      std::chrono::system_clock::now() - std::chrono::minutes(1);
+  atm::WirelessConnectionEvent drop;
+  drop.type = atm::WirelessConnectionEventType::Disassociated;
+  drop.confident = true;
+  drop.source = "carrier";
+  drop.interface_name = "wlp2s0";
+  drop.previous_association = atm::WirelessAssociation::Associated;
+  drop.new_association = atm::WirelessAssociation::Disconnected;
+  drop.previous_signal_dbm = -42;
+  drop.new_signal_dbm = -42;
+  drop.wall_clock = wall;
+  wl.connection_events.addSample(drop);
+
+  atm::WirelessConnectionEvent regain;
+  regain.type = atm::WirelessConnectionEventType::Reconnected;
+  regain.confident = true;
+  regain.source = "carrier";
+  regain.interface_name = "wlp2s0";
+  regain.previous_association = atm::WirelessAssociation::Disconnected;
+  regain.new_association = atm::WirelessAssociation::Associated;
+  regain.previous_signal_dbm = -44;
+  regain.new_signal_dbm = -41;
+  regain.wall_clock = wall + std::chrono::seconds(10);
+  wl.connection_events.addSample(regain);
+
+  atm::WirelessConnectionEvent roam;
+  roam.type = atm::WirelessConnectionEventType::Roamed;
+  roam.confident = true;
+  roam.source = "ap_identity";
+  roam.interface_name = "wlp2s0";
+  roam.previous_association = atm::WirelessAssociation::Associated;
+  roam.new_association = atm::WirelessAssociation::Associated;
+  roam.ap_fingerprint_changed = true;
+  roam.ap_identity_reliable = true;
+  roam.previous_signal_dbm = -40;
+  roam.new_signal_dbm = -39;
+  roam.wall_clock = wall + std::chrono::seconds(20);
+  wl.connection_events.addSample(roam);
+  return wl;
+}
+
+void test_csv_wireless_connection_events_section() {
+  run("csvWirelessConnectionEventsSection");
+  atm::NetworkTrafficSeries s = makeSeries("idx:30", "wlp2s0", false, 120);
+  fillFourTicks(s);
+  const atm::NetworkWirelessInfo wl = makeWirelessHistoryRecordWithEvents();
+  const atm::NetworkTrafficExportSnapshot snapshot =
+      atm::buildNetworkTrafficExportSnapshot(s, 120, nullptr, nullptr, &wl);
+  const std::string csv = atm::generateNetworkTrafficCsv(snapshot);
+
+  // Find the events section header after the wireless history section.
+  const std::string header =
+      "\ntimestamp,interface,event,confident,source,"
+      "previous_association,new_association,previous_signal_dbm,"
+      "new_signal_dbm,previous_frequency_mhz,new_frequency_mhz,"
+      "previous_channel,new_channel,access_point_changed,"
+      "access_point_reliable\n";
+  const std::size_t header_pos = csv.find(header);
+  CHECK(header_pos != std::string::npos);
+
+  // The events section is the final one and is not terminated by a trailing
+  // blank line: parse the rows directly after the header.
+  const std::vector<std::string> lines =
+      linesOf(csv.substr(header_pos + header.size()));
+  CHECK(lines.size() == 3);  // one row per event
+
+  const std::vector<std::string> row = csvSplit(lines[0]);
+  CHECK(row.size() == 15);
+  CHECK(row[1] == "wlp2s0");
+  CHECK(row[2] == "disassociated");
+  CHECK(row[3] == "1");       // confident
+  CHECK(row[4] == "carrier"); // source
+  CHECK(row[5] == "associated");
+  CHECK(row[6] == "disconnected");
+  CHECK(row[12] == "");       // no frequency/channel in the fixture
+  CHECK(row[13] == "0");      // not a roam
+  CHECK(row[14] == "0");
+
+  const std::vector<std::string> last = csvSplit(lines[2]);
+  CHECK(last[2] == "roamed");
+  CHECK(last[4] == "ap_identity");
+  CHECK(last[13] == "1");  // access_point_changed
+  CHECK(last[14] == "1");  // access_point_reliable
+}
+
+void test_json_wireless_connection_events() {
+  run("jsonWirelessConnectionEvents");
+  atm::NetworkTrafficSeries s = makeSeries("idx:30", "wlp2s0", false, 120);
+  const atm::NetworkWirelessInfo wl = makeWirelessHistoryRecordWithEvents();
+  const atm::NetworkTrafficExportSnapshot snapshot =
+      atm::buildNetworkTrafficExportSnapshot(s, 120, nullptr, nullptr, &wl);
+  const std::string json = atm::generateNetworkTrafficJson(snapshot);
+  CHECK(isValidJson(json));
+  CHECK(json.find("\"connection_events_count\":3") != std::string::npos);
+  CHECK(json.find("\"connection_events\":[") != std::string::npos);
+  CHECK(json.find("\"event\":\"disassociated\"") != std::string::npos);
+  CHECK(json.find("\"event\":\"reconnected\"") != std::string::npos);
+  CHECK(json.find("\"event\":\"roamed\"") != std::string::npos);
+  CHECK(json.find("\"source\":\"ap_identity\"") != std::string::npos);
+  CHECK(json.find("\"access_point_changed\":true") != std::string::npos);
+  CHECK(json.find("\"access_point_reliable\":true") != std::string::npos);
+  CHECK(json.find("\"previous_signal_dbm\":-42") != std::string::npos);
+  CHECK(json.find("\"new_signal_dbm\":-41") != std::string::npos);
+  // No raw AP identity ever crosses the export boundary.
+  CHECK(json.find("fingerprint") == std::string::npos);
+  CHECK(json.find("ssid") == std::string::npos);
+  CHECK(json.find("bssid") == std::string::npos);
+}
+
+void test_export_wireless_events_only_passes_empty_gate() {
+  run("exportWirelessEventsOnly");
+  atm::NetworkTrafficSeries s = makeSeries("idx:30", "wlp2s0", false, 120);
+  atm::NetworkWirelessInfo wl = makeWirelessHistoryRecordWithEvents();
+  wl.history.clear();  // no signal samples at all: events are the only content
+  const atm::NetworkTrafficExportSnapshot snapshot =
+      atm::buildNetworkTrafficExportSnapshot(s, 120, nullptr, nullptr, &wl);
+  CHECK(snapshot.samples.empty());
+  CHECK(snapshot.wireless_history.has_value());
+  CHECK(snapshot.wireless_history->samples.empty());
+  CHECK(!snapshot.wireless_history->events.empty());
+
+  const std::string path = tempPath("wireless-events-only.csv");
+  std::remove(path.c_str());
+  const auto result = atm::exportNetworkTrafficHistory(
+      path, snapshot, NetworkTrafficExportFormat::Csv);
+  CHECK(result.status == NetworkTrafficExportStatus::Success);
+  std::remove(path.c_str());
+
+  const std::string csv = atm::generateNetworkTrafficCsv(snapshot);
+  CHECK(csv.find("timestamp,interface,event,confident,source") !=
+        std::string::npos);
+  const std::string json = atm::generateNetworkTrafficJson(snapshot);
+  CHECK(isValidJson(json));
+  CHECK(json.find("\"wireless_history\":{") != std::string::npos);
+  CHECK(json.find("\"connection_events\":[") != std::string::npos);
+}
+
+// -------------------------------------------------------------------------
 // JSON serialization
 // -------------------------------------------------------------------------
 
@@ -1627,6 +1773,10 @@ int main() {
   test_csv_wireless_history_section();
   test_json_wireless_history();
   test_export_wireless_history_alone_passes_empty_gate();
+
+  test_csv_wireless_connection_events_section();
+  test_json_wireless_connection_events();
+  test_export_wireless_events_only_passes_empty_gate();
 
   test_summary_current_and_peak();
   test_summary_totals_valid_window();
