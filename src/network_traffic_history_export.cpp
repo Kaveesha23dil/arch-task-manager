@@ -17,6 +17,7 @@
 #include "network_interface_hardware.hpp"
 #include "network_link_metrics.hpp"
 #include "network_link_state.hpp"
+#include "network_link_stats.hpp"
 #include "network_wireless.hpp"
 #include "process_report.hpp"  // sanitizeReportName (shared filename sanitizer)
 
@@ -109,6 +110,52 @@ std::string jsonNumber(const std::optional<int> &value) {
   }
   return std::to_string(*value);
 }
+
+/// JSON number literal for an optional unsigned counter (Step 53 kernel
+/// error/drop counters), or "null" when unavailable.
+std::string jsonNumber(const std::optional<std::uint64_t> &value) {
+  if (!value.has_value()) {
+    return "null";
+  }
+  return std::to_string(*value);
+}
+
+/// Stable column/key order for the 13 derived interval rates (Step 53). The
+/// mapping links each human name to the NetworkLinkStatRates member it reads,
+/// so the CSV columns and JSON keys always follow one deterministic order that
+/// matches the struct (never a map iteration).
+struct NetworkLinkStatRateColumn {
+  const char *name;
+  std::optional<double> NetworkLinkStatRates::*member;
+};
+static constexpr NetworkLinkStatRateColumn kLinkStatRateColumns[] = {
+    {"rx_errors_per_second",
+     &NetworkLinkStatRates::rx_errors_per_second},
+    {"tx_errors_per_second",
+     &NetworkLinkStatRates::tx_errors_per_second},
+    {"rx_dropped_per_second",
+     &NetworkLinkStatRates::rx_dropped_per_second},
+    {"tx_dropped_per_second",
+     &NetworkLinkStatRates::tx_dropped_per_second},
+    {"combined_errors_per_second",
+     &NetworkLinkStatRates::combined_errors_per_second},
+    {"combined_drops_per_second",
+     &NetworkLinkStatRates::combined_drops_per_second},
+    {"collisions_per_second",
+     &NetworkLinkStatRates::collisions_per_second},
+    {"rx_missed_errors_per_second",
+     &NetworkLinkStatRates::rx_missed_errors_per_second},
+    {"rx_fifo_errors_per_second",
+     &NetworkLinkStatRates::rx_fifo_errors_per_second},
+    {"tx_fifo_errors_per_second",
+     &NetworkLinkStatRates::tx_fifo_errors_per_second},
+    {"rx_crc_errors_per_second",
+     &NetworkLinkStatRates::rx_crc_errors_per_second},
+    {"rx_frame_errors_per_second",
+     &NetworkLinkStatRates::rx_frame_errors_per_second},
+    {"tx_carrier_errors_per_second",
+     &NetworkLinkStatRates::tx_carrier_errors_per_second},
+};
 
 /// Builds a JSON object literal from ordered key/value members.
 std::string jsonObject(
@@ -226,7 +273,8 @@ NetworkTrafficExportSnapshot buildNetworkTrafficExportSnapshot(
     const NetworkInterfaceHardware *hardware,
     const NetworkWirelessInfo *wireless,
     const NetworkInterfaceInfo *info,
-    const TrackedInterface *link_state) {
+    const TrackedInterface *link_state,
+    const NetworkLinkStats *link_stats) {
   NetworkTrafficExportSnapshot snapshot;
   snapshot.aggregate = series.aggregate;
   snapshot.identity = series.identity;
@@ -481,6 +529,50 @@ NetworkTrafficExportSnapshot buildNetworkTrafficExportSnapshot(
       wh.quality = std::move(q);
     }
     snapshot.wireless_history = std::move(wh);
+  }
+
+  // Capture the kernel error/drop/collision statistics (Step 53) when the
+  // monitoring layer tracked the selected interface and its sample ring holds
+  // recorded samples. The summary numbers mirror summarizeNetworkLinkStats, the
+  // same pure function the interface-details "Errors & drops" section renders,
+  // so the exported values always equal the UI numbers. Per-sample rows use each
+  // sample's own wall clock (recorded beside the sysfs read), never an anchored
+  // offset, and unavailable counters stay null — never a fabricated zero.
+  if (link_stats != nullptr && !link_stats->history.empty()) {
+    const NetworkLinkStatSummary stats =
+        summarizeNetworkLinkStats(*link_stats, max_samples);
+    NetworkTrafficExportLinkStats ls;
+    ls.identity = link_stats->identity;
+    ls.name = link_stats->name;
+    ls.state = networkLinkStatStateName(link_stats->state);
+    ls.present = link_stats->present;
+    ls.discontinuity_count = stats.discontinuity_count;
+    ls.sample_count = stats.sample_count;
+    ls.valid_sample_count = stats.valid_sample_count;
+    ls.stale_sample_count = stats.stale_sample_count;
+    ls.coverage = stats.coverage;
+    ls.span_seconds = stats.span_seconds;
+    ls.last_update = stats.last_update;
+    ls.rates = stats.rates;
+    for (std::size_t i = 0; i < kNetworkLinkStatMetricCount; ++i) {
+      ls.current[i] = stats.current[i];
+      ls.window_delta[i] = stats.window_delta[i];
+    }
+    const auto &samples = link_stats->history.samples();
+    ls.samples.reserve(samples.size());
+    for (const NetworkLinkStatSample &sample : samples) {
+      NetworkTrafficExportLinkStatsRow row;
+      row.timestamp = sample.wall_clock;
+      row.valid = sample.valid;
+      row.any_available = sample.any_available;
+      row.rates = sample.rates;
+      row.discontinuity_count = sample.discontinuity_count;
+      for (std::size_t i = 0; i < kNetworkLinkStatMetricCount; ++i) {
+        row.counters[i] = sample.counters[i];
+      }
+      ls.samples.push_back(std::move(row));
+    }
+    snapshot.link_stats = std::move(ls);
   }
 
   // Merge every retained ring into one row per unique sample tick. A row is
@@ -994,6 +1086,93 @@ std::string generateNetworkTrafficCsv(
       out += '\n';
     }
   }
+
+  // Step 53 link error/drop statistics: two clearly-headed sections appended
+  // only when the selected interface is tracked and its ring holds samples. A
+  // link_stats_metadata line carries the series-scoped summary (state, coverage,
+  // span, retained-window deltas) and a samples section lists every retained
+  // tick with per-metric counters and rates — unavailable counters/rates stay
+  // empty fields (never fabricated zeros).
+  if (snapshot.link_stats.has_value()) {
+    const NetworkTrafficExportLinkStats &ls = *snapshot.link_stats;
+    const auto appendCounter = [](std::string &text,
+                                  const std::optional<std::uint64_t> &value) {
+      text += value.has_value() ? std::to_string(*value) : std::string{};
+      text += ',';
+    };
+    out += "\nlink_stats_metadata,interface,state,present,discontinuity_count,"
+           "sample_count,valid_sample_count,stale_sample_count,coverage,"
+           "span_seconds,last_update";
+    for (std::size_t i = 0; i < kNetworkLinkStatMetricCount; ++i) {
+      out += ",window_";
+      out += networkLinkStatMetricName(
+          static_cast<NetworkLinkStatMetric>(i));
+    }
+    out += '\n';
+    out += "link_stats_metadata,";
+    out += escapeNetworkTrafficCsvField(ls.name);
+    out += ',';
+    out += escapeNetworkTrafficCsvField(ls.state);
+    out += ',';
+    out += ls.present ? "1" : "0";
+    out += ',';
+    out += std::to_string(ls.discontinuity_count);
+    out += ',';
+    out += std::to_string(ls.sample_count);
+    out += ',';
+    out += std::to_string(ls.valid_sample_count);
+    out += ',';
+    out += std::to_string(ls.stale_sample_count);
+    out += ',';
+    out += formatExportDouble(ls.coverage);
+    out += ',';
+    out += formatExportDouble(ls.span_seconds);
+    out += ',';
+    out += escapeNetworkTrafficCsvField(
+        formatNetworkTrafficTimestamp(ls.last_update));
+    out += ',';
+    for (std::size_t i = 0; i < kNetworkLinkStatMetricCount; ++i) {
+      appendCounter(out, ls.window_delta[i]);
+    }
+    if (!out.empty() && out.back() == ',') {
+      out.pop_back();
+    }
+    out += '\n';
+
+    out += "\ntimestamp,interface,valid,any_available";
+    for (std::size_t i = 0; i < kNetworkLinkStatMetricCount; ++i) {
+      out += ",counter_";
+      out += networkLinkStatMetricName(
+          static_cast<NetworkLinkStatMetric>(i));
+    }
+    for (const NetworkLinkStatRateColumn &rate : kLinkStatRateColumns) {
+      out += ",rate_";
+      out += rate.name;
+    }
+    out += ",discontinuity_count\n";
+    for (const NetworkTrafficExportLinkStatsRow &row : ls.samples) {
+      out += escapeNetworkTrafficCsvField(
+          formatNetworkTrafficTimestamp(row.timestamp));
+      out += ',';
+      out += interface;  // already-escaped display name
+      out += ',';
+      out += row.valid ? "1" : "0";
+      out += ',';
+      out += row.any_available ? "1" : "0";
+      out += ',';
+      for (std::size_t i = 0; i < kNetworkLinkStatMetricCount; ++i) {
+        appendCounter(out, row.counters[i]);
+      }
+      for (const NetworkLinkStatRateColumn &rate : kLinkStatRateColumns) {
+        out += (row.rates.*(rate.member)).has_value()
+                   ? formatExportDouble(*(row.rates.*(rate.member)))
+                   : std::string{};
+        out += ',';
+      }
+      out += std::to_string(row.discontinuity_count);
+      out += '\n';
+    }
+  }
   return out;
 }
 
@@ -1226,6 +1405,133 @@ std::string generateNetworkTrafficJson(
     });
   }();
 
+  // Step 53 link error/drop statistics captured with the snapshot, or null when
+  // absent (aggregate / interface not tracked / no recorded samples). Series
+  // summary plus per-sample counters/rates; unavailable metrics are null and
+  // never fabricated zeros. Field names match the sysfs statistics files and the
+  // NetworkLinkStatRates struct members respectively.
+  const std::string link_stats_json = [&] {
+    if (!snapshot.link_stats.has_value()) {
+      return std::string("null");
+    }
+    const NetworkTrafficExportLinkStats &ls = *snapshot.link_stats;
+    std::vector<std::string> current_members;
+    std::vector<std::string> delta_members;
+    current_members.reserve(kNetworkLinkStatMetricCount);
+    delta_members.reserve(kNetworkLinkStatMetricCount);
+    for (std::size_t i = 0; i < kNetworkLinkStatMetricCount; ++i) {
+      const std::string key = networkLinkStatMetricName(
+          static_cast<NetworkLinkStatMetric>(i));
+      current_members.push_back(jsonObject(
+          {{key, jsonNumber(ls.current[i])}}));
+      delta_members.push_back(jsonObject(
+          {{key, jsonNumber(ls.window_delta[i])}}));
+    }
+    std::string current_json = "{";
+    for (const std::string &member : current_members) {
+      current_json += member;
+      current_json += ',';
+    }
+    if (!current_members.empty()) {
+      current_json.pop_back();
+    }
+    current_json += '}';
+    std::string delta_json = "{";
+    for (const std::string &member : delta_members) {
+      delta_json += member;
+      delta_json += ',';
+    }
+    if (!delta_members.empty()) {
+      delta_json.pop_back();
+    }
+    delta_json += '}';
+
+    std::vector<std::string> rate_members;
+    rate_members.reserve(std::size(kLinkStatRateColumns));
+    for (const NetworkLinkStatRateColumn &rate : kLinkStatRateColumns) {
+      rate_members.push_back(jsonObject(
+          {{rate.name, jsonNumber(ls.rates.*(rate.member))}}));
+    }
+    std::string rates_json = "{";
+    for (const std::string &member : rate_members) {
+      rates_json += member;
+      rates_json += ',';
+    }
+    if (!rate_members.empty()) {
+      rates_json.pop_back();
+    }
+    rates_json += '}';
+
+    std::vector<std::string> sample_objects;
+    sample_objects.reserve(ls.samples.size());
+    for (const NetworkTrafficExportLinkStatsRow &row : ls.samples) {
+      std::vector<std::string> counter_members;
+      counter_members.reserve(kNetworkLinkStatMetricCount);
+      for (std::size_t i = 0; i < kNetworkLinkStatMetricCount; ++i) {
+        counter_members.push_back(jsonObject({
+            {std::string(networkLinkStatMetricName(
+                 static_cast<NetworkLinkStatMetric>(i))),
+             jsonNumber(row.counters[i])},
+        }));
+      }
+      std::string counters_json = "{";
+      for (const std::string &member : counter_members) {
+        counters_json += member;
+        counters_json += ',';
+      }
+      if (!counter_members.empty()) {
+        counters_json.pop_back();
+      }
+      counters_json += '}';
+
+      std::vector<std::string> row_rate_members;
+      row_rate_members.reserve(std::size(kLinkStatRateColumns));
+      for (const NetworkLinkStatRateColumn &rate : kLinkStatRateColumns) {
+        row_rate_members.push_back(jsonObject(
+            {{rate.name, jsonNumber(row.rates.*(rate.member))}}));
+      }
+      std::string row_rates_json = "{";
+      for (const std::string &member : row_rate_members) {
+        row_rates_json += member;
+        row_rates_json += ',';
+      }
+      if (!row_rate_members.empty()) {
+        row_rates_json.pop_back();
+      }
+      row_rates_json += '}';
+
+      sample_objects.push_back(jsonObject({
+          {"timestamp",
+           jsonEscape(formatNetworkTrafficTimestamp(row.timestamp))},
+          {"valid", row.valid ? "true" : "false"},
+          {"any_available", row.any_available ? "true" : "false"},
+          {"counters", counters_json},
+          {"rates", row_rates_json},
+          {"discontinuity_count", std::to_string(row.discontinuity_count)},
+      }));
+    }
+
+    return jsonObject({
+        {"identity", jsonEscape(ls.identity)},
+        {"name", jsonEscape(ls.name)},
+        {"state", jsonEscape(ls.state)},
+        {"present", ls.present ? "true" : "false"},
+        {"discontinuity_count", std::to_string(ls.discontinuity_count)},
+        {"sample_count", std::to_string(ls.sample_count)},
+        {"valid_sample_count", std::to_string(ls.valid_sample_count)},
+        {"stale_sample_count", std::to_string(ls.stale_sample_count)},
+        {"coverage", jsonNumber(std::optional<double>(ls.coverage))},
+        {"complete", ls.sample_count >= snapshot.max_samples ? "true" : "false"},
+        {"span_seconds", jsonNumber(std::optional<double>(ls.span_seconds))},
+        {"last_update",
+         jsonEscape(formatNetworkTrafficTimestamp(ls.last_update))},
+        {"current", current_json},
+        {"rates", rates_json},
+        {"window_delta", delta_json},
+        {"samples", jsonArray(sample_objects)},
+    });
+  }();
+
   const std::string history = jsonObject({
       {"start_timestamp", start_timestamp},
       {"end_timestamp", end_timestamp},
@@ -1295,6 +1601,7 @@ std::string generateNetworkTrafficJson(
       {"hardware", hardware_json},
       {"wireless", wireless_json},
       {"wireless_history", wireless_history_json},
+      {"link_stats", link_stats_json},
       {"history", history},
       {"units", units},
       {"summary", summary_json},
@@ -1379,10 +1686,17 @@ NetworkTrafficExportResult exportNetworkTrafficHistory(
       format != NetworkTrafficExportFormat::Json) {
     return {NetworkTrafficExportStatus::UnsupportedFormat, 0, 0, {}};
   }
-  if (snapshot.samples.empty() &&
-      (snapshot.wireless_history.has_value() == false ||
-       (snapshot.wireless_history->samples.empty() &&
-        snapshot.wireless_history->events.empty()))) {
+  // A snapshot counts as content if it carries traffic rows, wireless history
+  // rows/events or Step 53 link error-statistics samples — an otherwise-empty
+  // snapshot with any of those still exports.
+  const bool has_wireless =
+      snapshot.wireless_history.has_value() &&
+      (!snapshot.wireless_history->samples.empty() ||
+       !snapshot.wireless_history->events.empty());
+  const bool has_link_stats =
+      snapshot.link_stats.has_value() &&
+      !snapshot.link_stats->samples.empty();
+  if (snapshot.samples.empty() && !has_wireless && !has_link_stats) {
     return {NetworkTrafficExportStatus::EmptyHistory, 0, 0, {}};
   }
   const std::string contents =

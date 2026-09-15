@@ -2,11 +2,13 @@
 
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
 
+#include "network_link_stats.hpp"
 #include "network_traffic_history.hpp"
 
 namespace atm {
@@ -257,6 +259,49 @@ struct NetworkTrafficExportWirelessHistory {
   std::optional<NetworkTrafficExportWirelessQuality> quality;
 };
 
+/// One exported link error/drop/collision sample row (Step 53). Mirrors the
+/// live NetworkLinkStatSample: every counter is an explicit null when it was
+/// unavailable for that tick (missing sysfs file, driver without that counter)
+/// — never a fabricated zero. `valid` marks freshly-read ticks; stale ticks
+/// carry the last valid counters but zero fresh measurements. `discontinuity_count`
+/// is the number of metrics that decreased between this and the previous valid
+/// tick (driver reset / wraparound). The wall-clock `timestamp` is the sample's
+/// own wall clock recorded when the sysfs counters were read.
+struct NetworkTrafficExportLinkStatsRow {
+  std::chrono::system_clock::time_point timestamp{};
+  bool valid = false;
+  bool any_available = false;  // at least one counter file was present
+  std::optional<std::uint64_t> counters[kNetworkLinkStatMetricCount]{};
+  NetworkLinkStatRates rates;
+  std::size_t discontinuity_count = 0;
+};
+
+/// Series-scoped link error/drop statistics (Step 53) captured into an export
+/// snapshot. Only present when the selected interface is tracked and its sample
+/// ring holds recorded samples. The summary numbers are the same ones the
+/// interface-details view renders (state, coverage, span, cumulative current
+/// counters and retained-window deltas) — never a fabricated zero and never a
+/// higher precision than the honest counters.
+struct NetworkTrafficExportLinkStats {
+  std::string identity;         // stable key ("idx:<ifindex>" / "name:<name>")
+  std::string name;             // current kernel name
+  std::string state;            // networkLinkStatsStateName()
+  bool present = false;         // interface still seen at the last discovery
+  std::size_t discontinuity_count = 0;  // total resets observed while tracked
+  std::size_t sample_count = 0;
+  std::size_t valid_sample_count = 0;   // freshly-read retained ticks
+  std::size_t stale_sample_count = 0;   // retained ticks read as stale
+  double coverage = 0.0;                // sample_count / retention bound
+  double span_seconds = 0.0;            // newest - oldest retained span
+  std::chrono::system_clock::time_point last_update{};
+
+  std::optional<std::uint64_t> current[kNetworkLinkStatMetricCount]{};
+  NetworkLinkStatRates rates;
+  std::optional<std::uint64_t> window_delta[kNetworkLinkStatMetricCount]{};
+
+  std::vector<NetworkTrafficExportLinkStatsRow> samples;  // ascending order
+};
+
 /// Implementation-free, immutable snapshot of one traffic series ready for
 /// serialization. Contains only plain data — no pointers, no mutexes, no UI
 /// objects and no internal bookkeeping. Building this snapshot before
@@ -290,6 +335,12 @@ struct NetworkTrafficExportSnapshot {
   // recorded samples (std::nullopt otherwise). The values match what the
   // wireless-history view displays — see NetworkTrafficExportWirelessHistory.
   std::optional<NetworkTrafficExportWirelessHistory> wireless_history;
+
+  // Kernel error/drop/collision statistics (Step 53) when the monitoring layer
+  // tracked the selected interface and its sample ring holds recorded samples
+  // (std::nullopt for the aggregate / when no counters were captured). The
+  // numbers match what the interface-details "Errors & drops" section shows.
+  std::optional<NetworkTrafficExportLinkStats> link_stats;
 };
 
 /// Builds a stable snapshot of `series` for export. Reads only the series'
@@ -307,15 +358,18 @@ struct NetworkTrafficExportSnapshot {
 /// interface) it is captured into snapshot.wireless, and when its history ring
 /// holds recorded samples those are captured into snapshot.wireless_history
 /// (per-sample rows anchored to the newest sample plus the summary numbers the
-/// wireless-history view shows). All parameters are additive — existing fields
-/// are unchanged and any missing one stays unavailable.
+/// wireless-history view shows). When `link_stats` points at the selected
+/// interface's error/drop statistics the summary and per-sample rows are
+/// captured into snapshot.link_stats. All parameters are additive — existing
+/// fields are unchanged and any missing one stays unavailable.
 [[nodiscard]] NetworkTrafficExportSnapshot buildNetworkTrafficExportSnapshot(
     const NetworkTrafficSeries &series, std::size_t max_samples,
     const NetworkLinkMetrics *link_metrics = nullptr,
     const NetworkInterfaceHardware *hardware = nullptr,
     const NetworkWirelessInfo *wireless = nullptr,
     const NetworkInterfaceInfo *info = nullptr,
-    const TrackedInterface *link_state = nullptr);
+    const TrackedInterface *link_state = nullptr,
+    const NetworkLinkStats *link_stats = nullptr);
 
 /// Formats a wall-clock time point as ISO-8601 local time
 /// "YYYY-MM-DDTHH:MM:SS". This is the timestamp format used by every export
@@ -337,7 +391,11 @@ struct NetworkTrafficExportSnapshot {
 /// leading historical columns are unchanged; without captured metadata the
 /// trailing columns are empty. When a wireless history was captured it is
 /// appended as a clearly-headed second section (its own header, one row per
-/// wireless sample and a prefixed summary line). Unavailable metrics are empty
+/// wireless sample and a prefixed summary line); wireless connection events and
+/// the connection-quality summary follow as their own sections. When link error
+/// statistics (Step 53) were captured a link_stats metadata section (state,
+/// coverage, cumulative current counters and retained-window deltas) and a
+/// per-sample section are appended. Unavailable metrics are empty
 /// fields (never misleading zeros); headers are always emitted, so a snapshot
 /// with no rows still produces a valid, readable CSV.
 [[nodiscard]] std::string generateNetworkTrafficCsv(
@@ -351,10 +409,12 @@ struct NetworkTrafficExportSnapshot {
 /// absent), an optional "wireless" object (wireless presence, PHY, signal/noise
 /// dBm, raw link quality, carrier-derived association and freshness, null when
 /// absent), an optional "wireless_history" object (per-sample rows plus the
-/// signal/quality summary the wireless-history view shows, null when absent)
-/// and history span and sampling interval, unit information, the summary
-/// values and the sample array. Unavailable values are null; an empty sample
-/// array is valid; no internal implementation state is ever serialized.
+/// signal/quality summary the wireless-history view shows, null when absent),
+/// an optional "link_stats" object (Step 53: current counters, interval rates,
+/// retained-window deltas and per-sample rows, null when absent) and history
+/// span and sampling interval, unit information, the summary values and the
+/// sample array. Unavailable values are null; an empty sample array is valid; no
+/// internal implementation state is ever serialized.
 [[nodiscard]] std::string generateNetworkTrafficJson(
     const NetworkTrafficExportSnapshot &snapshot);
 

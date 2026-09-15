@@ -15,6 +15,7 @@
 #include "network_interface_hardware.hpp"
 #include "network_link_metrics.hpp"
 #include "network_link_state.hpp"
+#include "network_link_stats.hpp"
 #include "network_traffic_history.hpp"
 #include "network_traffic_history_export.hpp"
 #include "network_wireless.hpp"
@@ -1219,6 +1220,209 @@ void test_export_quality_present_without_samples() {
 }
 
 // -------------------------------------------------------------------------
+// Link error/drop statistics export (Step 53)
+// -------------------------------------------------------------------------
+
+/// Builds a tracked link-stats record with three valid samples (0s..2s). Only
+/// the rx/tx errors and drops counters are present; the other metrics stay
+/// unavailable (drivers differ), which also exercises the honest-empty path.
+atm::NetworkLinkStats makeLinkStatsHistory(std::size_t max_samples = 120) {
+  atm::NetworkLinkStats stats;
+  stats.identity = "idx:2";
+  stats.name = "eth0";
+  stats.present = true;
+  const auto t0 = std::chrono::steady_clock::now();
+  const auto w0 = std::chrono::system_clock::now();
+
+  const auto read = [](std::uint64_t rx_errors, std::uint64_t tx_errors,
+                       std::uint64_t rx_dropped,
+                       std::uint64_t tx_dropped) {
+    atm::NetworkLinkStatRead r;
+    r.read_ok = true;
+    r.access_denied = false;
+    r.any_available = true;
+    r.counters[static_cast<std::size_t>(atm::NetworkLinkStatMetric::RxErrors)] =
+        rx_errors;
+    r.counters[static_cast<std::size_t>(atm::NetworkLinkStatMetric::TxErrors)] =
+        tx_errors;
+    r.counters[static_cast<std::size_t>(atm::NetworkLinkStatMetric::RxDropped)] =
+        rx_dropped;
+    r.counters[static_cast<std::size_t>(atm::NetworkLinkStatMetric::TxDropped)] =
+        tx_dropped;
+    return r;
+  };
+
+  stats = atm::updateNetworkLinkStats(stats, read(100, 50, 20, 10), t0, w0,
+                                      max_samples);
+  stats = atm::updateNetworkLinkStats(
+      stats, read(115, 55, 22, 12), t0 + std::chrono::seconds(1),
+      w0 + std::chrono::seconds(1), max_samples);
+  stats = atm::updateNetworkLinkStats(
+      stats, read(130, 57, 24, 15), t0 + std::chrono::seconds(2),
+      w0 + std::chrono::seconds(2), max_samples);
+  return stats;
+}
+
+void test_csv_link_stats_section() {
+  run("csvLinkStatsSection");
+  atm::NetworkTrafficSeries s = makeSeries("idx:2", "eth0", false, 120);
+  fillFourTicks(s);
+  const atm::NetworkLinkStats stats = makeLinkStatsHistory();
+  const atm::NetworkTrafficExportSnapshot snapshot =
+      atm::buildNetworkTrafficExportSnapshot(s, 120, nullptr, nullptr, nullptr,
+                                             nullptr, nullptr, &stats);
+  CHECK(snapshot.link_stats.has_value());
+  CHECK(snapshot.link_stats->sample_count == 3);
+  CHECK(snapshot.link_stats->valid_sample_count == 3);
+
+  const std::string csv = atm::generateNetworkTrafficCsv(snapshot);
+  // The main table is unchanged and comes first: header + 4 ticks. The link
+  // stats metadata line starts the new section after a blank separator.
+  const std::vector<std::string> table_lines = linesOf(csv);
+  CHECK(table_lines.size() == 5);  // exactly the main table's 5 lines
+  const std::vector<std::string> table_header = csvSplit(table_lines[0]);
+  CHECK(table_header.size() == 39);
+  const std::vector<std::string> table_row = csvSplit(table_lines[1]);
+  CHECK(table_row.size() == 39);
+
+  // Metadata row: series-scoped summary + retained-window deltas.
+  const std::size_t meta = csv.find("link_stats_metadata,interface,state,");
+  CHECK(meta != std::string::npos);
+  const std::size_t meta_data_start = csv.find('\n', meta) + 1;
+  const std::size_t meta_data_end = csv.find('\n', meta_data_start);
+  const std::vector<std::string> fields =
+      csvSplit(csv.substr(meta_data_start, meta_data_end - meta_data_start));
+  CHECK(fields[0] == "link_stats_metadata");
+  CHECK(fields[1] == "eth0");
+  CHECK(fields[2] == "valid");
+  CHECK(fields[3] == "1");   // present
+  CHECK(fields[4] == "0");   // discontinuity_count
+  CHECK(fields[5] == "3");   // sample_count
+  CHECK(fields[6] == "3");   // valid_sample_count
+  CHECK(fields[7] == "0");   // stale_sample_count
+  CHECK(fields[9] == "2");   // span_seconds
+  CHECK(fields[11] == "30");   // window_rx_errors == 130 - 100
+  CHECK(fields[12] == "7");    // window_tx_errors == 57 - 50
+  CHECK(fields[13] == "4");    // window_rx_dropped
+  CHECK(fields[14] == "5");    // window_tx_dropped
+  CHECK(fields[29].empty());   // window_rx_nohandler never present
+
+  // Sample rows: honest empty fields for the first tick (no baseline yet) and
+  // the derived rates on the later ticks.
+  const std::size_t samples_header =
+      csv.find("timestamp,interface,valid,any_available");
+  CHECK(samples_header != std::string::npos);
+  const std::size_t samples_start = csv.rfind('\n', samples_header) + 1;
+  const std::vector<std::string> sample_lines =
+      linesOf(csv.substr(samples_start));
+  CHECK(sample_lines.size() == 4);  // header + 3 ticks
+  const std::vector<std::string> row0 = csvSplit(sample_lines[1]);
+  CHECK(row0.size() == 37);
+  CHECK(row0[1] == "eth0");
+  CHECK(row0[2] == "1");
+  CHECK(row0[3] == "1");
+  CHECK(row0[4] == "100");  // counter_rx_errors
+  CHECK(row0[5] == "50");   // counter_tx_errors
+  CHECK(row0[22].empty());  // counter_rx_nohandler
+  CHECK(row0[23] == "");    // no rate on the first tick
+  CHECK(row0[36] == "0");   // discontinuity_count
+  const std::vector<std::string> row1 = csvSplit(sample_lines[2]);
+  CHECK(row1[4] == "115");
+  CHECK(row1[23] == "15");  // rate_rx_errors_per_second
+  CHECK(row1[24] == "5");   // rate_tx_errors_per_second
+  CHECK(row1[25] == "2");   // rate_rx_dropped_per_second
+  CHECK(row1[26] == "2");   // rate_tx_dropped_per_second
+  CHECK(row1[27] == "20");  // rate_combined_errors_per_second
+  CHECK(row1[28] == "4");   // rate_combined_drops_per_second
+  CHECK(row1[29] == "");    // collisions never present
+  const std::vector<std::string> row2 = csvSplit(sample_lines[3]);
+  CHECK(row2[4] == "130");
+  CHECK(row2[23] == "15");
+  CHECK(row2[24] == "2");
+  CHECK(row2[25] == "2");
+  CHECK(row2[26] == "3");
+  CHECK(row2[27] == "17");
+  CHECK(row2[28] == "5");
+}
+
+void test_json_link_stats() {
+  run("jsonLinkStats");
+  atm::NetworkTrafficSeries s = makeSeries("idx:2", "eth0", false, 120);
+  fillFourTicks(s);
+  const atm::NetworkLinkStats stats = makeLinkStatsHistory();
+  const atm::NetworkTrafficExportSnapshot snapshot =
+      atm::buildNetworkTrafficExportSnapshot(s, 120, nullptr, nullptr, nullptr,
+                                            nullptr, nullptr, &stats);
+  const std::string json = atm::generateNetworkTrafficJson(snapshot);
+  CHECK(isValidJson(json));
+  CHECK(json.find("\"link_stats\":{") != std::string::npos);
+  CHECK(json.find("\"name\":\"eth0\"") != std::string::npos);
+  CHECK(json.find("\"state\":\"valid\"") != std::string::npos);
+  CHECK(json.find("\"present\":true") != std::string::npos);
+  CHECK(json.find("\"discontinuity_count\":0") != std::string::npos);
+  CHECK(json.find("\"sample_count\":3") != std::string::npos);
+  CHECK(json.find("\"valid_sample_count\":3") != std::string::npos);
+  CHECK(json.find("\"stale_sample_count\":0") != std::string::npos);
+  CHECK(json.find("\"complete\":false") != std::string::npos);
+  CHECK(json.find("\"current\":{") != std::string::npos);
+  CHECK(json.find("\"rx_errors\":130") != std::string::npos);
+  CHECK(json.find("\"tx_errors\":57") != std::string::npos);
+  CHECK(json.find("\"rx_nohandler\":null") != std::string::npos);
+  CHECK(json.find("\"rates\":{") != std::string::npos);
+  CHECK(json.find("\"rx_errors_per_second\":15") != std::string::npos);
+  CHECK(json.find("\"combined_errors_per_second\":17") != std::string::npos);
+  CHECK(json.find("\"collisions_per_second\":null") != std::string::npos);
+  CHECK(json.find("\"window_delta\":{") != std::string::npos);
+  CHECK(json.find("\"rx_errors\":30") != std::string::npos);
+  CHECK(json.find("\"tx_errors\":7") != std::string::npos);
+  CHECK(json.find("\"samples\":[") != std::string::npos);
+  CHECK(json.find("\"valid\":true") != std::string::npos);
+  CHECK(json.find("\"any_available\":true") != std::string::npos);
+  CHECK(json.find("\"counters\":{") != std::string::npos);
+  CHECK(json.find("\"discontinuity_count\":0") != std::string::npos);
+}
+
+void test_json_link_stats_null_when_absent() {
+  run("jsonLinkStatsNullWhenAbsent");
+  atm::NetworkTrafficSeries s = makeSeries("idx:2", "eth0", false, 120);
+  fillFourTicks(s);
+  const atm::NetworkTrafficExportSnapshot snapshot =
+      atm::buildNetworkTrafficExportSnapshot(s, 120);
+  CHECK(!snapshot.link_stats.has_value());
+  const std::string json = atm::generateNetworkTrafficJson(snapshot);
+  CHECK(isValidJson(json));
+  CHECK(json.find("\"link_stats\":null") != std::string::npos);
+  CHECK(countKey(json, "link_stats") == 1);  // exactly one occurrence
+}
+
+void test_export_link_stats_only_passes_empty_gate() {
+  run("exportLinkStatsOnly");
+  // No traffic samples and no wireless content: the recorded link error
+  // statistics are the only content and must not be rejected as empty history.
+  atm::NetworkTrafficSeries s = makeSeries("idx:2", "eth0", false, 120);
+  const atm::NetworkLinkStats stats = makeLinkStatsHistory();
+  const atm::NetworkTrafficExportSnapshot snapshot =
+      atm::buildNetworkTrafficExportSnapshot(s, 120, nullptr, nullptr, nullptr,
+                                            nullptr, nullptr, &stats);
+  CHECK(snapshot.samples.empty());
+  CHECK(!snapshot.wireless_history.has_value());
+  CHECK(snapshot.link_stats.has_value());
+
+  const std::string path = tempPath("link-stats-only.csv");
+  std::remove(path.c_str());
+  const auto result = atm::exportNetworkTrafficHistory(
+      path, snapshot, NetworkTrafficExportFormat::Csv);
+  CHECK(result.status == NetworkTrafficExportStatus::Success);
+  std::remove(path.c_str());
+
+  const std::string csv = atm::generateNetworkTrafficCsv(snapshot);
+  CHECK(csv.find("link_stats_metadata,") != std::string::npos);
+  const std::string json = atm::generateNetworkTrafficJson(snapshot);
+  CHECK(isValidJson(json));
+  CHECK(json.find("\"link_stats\":{") != std::string::npos);
+}
+
+// -------------------------------------------------------------------------
 // JSON serialization
 // -------------------------------------------------------------------------
 
@@ -1884,6 +2088,11 @@ int main() {
   test_csv_wireless_quality_section();
   test_json_wireless_quality();
   test_export_quality_present_without_samples();
+
+  test_csv_link_stats_section();
+  test_json_link_stats();
+  test_json_link_stats_null_when_absent();
+  test_export_link_stats_only_passes_empty_gate();
 
   test_summary_current_and_peak();
   test_summary_totals_valid_window();
