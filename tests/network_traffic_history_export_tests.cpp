@@ -15,6 +15,7 @@
 #include "network_interface_hardware.hpp"
 #include "network_link_metrics.hpp"
 #include "network_link_state.hpp"
+#include "network_link_stats.hpp"
 #include "network_traffic_history.hpp"
 #include "network_traffic_history_export.hpp"
 #include "network_wireless.hpp"
@@ -1219,6 +1220,532 @@ void test_export_quality_present_without_samples() {
 }
 
 // -------------------------------------------------------------------------
+// Link error/drop statistics export (Step 53)
+// -------------------------------------------------------------------------
+
+/// Builds a tracked link-stats record with three valid samples (0s..2s). Only
+/// the rx/tx errors and drops counters are present; the other metrics stay
+/// unavailable (drivers differ), which also exercises the honest-empty path.
+atm::NetworkLinkStats makeLinkStatsHistory(std::size_t max_samples = 120) {
+  atm::NetworkLinkStats stats;
+  stats.identity = "idx:2";
+  stats.name = "eth0";
+  stats.present = true;
+  const auto t0 = std::chrono::steady_clock::now();
+  const auto w0 = std::chrono::system_clock::now();
+
+  const auto read = [](std::uint64_t rx_errors, std::uint64_t tx_errors,
+                       std::uint64_t rx_dropped,
+                       std::uint64_t tx_dropped) {
+    atm::NetworkLinkStatRead r;
+    r.read_ok = true;
+    r.access_denied = false;
+    r.any_available = true;
+    r.counters[static_cast<std::size_t>(atm::NetworkLinkStatMetric::RxErrors)] =
+        rx_errors;
+    r.counters[static_cast<std::size_t>(atm::NetworkLinkStatMetric::TxErrors)] =
+        tx_errors;
+    r.counters[static_cast<std::size_t>(atm::NetworkLinkStatMetric::RxDropped)] =
+        rx_dropped;
+    r.counters[static_cast<std::size_t>(atm::NetworkLinkStatMetric::TxDropped)] =
+        tx_dropped;
+    return r;
+  };
+
+  stats = atm::updateNetworkLinkStats(stats, read(100, 50, 20, 10), t0, w0,
+                                      max_samples);
+  stats = atm::updateNetworkLinkStats(
+      stats, read(115, 55, 22, 12), t0 + std::chrono::seconds(1),
+      w0 + std::chrono::seconds(1), max_samples);
+  stats = atm::updateNetworkLinkStats(
+      stats, read(130, 57, 24, 15), t0 + std::chrono::seconds(2),
+      w0 + std::chrono::seconds(2), max_samples);
+  return stats;
+}
+
+void test_csv_link_stats_section() {
+  run("csvLinkStatsSection");
+  atm::NetworkTrafficSeries s = makeSeries("idx:2", "eth0", false, 120);
+  fillFourTicks(s);
+  const atm::NetworkLinkStats stats = makeLinkStatsHistory();
+  const atm::NetworkTrafficExportSnapshot snapshot =
+      atm::buildNetworkTrafficExportSnapshot(s, 120, nullptr, nullptr, nullptr,
+                                             nullptr, nullptr, &stats);
+  CHECK(snapshot.link_stats.has_value());
+  CHECK(snapshot.link_stats->sample_count == 3);
+  CHECK(snapshot.link_stats->valid_sample_count == 3);
+
+  const std::string csv = atm::generateNetworkTrafficCsv(snapshot);
+  // The main table is unchanged and comes first: header + 4 ticks. The link
+  // stats metadata line starts the new section after a blank separator.
+  const std::vector<std::string> table_lines = linesOf(csv);
+  CHECK(table_lines.size() == 5);  // exactly the main table's 5 lines
+  const std::vector<std::string> table_header = csvSplit(table_lines[0]);
+  CHECK(table_header.size() == 39);
+  const std::vector<std::string> table_row = csvSplit(table_lines[1]);
+  CHECK(table_row.size() == 39);
+
+  // Metadata row: series-scoped summary + retained-window deltas.
+  const std::size_t meta = csv.find("link_stats_metadata,interface,state,");
+  CHECK(meta != std::string::npos);
+  const std::size_t meta_data_start = csv.find('\n', meta) + 1;
+  const std::size_t meta_data_end = csv.find('\n', meta_data_start);
+  const std::vector<std::string> fields =
+      csvSplit(csv.substr(meta_data_start, meta_data_end - meta_data_start));
+  CHECK(fields[0] == "link_stats_metadata");
+  CHECK(fields[1] == "eth0");
+  CHECK(fields[2] == "valid");
+  CHECK(fields[3] == "1");   // present
+  CHECK(fields[4] == "0");   // discontinuity_count
+  CHECK(fields[5] == "3");   // sample_count
+  CHECK(fields[6] == "3");   // valid_sample_count
+  CHECK(fields[7] == "0");   // stale_sample_count
+  CHECK(fields[9] == "2");   // span_seconds
+  CHECK(fields[11] == "30");   // window_rx_errors == 130 - 100
+  CHECK(fields[12] == "7");    // window_tx_errors == 57 - 50
+  CHECK(fields[13] == "4");    // window_rx_dropped
+  CHECK(fields[14] == "5");    // window_tx_dropped
+  CHECK(fields[29].empty());   // window_rx_nohandler never present
+
+  // Sample rows: honest empty fields for the first tick (no baseline yet) and
+  // the derived rates on the later ticks.
+  const std::size_t samples_header =
+      csv.find("timestamp,interface,valid,any_available");
+  CHECK(samples_header != std::string::npos);
+  const std::size_t samples_start = csv.rfind('\n', samples_header) + 1;
+  const std::vector<std::string> sample_lines =
+      linesOf(csv.substr(samples_start));
+  CHECK(sample_lines.size() == 4);  // header + 3 ticks
+  const std::vector<std::string> row0 = csvSplit(sample_lines[1]);
+  CHECK(row0.size() == 37);
+  CHECK(row0[1] == "eth0");
+  CHECK(row0[2] == "1");
+  CHECK(row0[3] == "1");
+  CHECK(row0[4] == "100");  // counter_rx_errors
+  CHECK(row0[5] == "50");   // counter_tx_errors
+  CHECK(row0[22].empty());  // counter_rx_nohandler
+  CHECK(row0[23] == "");    // no rate on the first tick
+  CHECK(row0[36] == "0");   // discontinuity_count
+  const std::vector<std::string> row1 = csvSplit(sample_lines[2]);
+  CHECK(row1[4] == "115");
+  CHECK(row1[23] == "15");  // rate_rx_errors_per_second
+  CHECK(row1[24] == "5");   // rate_tx_errors_per_second
+  CHECK(row1[25] == "2");   // rate_rx_dropped_per_second
+  CHECK(row1[26] == "2");   // rate_tx_dropped_per_second
+  CHECK(row1[27] == "20");  // rate_combined_errors_per_second
+  CHECK(row1[28] == "4");   // rate_combined_drops_per_second
+  CHECK(row1[29] == "");    // collisions never present
+  const std::vector<std::string> row2 = csvSplit(sample_lines[3]);
+  CHECK(row2[4] == "130");
+  CHECK(row2[23] == "15");
+  CHECK(row2[24] == "2");
+  CHECK(row2[25] == "2");
+  CHECK(row2[26] == "3");
+  CHECK(row2[27] == "17");
+  CHECK(row2[28] == "5");
+}
+
+void test_json_link_stats() {
+  run("jsonLinkStats");
+  atm::NetworkTrafficSeries s = makeSeries("idx:2", "eth0", false, 120);
+  fillFourTicks(s);
+  const atm::NetworkLinkStats stats = makeLinkStatsHistory();
+  const atm::NetworkTrafficExportSnapshot snapshot =
+      atm::buildNetworkTrafficExportSnapshot(s, 120, nullptr, nullptr, nullptr,
+                                            nullptr, nullptr, &stats);
+  const std::string json = atm::generateNetworkTrafficJson(snapshot);
+  CHECK(isValidJson(json));
+  CHECK(json.find("\"link_stats\":{") != std::string::npos);
+  CHECK(json.find("\"name\":\"eth0\"") != std::string::npos);
+  CHECK(json.find("\"state\":\"valid\"") != std::string::npos);
+  CHECK(json.find("\"present\":true") != std::string::npos);
+  CHECK(json.find("\"discontinuity_count\":0") != std::string::npos);
+  CHECK(json.find("\"sample_count\":3") != std::string::npos);
+  CHECK(json.find("\"valid_sample_count\":3") != std::string::npos);
+  CHECK(json.find("\"stale_sample_count\":0") != std::string::npos);
+  CHECK(json.find("\"complete\":false") != std::string::npos);
+  CHECK(json.find("\"current\":{") != std::string::npos);
+  CHECK(json.find("\"rx_errors\":130") != std::string::npos);
+  CHECK(json.find("\"tx_errors\":57") != std::string::npos);
+  CHECK(json.find("\"rx_nohandler\":null") != std::string::npos);
+  CHECK(json.find("\"rates\":{") != std::string::npos);
+  CHECK(json.find("\"rx_errors_per_second\":15") != std::string::npos);
+  CHECK(json.find("\"combined_errors_per_second\":17") != std::string::npos);
+  CHECK(json.find("\"collisions_per_second\":null") != std::string::npos);
+  CHECK(json.find("\"window_delta\":{") != std::string::npos);
+  CHECK(json.find("\"rx_errors\":30") != std::string::npos);
+  CHECK(json.find("\"tx_errors\":7") != std::string::npos);
+  CHECK(json.find("\"samples\":[") != std::string::npos);
+  CHECK(json.find("\"valid\":true") != std::string::npos);
+  CHECK(json.find("\"any_available\":true") != std::string::npos);
+  CHECK(json.find("\"counters\":{") != std::string::npos);
+  CHECK(json.find("\"discontinuity_count\":0") != std::string::npos);
+}
+
+void test_json_link_stats_null_when_absent() {
+  run("jsonLinkStatsNullWhenAbsent");
+  atm::NetworkTrafficSeries s = makeSeries("idx:2", "eth0", false, 120);
+  fillFourTicks(s);
+  const atm::NetworkTrafficExportSnapshot snapshot =
+      atm::buildNetworkTrafficExportSnapshot(s, 120);
+  CHECK(!snapshot.link_stats.has_value());
+  const std::string json = atm::generateNetworkTrafficJson(snapshot);
+  CHECK(isValidJson(json));
+  CHECK(json.find("\"link_stats\":null") != std::string::npos);
+  CHECK(countKey(json, "link_stats") == 1);  // exactly one occurrence
+}
+
+void test_export_link_stats_only_passes_empty_gate() {
+  run("exportLinkStatsOnly");
+  // No traffic samples and no wireless content: the recorded link error
+  // statistics are the only content and must not be rejected as empty history.
+  atm::NetworkTrafficSeries s = makeSeries("idx:2", "eth0", false, 120);
+  const atm::NetworkLinkStats stats = makeLinkStatsHistory();
+  const atm::NetworkTrafficExportSnapshot snapshot =
+      atm::buildNetworkTrafficExportSnapshot(s, 120, nullptr, nullptr, nullptr,
+                                            nullptr, nullptr, &stats);
+  CHECK(snapshot.samples.empty());
+  CHECK(!snapshot.wireless_history.has_value());
+  CHECK(snapshot.link_stats.has_value());
+
+  const std::string path = tempPath("link-stats-only.csv");
+  std::remove(path.c_str());
+  const auto result = atm::exportNetworkTrafficHistory(
+      path, snapshot, NetworkTrafficExportFormat::Csv);
+  CHECK(result.status == NetworkTrafficExportStatus::Success);
+  std::remove(path.c_str());
+
+  const std::string csv = atm::generateNetworkTrafficCsv(snapshot);
+  CHECK(csv.find("link_stats_metadata,") != std::string::npos);
+  const std::string json = atm::generateNetworkTrafficJson(snapshot);
+  CHECK(isValidJson(json));
+  CHECK(json.find("\"link_stats\":{") != std::string::npos);
+}
+
+// -------------------------------------------------------------------------
+// Packet and MTU statistics export (Step 54)
+// -------------------------------------------------------------------------
+
+/// Builds a tracked MTU/packet record with three valid samples (0s..2s): the
+/// first establishes the baseline at the standard Ethernet MTU, the second
+/// changes it to a large configured MTU, the third confirms it. All four
+/// packet/byte counters are present.
+atm::NetworkPacketMtuStats makePacketMtuHistory(std::size_t max_samples = 120) {
+  atm::NetworkPacketMtuStats stats;
+  stats.identity = "idx:2";
+  stats.name = "eth0";
+  stats.present = true;
+  const auto t0 = std::chrono::steady_clock::now();
+  const auto w0 = std::chrono::system_clock::now();
+
+  const auto read = [](int mtu, std::uint64_t rx_packets,
+                       std::uint64_t tx_packets, std::uint64_t rx_bytes,
+                       std::uint64_t tx_bytes) {
+    atm::NetworkPacketMtuRead r;
+    r.mtu_read_ok = true;
+    r.mtu_access_denied = false;
+    r.counters_available = true;
+    r.mtu = mtu;
+    r.rx_packets = rx_packets;
+    r.tx_packets = tx_packets;
+    r.rx_bytes = rx_bytes;
+    r.tx_bytes = tx_bytes;
+    return r;
+  };
+
+  stats = atm::updateNetworkPacketMtu(stats, read(1500, 100, 200, 150000, 300000),
+                                      t0, w0, max_samples);
+  stats = atm::updateNetworkPacketMtu(
+      stats, read(9000, 160, 250, 240000, 370000),
+      t0 + std::chrono::seconds(1), w0 + std::chrono::seconds(1), max_samples);
+  stats = atm::updateNetworkPacketMtu(
+      stats, read(9000, 210, 320, 320000, 470000),
+      t0 + std::chrono::seconds(2), w0 + std::chrono::seconds(2), max_samples);
+  return stats;
+}
+
+/// Same shape but with a middle tick that produced no fresh measurement (mtu
+/// file temporarily unreadable, counters absent): the preserved MTU/counters
+/// must survive and the tick must export as valid=0 with empty rates.
+atm::NetworkPacketMtuStats makePacketMtuHistoryWithStale(
+    std::size_t max_samples = 120) {
+  atm::NetworkPacketMtuStats stats = makePacketMtuHistory(max_samples);
+  // Rewind: rebuild with the stale tick spliced between the two fresh ones.
+  atm::NetworkPacketMtuStats rebuilt;
+  rebuilt.identity = "idx:2";
+  rebuilt.name = "eth0";
+  rebuilt.present = true;
+  const auto t0 = std::chrono::steady_clock::now();
+  const auto w0 = std::chrono::system_clock::now();
+  atm::NetworkPacketMtuRead base;
+  base.mtu_read_ok = true;
+  base.counters_available = true;
+  base.mtu = 1500;
+  base.rx_packets = 100;
+  base.tx_packets = 200;
+  base.rx_bytes = 150000;
+  base.tx_bytes = 300000;
+  rebuilt = atm::updateNetworkPacketMtu(rebuilt, base, t0, w0, max_samples);
+  atm::NetworkPacketMtuRead stale;  // clean absence: nothing fresh
+  stale.mtu_read_ok = false;
+  rebuilt = atm::updateNetworkPacketMtu(
+      rebuilt, stale, t0 + std::chrono::seconds(1),
+      w0 + std::chrono::seconds(1), max_samples);
+  atm::NetworkPacketMtuRead changed;
+  changed.mtu_read_ok = true;
+  changed.mtu_access_denied = false;
+  changed.counters_available = true;
+  changed.mtu = 9000;
+  changed.rx_packets = 160;
+  changed.tx_packets = 250;
+  changed.rx_bytes = 240000;
+  changed.tx_bytes = 370000;
+  rebuilt = atm::updateNetworkPacketMtu(
+      rebuilt, changed, t0 + std::chrono::seconds(2),
+      w0 + std::chrono::seconds(2), max_samples);
+  return rebuilt;
+}
+
+void test_csv_packet_mtu_section() {
+  run("csvPacketMtuSection");
+  atm::NetworkTrafficSeries s = makeSeries("idx:2", "eth0", false, 120);
+  fillFourTicks(s);
+  const atm::NetworkPacketMtuStats stats = makePacketMtuHistory();
+  const atm::NetworkTrafficExportSnapshot snapshot =
+      atm::buildNetworkTrafficExportSnapshot(s, 120, nullptr, nullptr, nullptr,
+                                             nullptr, nullptr, nullptr, &stats);
+  CHECK(snapshot.packet_mtu.has_value());
+  CHECK(snapshot.packet_mtu->sample_count == 3);
+  CHECK(snapshot.packet_mtu->mtu_change_count == 1);
+
+  const std::string csv = atm::generateNetworkTrafficCsv(snapshot);
+
+  // Metadata row: interface, state, size class and the series-scoped summary.
+  const std::size_t meta = csv.find("packet_mtu_metadata,interface,state,");
+  CHECK(meta != std::string::npos);
+  const std::size_t meta_data_start = csv.find('\n', meta) + 1;
+  const std::size_t meta_data_end = csv.find('\n', meta_data_start);
+  const std::vector<std::string> fields =
+      csvSplit(csv.substr(meta_data_start, meta_data_end - meta_data_start));
+  CHECK(fields[0] == "packet_mtu_metadata");
+  CHECK(fields[1] == "eth0");
+  CHECK(fields[2] == "valid");
+  CHECK(fields[3] == "above_standard");
+  CHECK(fields[4] == "1");          // present
+  CHECK(fields[5] == "1");          // mtu_change_count
+  CHECK(fields[6] == "0");          // discontinuity_count
+  CHECK(fields[7] == "3");          // sample_count
+  CHECK(fields[8] == "3");          // valid_sample_count
+  CHECK(fields[9] == "0");          // stale_sample_count
+  CHECK(fields[10] == "3");         // mtu_valid_count
+  CHECK(fields[11] == "3");         // counter_valid_count
+  CHECK(fields[13] == "2");         // span_seconds
+  CHECK(!fields[14].empty());       // last_update
+  CHECK(fields[15] == "9000");      // current_mtu
+  CHECK(fields[16] == "1500");      // previous_mtu
+  CHECK(fields[17] == "1500");      // min_mtu
+  CHECK(fields[18] == "9000");      // max_mtu
+  CHECK(fields[19] == "210");       // current_rx_packets
+  CHECK(fields[20] == "320");       // current_tx_packets
+  CHECK(fields[21] == "320000");    // current_rx_bytes
+  CHECK(fields[22] == "470000");    // current_tx_bytes
+  CHECK(fields[23] == "110");       // window_rx_packets
+  CHECK(fields[24] == "120");       // window_tx_packets
+  CHECK(fields[25] == "170000");    // window_rx_bytes
+  CHECK(fields[26] == "170000");    // window_tx_bytes
+  CHECK(fields[27] == "50");        // rate_rx_packets_per_second
+  CHECK(fields[28] == "70");        // rate_tx_packets_per_second
+  CHECK(fields[29] == "120");       // rate_combined_packets_per_second
+  CHECK(fields[30] == "80000");     // rate_rx_bytes_per_second
+  CHECK(fields[31] == "100000");    // rate_tx_bytes_per_second
+  CHECK(fields[32] == "180000");    // rate_combined_bytes_per_second
+  CHECK(fields[33] == "1600");      // estimate_rx_bytes_per_frame
+  CHECK(!fields[34].empty());       // estimate_tx_bytes_per_frame (fractional)
+  CHECK(fields[35] == "1500");      // estimate_combined_bytes_per_frame
+  CHECK(!fields[36].empty());       // window_rx_bytes_per_frame
+  CHECK(!fields[37].empty());       // window_tx_bytes_per_frame
+
+  // Sample rows: header lists the fresh/derived fields explicitly.
+  const std::size_t samples_header = csv.find(
+      "timestamp,interface,valid,mtu_available,counters_available,mtu,"
+      "previous_mtu,mtu_changed,counter_rx_packets,");
+  CHECK(samples_header != std::string::npos);
+  const std::size_t samples_start = csv.rfind('\n', samples_header) + 1;
+  const std::vector<std::string> sample_lines = linesOf(csv.substr(samples_start));
+  CHECK(sample_lines.size() == 4);  // header + 3 ticks
+  const std::vector<std::string> row0 = csvSplit(sample_lines[1]);
+  CHECK(row0.size() == 22);
+  CHECK(row0[1] == "eth0");
+  CHECK(row0[2] == "1");    // valid
+  CHECK(row0[3] == "1");    // mtu_available
+  CHECK(row0[4] == "1");    // counters_available
+  CHECK(row0[5] == "1500");
+  CHECK(row0[6].empty());   // no previous value on the baseline tick
+  CHECK(row0[7] == "0");    // mtu_changed
+  CHECK(row0[8] == "100");
+  CHECK(row0[9] == "200");
+  CHECK(row0[10] == "150000");
+  CHECK(row0[11] == "300000");
+  CHECK(row0[12].empty());  // no rate on the baseline tick
+  CHECK(row0[20].empty());  // no estimate on the baseline tick
+  CHECK(row0[21] == "0");   // counter_discontinuity_count
+  const std::vector<std::string> row1 = csvSplit(sample_lines[2]);
+  CHECK(row1[5] == "9000");
+  CHECK(row1[6] == "1500");  // previous_mtu
+  CHECK(row1[7] == "1");     // mtu_changed
+  CHECK(row1[8] == "160");
+  CHECK(row1[12] == "60");   // rate_rx_packets_per_second
+  CHECK(row1[13] == "50");
+  CHECK(row1[14] == "110");
+  CHECK(row1[15] == "90000");
+  CHECK(row1[16] == "70000");
+  CHECK(row1[17] == "160000");
+  CHECK(row1[18] == "1500");   // estimate_rx_bytes_per_frame
+  CHECK(row1[19] == "1400");   // estimate_tx_bytes_per_frame
+  CHECK(!row1[20].empty());    // combined estimate
+  const std::vector<std::string> row2 = csvSplit(sample_lines[3]);
+  CHECK(row2[6].empty());  // no change on the confirming tick
+  CHECK(row2[7] == "0");
+  CHECK(row2[12] == "50");
+  CHECK(row2[18] == "1600");
+  CHECK(row2[20] == "1500");
+
+  // MTU change timeline: exactly the single actual value change.
+  const std::size_t events_header = csv.find("packet_mtu_events,timestamp,");
+  CHECK(events_header != std::string::npos);
+  const std::vector<std::string> event_lines =
+      linesOf(csv.substr(events_header));
+  CHECK(event_lines.size() == 2);  // header + one event
+  const std::vector<std::string> event = csvSplit(event_lines[1]);
+  CHECK(event[0] == "packet_mtu_events");
+  CHECK(!event[1].empty());
+  CHECK(event[2] == "1500");
+  CHECK(event[3] == "9000");
+}
+
+void test_csv_packet_mtu_stale_row() {
+  run("csvPacketMtuStaleRow");
+  atm::NetworkTrafficSeries s = makeSeries("idx:2", "eth0", false, 120);
+  fillFourTicks(s);
+  const atm::NetworkPacketMtuStats stats = makePacketMtuHistoryWithStale();
+  const atm::NetworkTrafficExportSnapshot snapshot =
+      atm::buildNetworkTrafficExportSnapshot(s, 120, nullptr, nullptr, nullptr,
+                                             nullptr, nullptr, nullptr, &stats);
+  CHECK(snapshot.packet_mtu.has_value());
+  CHECK(snapshot.packet_mtu->stale_sample_count == 1);
+  CHECK(snapshot.packet_mtu->sample_count == 3);
+  CHECK(snapshot.packet_mtu->mtu_change_count == 1);
+  CHECK(snapshot.packet_mtu->window_rx_packets.has_value() &&
+        *snapshot.packet_mtu->window_rx_packets == 60);
+
+  const std::string csv = atm::generateNetworkTrafficCsv(snapshot);
+  const std::size_t samples_header = csv.find(
+      "timestamp,interface,valid,mtu_available,counters_available,mtu,");
+  const std::size_t samples_start = csv.rfind('\n', samples_header) + 1;
+  const std::vector<std::string> sample_lines = linesOf(csv.substr(samples_start));
+  CHECK(sample_lines.size() == 4);
+  // The stale middle tick carries the preserved MTU and counters but no
+  // freshness and no derived rates; it is never a fabricated gap or zero.
+  const std::vector<std::string> stake_row = csvSplit(sample_lines[2]);
+  CHECK(stake_row[2] == "0");    // valid
+  CHECK(stake_row[3] == "0");    // mtu_available
+  CHECK(stake_row[4] == "0");    // counters_available
+  CHECK(stake_row[5] == "1500"); // preserved MTU, honest gap-free display
+  CHECK(stake_row[8] == "100");  // preserved counters
+  CHECK(stake_row[12].empty());  // no rate from a preserved copy
+  CHECK(stake_row[21] == "0");
+}
+
+void test_json_packet_mtu() {
+  run("jsonPacketMtu");
+  atm::NetworkTrafficSeries s = makeSeries("idx:2", "eth0", false, 120);
+  fillFourTicks(s);
+  const atm::NetworkPacketMtuStats stats = makePacketMtuHistory();
+  const atm::NetworkTrafficExportSnapshot snapshot =
+      atm::buildNetworkTrafficExportSnapshot(s, 120, nullptr, nullptr, nullptr,
+                                             nullptr, nullptr, nullptr, &stats);
+  const std::string json = atm::generateNetworkTrafficJson(snapshot);
+  CHECK(isValidJson(json));
+  CHECK(json.find("\"packet_mtu\":{") != std::string::npos);
+  CHECK(json.find("\"identity\":\"idx:2\"") != std::string::npos);
+  CHECK(json.find("\"name\":\"eth0\"") != std::string::npos);
+  CHECK(json.find("\"state\":\"valid\"") != std::string::npos);
+  CHECK(json.find("\"mtu_size_class\":\"above_standard\"") != std::string::npos);
+  CHECK(json.find("\"present\":true") != std::string::npos);
+  CHECK(json.find("\"mtu_change_count\":1") != std::string::npos);
+  CHECK(json.find("\"discontinuity_count\":0") != std::string::npos);
+  CHECK(json.find("\"sample_count\":3") != std::string::npos);
+  CHECK(json.find("\"valid_sample_count\":3") != std::string::npos);
+  CHECK(json.find("\"stale_sample_count\":0") != std::string::npos);
+  CHECK(json.find("\"complete\":false") != std::string::npos);
+  CHECK(json.find("\"current_mtu\":9000") != std::string::npos);
+  CHECK(json.find("\"previous_mtu\":1500") != std::string::npos);
+  CHECK(json.find("\"min_mtu\":1500") != std::string::npos);
+  CHECK(json.find("\"max_mtu\":9000") != std::string::npos);
+  CHECK(json.find("\"current\":{") != std::string::npos);
+  CHECK(json.find("\"rx_packets\":210") != std::string::npos);
+  CHECK(json.find("\"tx_bytes\":470000") != std::string::npos);
+  CHECK(json.find("\"window_delta\":{") != std::string::npos);
+  CHECK(json.find("\"rx_packets\":110") != std::string::npos);
+  CHECK(json.find("\"tx_packets\":120") != std::string::npos);
+  CHECK(json.find("\"rates\":{") != std::string::npos);
+  CHECK(json.find("\"rx_packets_per_second\":50") != std::string::npos);
+  CHECK(json.find("\"combined_bytes_per_second\":180000") != std::string::npos);
+  CHECK(json.find("\"estimate\":{") != std::string::npos);
+  CHECK(json.find("\"rx_bytes_per_frame\":1600") != std::string::npos);
+  CHECK(json.find("\"combined_bytes_per_frame\":1500") != std::string::npos);
+  CHECK(json.find("\"samples\":[") != std::string::npos);
+  CHECK(json.find("\"mtu\":9000") != std::string::npos);
+  CHECK(json.find("\"mtu_changed\":true") != std::string::npos);
+  CHECK(json.find("\"counters_available\":true") != std::string::npos);
+  CHECK(json.find("\"counter_discontinuity_count\":0") != std::string::npos);
+  CHECK(json.find("\"mtu_change_events\":[{") != std::string::npos);
+  CHECK(json.find("\"new_mtu\":9000") != std::string::npos);
+}
+
+void test_json_packet_mtu_null_when_absent() {
+  run("jsonPacketMtuNullWhenAbsent");
+  atm::NetworkTrafficSeries s = makeSeries("idx:2", "eth0", false, 120);
+  fillFourTicks(s);
+  const atm::NetworkTrafficExportSnapshot snapshot =
+      atm::buildNetworkTrafficExportSnapshot(s, 120);
+  CHECK(!snapshot.packet_mtu.has_value());
+  const std::string json = atm::generateNetworkTrafficJson(snapshot);
+  CHECK(isValidJson(json));
+  CHECK(json.find("\"packet_mtu\":null") != std::string::npos);
+  CHECK(countKey(json, "packet_mtu") == 1);  // exactly one occurrence
+}
+
+void test_export_packet_mtu_only_passes_empty_gate() {
+  run("exportPacketMtuOnly");
+  // No traffic samples and no other sections: the recorded MTU/packet statistics
+  // are the only content and must not be rejected as empty history.
+  atm::NetworkTrafficSeries s = makeSeries("idx:2", "eth0", false, 120);
+  const atm::NetworkPacketMtuStats stats = makePacketMtuHistory();
+  const atm::NetworkTrafficExportSnapshot snapshot =
+      atm::buildNetworkTrafficExportSnapshot(s, 120, nullptr, nullptr, nullptr,
+                                             nullptr, nullptr, nullptr, &stats);
+  CHECK(snapshot.samples.empty());
+  CHECK(!snapshot.wireless_history.has_value());
+  CHECK(!snapshot.link_stats.has_value());
+  CHECK(snapshot.packet_mtu.has_value());
+
+  const std::string path = tempPath("packet-mtu-only.csv");
+  std::remove(path.c_str());
+  const auto result = atm::exportNetworkTrafficHistory(
+      path, snapshot, NetworkTrafficExportFormat::Csv);
+  CHECK(result.status == NetworkTrafficExportStatus::Success);
+  std::remove(path.c_str());
+
+  const std::string csv = atm::generateNetworkTrafficCsv(snapshot);
+  CHECK(csv.find("packet_mtu_metadata,") != std::string::npos);
+  CHECK(csv.find("packet_mtu_events,timestamp,") != std::string::npos);
+  const std::string json = atm::generateNetworkTrafficJson(snapshot);
+  CHECK(isValidJson(json));
+  CHECK(json.find("\"packet_mtu\":{") != std::string::npos);
+}
+
+// -------------------------------------------------------------------------
 // JSON serialization
 // -------------------------------------------------------------------------
 
@@ -1884,6 +2411,17 @@ int main() {
   test_csv_wireless_quality_section();
   test_json_wireless_quality();
   test_export_quality_present_without_samples();
+
+  test_csv_link_stats_section();
+  test_json_link_stats();
+  test_json_link_stats_null_when_absent();
+  test_export_link_stats_only_passes_empty_gate();
+
+  test_csv_packet_mtu_section();
+  test_csv_packet_mtu_stale_row();
+  test_json_packet_mtu();
+  test_json_packet_mtu_null_when_absent();
+  test_export_packet_mtu_only_passes_empty_gate();
 
   test_summary_current_and_peak();
   test_summary_totals_valid_window();

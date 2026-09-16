@@ -42,6 +42,8 @@
 #include "network_wireless.hpp"
 #include "network_link_metrics.hpp"
 #include "network_link_state.hpp"
+#include "network_link_stats.hpp"
+#include "network_packet_stats.hpp"
 #include "network_traffic_history.hpp"
 #include "network_traffic_alert.hpp"
 #include "network_traffic_history_export.hpp"
@@ -1195,7 +1197,9 @@ void renderNetworkTrafficHistorySection(
     const atm::NetworkLinkStateMonitor &network_link_state,
     const atm::NetworkLinkMetricsMonitor &link_metrics_monitor,
     const atm::NetworkInterfaceHardwareMonitor &hardware_monitor,
-    const atm::NetworkWirelessMonitor &wireless_monitor) {
+    const atm::NetworkWirelessMonitor &wireless_monitor,
+    const atm::NetworkLinkStatsMonitor &link_stats_monitor,
+    const atm::NetworkPacketMtuMonitor &packet_mtu_monitor) {
   out << "\n## NETWORK TRAFFIC HISTORY\n\n";
   const atm::NetworkTrafficSeries *series = traffic.seriesFor(selection);
   const bool stale_selection = series == nullptr;
@@ -1261,6 +1265,68 @@ void renderNetworkTrafficHistorySection(
         out << "\nWireless signal history\n";
         renderWirelessHistoryBlock(out, *wireless,
                                    wireless_monitor.historyMaxSamples(), false);
+      }
+    }
+    // One compact error/drop line for the selected interface when the link
+    // statistics monitor has retained data. Reads only cached monitor state;
+    // never reads the network on the render path.
+    const atm::NetworkLinkStats *link_stats =
+        link_stats_monitor.tracked(series->identity);
+    if (link_stats != nullptr) {
+      const atm::NetworkLinkStatSummary link_summary =
+          atm::summarizeNetworkLinkStats(
+              *link_stats, link_stats_monitor.historyMaxSamples());
+      if (link_summary.has_valid_data) {
+        const auto formatCounter =
+            [](const std::optional<std::uint64_t> &value) {
+              return value.has_value() ? std::to_string(*value)
+                                       : "unavailable";
+            };
+        out << "Link stats: "
+            << atm::networkLinkStatStateName(link_stats->state)
+            << "   rx_errors "
+            << formatCounter(link_summary.current[static_cast<std::size_t>(
+                   atm::NetworkLinkStatMetric::RxErrors)])
+            << "   tx_errors "
+            << formatCounter(link_summary.current[static_cast<std::size_t>(
+                   atm::NetworkLinkStatMetric::TxErrors)])
+            << "   rx_dropped "
+            << formatCounter(link_summary.current[static_cast<std::size_t>(
+                   atm::NetworkLinkStatMetric::RxDropped)])
+            << "   tx_dropped "
+            << formatCounter(link_summary.current[static_cast<std::size_t>(
+                   atm::NetworkLinkStatMetric::TxDropped)])
+            << '\n';
+      }
+    }
+    // One compact MTU/packet line for the selected interface when the packet
+    // statistics monitor has retained data. Reads only cached monitor state;
+    // never reads the network on the render path. The frame size is an
+    // estimate (average bytes per frame from the aggregate byte/packet
+    // counters), never a claimed size distribution.
+    const atm::NetworkPacketMtuStats *packet_mtu =
+        packet_mtu_monitor.tracked(series->identity);
+    if (packet_mtu != nullptr) {
+      const atm::NetworkPacketMtuSummary mtu_summary =
+          atm::summarizeNetworkPacketMtu(
+              *packet_mtu, packet_mtu_monitor.historyMaxSamples());
+      if (mtu_summary.has_valid_data) {
+        out << "Packet/MTU: "
+            << atm::networkPacketMtuStateName(packet_mtu->state)
+            << "   mtu "
+            << (mtu_summary.current_mtu.has_value()
+                    ? std::to_string(*mtu_summary.current_mtu)
+                    : "unavailable")
+            << "   rx_packets/s "
+            << atm::formatNetworkPacketMtuRate(
+                   mtu_summary.rates.rx_packets_per_second)
+            << "   tx_packets/s "
+            << atm::formatNetworkPacketMtuRate(
+                   mtu_summary.rates.tx_packets_per_second)
+            << "   avg_frame "
+            << atm::formatNetworkPacketSizeEstimate(
+                   mtu_summary.estimate.combined_bytes_per_frame)
+            << '\n';
       }
     }
   }
@@ -4542,7 +4608,9 @@ const atm::FilesystemMonitor &filesystems,
                          const atm::NetworkLinkStateMonitor &network_link_state,
                          const atm::NetworkLinkMetricsMonitor &network_link_metrics,
                          const atm::NetworkInterfaceHardwareMonitor &hardware_monitor,
-                         const atm::NetworkWirelessMonitor &wireless_monitor) {
+                         const atm::NetworkWirelessMonitor &wireless_monitor,
+                         const atm::NetworkLinkStatsMonitor &link_stats_monitor,
+                         const atm::NetworkPacketMtuMonitor &packet_mtu_monitor) {
    if (view == ViewMode::Tree) {
     // The tree view stays deliberately focused on the hierarchy; the storage
     // and network sections are part of the table view.
@@ -4569,7 +4637,8 @@ const atm::FilesystemMonitor &filesystems,
                                      traffic_selection,
                                      network_alert_monitor,
                                      network_link_state, network_link_metrics,
-                                     hardware_monitor, wireless_monitor);
+                                     hardware_monitor, wireless_monitor,
+                                     link_stats_monitor, packet_mtu_monitor);
   renderGpuSections(out, gpu);
   renderSensorSections(out, sensors, gpu);
   renderAlertsSections(out, alerts, alert_filter);
@@ -4647,7 +4716,9 @@ const atm::GpuSnapshot &gpu,
                  const atm::NetworkLinkStateMonitor &network_link_state,
                  const atm::NetworkLinkMetricsMonitor &network_link_metrics,
                  const atm::NetworkInterfaceHardwareMonitor &hardware_monitor,
-                 const atm::NetworkWirelessMonitor &wireless_monitor) {
+                 const atm::NetworkWirelessMonitor &wireless_monitor,
+                 const atm::NetworkLinkStatsMonitor &link_stats_monitor,
+                 const atm::NetworkPacketMtuMonitor &packet_mtu_monitor) {
   // ANSI "clear entire screen" + "cursor to home" so the multi-line frame
   // refreshes in place instead of scrolling the terminal.
   std::cout << "\033[2J\033[H";
@@ -4661,7 +4732,8 @@ const atm::GpuSnapshot &gpu,
                            network_traffic_history, traffic_selection,
                            network_alert_monitor, network_link_state,
                            network_link_metrics, hardware_monitor,
-                           wireless_monitor)
+                           wireless_monitor, link_stats_monitor,
+                           packet_mtu_monitor)
             << std::flush;
 }
 
@@ -4871,6 +4943,8 @@ void interactNetworkTrafficExport(const atm::NetworkTrafficHistory &traffic,
                                   const atm::NetworkLinkStateMonitor &link_state,
                                   const atm::NetworkInterfaceHardwareMonitor &hardware,
                                   const atm::NetworkWirelessMonitor &wireless,
+                                  const atm::NetworkLinkStatsMonitor &link_stats,
+                                  const atm::NetworkPacketMtuMonitor &packet_mtu,
                                   ConsoleInput &input) {
   for (;;) {
     std::cout << "\033[2J\033[H";
@@ -4930,11 +5004,11 @@ void interactNetworkTrafficExport(const atm::NetworkTrafficHistory &traffic,
       continue;
     }
 
-    // Attach the hardware/driver, wireless, interface-info and link-state
-    // records for the selected series (all already-cached monitor state — the
-    // export path never reads the network). The builder treats each as
-    // optional, so a stale selection or a non-wireless interface simply yields
-    // no wireless metadata.
+    // Attach the hardware/driver, wireless, interface-info, link-state and
+    // packet/MTU records for the selected series (all already-cached monitor
+    // state — the export path never reads the network). The builder treats each
+    // as optional, so a stale selection or a non-wireless interface simply
+    // yields no wireless metadata.
     const atm::NetworkInterfaceInfo *info = nullptr;
     for (const atm::NetworkInterfaceInfo &candidate :
          interfaces.current().interfaces) {
@@ -4949,11 +5023,15 @@ void interactNetworkTrafficExport(const atm::NetworkTrafficHistory &traffic,
             link_metrics.tracked(effective_identity),
             hardware.tracked(effective_identity),
             wireless.tracked(effective_identity), info,
-            link_state.tracked(effective_identity));
+            link_state.tracked(effective_identity),
+            link_stats.tracked(effective_identity),
+            packet_mtu.tracked(effective_identity));
     if (snapshot.samples.empty() &&
         (!snapshot.wireless_history.has_value() ||
          (snapshot.wireless_history->samples.empty() &&
-          snapshot.wireless_history->events.empty()))) {
+          snapshot.wireless_history->events.empty())) &&
+        !snapshot.link_stats.has_value() &&
+        !snapshot.packet_mtu.has_value()) {
       std::cout << "\nNo network history samples are available to export for "
                    "this selection (history is disabled or never collected).\n"
                    "Press Enter to continue.\n"
@@ -5974,6 +6052,8 @@ std::string buildNetworkInterfacePage(
     const atm::NetworkLinkMetricsMonitor &link_metrics_monitor,
     const atm::NetworkInterfaceHardwareMonitor &hardware_monitor,
     const atm::NetworkWirelessMonitor &wireless_monitor,
+    const atm::NetworkLinkStatsMonitor &link_stats_monitor,
+    const atm::NetworkPacketMtuMonitor &packet_mtu_monitor,
     const atm::NetworkInterfaceStats &traffic) {
   const auto found = std::find_if(
       snapshot.interfaces.begin(), snapshot.interfaces.end(),
@@ -6147,6 +6227,52 @@ std::string buildNetworkInterfacePage(
     }
   }
 
+  out << "\nLink error and drop statistics\n";
+  if (const atm::NetworkLinkStats *stats = link_stats_monitor.tracked(identity);
+      stats != nullptr) {
+    out << atm::renderNetworkLinkStats(*stats, monitor.historyMaxSamples());
+
+    atm::NetworkLinkStatChartConfig chart;
+    chart.data_width = 40;
+    chart.data_height = 5;
+    out << "  rx_errors rate trend:\n"
+        << atm::renderNetworkLinkStatTrend(
+               *stats, atm::NetworkLinkStatMetric::RxErrors, chart)
+        << '\n';
+  } else {
+    out << "  not sampled yet\n";
+  }
+
+  out << "\nPacket and MTU statistics\n";
+  if (const atm::NetworkPacketMtuStats *packet_mtu =
+          packet_mtu_monitor.tracked(identity);
+      packet_mtu != nullptr) {
+    out << atm::renderNetworkPacketMtu(*packet_mtu,
+                                       monitor.historyMaxSamples());
+    out << atm::renderNetworkPacketMtuChanges(*packet_mtu);
+
+    atm::NetworkPacketMtuChartConfig chart;
+    chart.data_width = 40;
+    chart.data_height = 5;
+    out << "  rx packets/s trend:\n"
+        << atm::renderNetworkPacketMtuTrend(
+               *packet_mtu, atm::NetworkPacketMtuTrendMetric::RxPacketRate,
+               chart)
+        << '\n';
+    out << "  tx packets/s trend:\n"
+        << atm::renderNetworkPacketMtuTrend(
+               *packet_mtu, atm::NetworkPacketMtuTrendMetric::TxPacketRate,
+               chart)
+        << '\n';
+    out << "  estimated average frame size trend:\n"
+        << atm::renderNetworkPacketMtuTrend(
+               *packet_mtu,
+               atm::NetworkPacketMtuTrendMetric::CombinedAvgFrameSize, chart)
+        << '\n';
+  } else {
+    out << "  not sampled yet\n";
+  }
+
   out << "\nAddresses\n";
   if (info.addresses.empty()) {
     out << "  none\n";
@@ -6266,6 +6392,8 @@ void interactNetworkDetail(const atm::NetworkSnapshot &network,
                            const atm::NetworkLinkMetricsMonitor &link_metrics,
                            const atm::NetworkInterfaceHardwareMonitor &hardware,
                            const atm::NetworkWirelessMonitor &wireless,
+                           const atm::NetworkLinkStatsMonitor &link_stats,
+                           const atm::NetworkPacketMtuMonitor &packet_mtu,
                            ConsoleInput &input) {
   std::cout << "\033[2J\033[H";
   const atm::NetworkInterfaceSnapshot &iface_snapshot = interfaces.current();
@@ -6301,7 +6429,9 @@ void interactNetworkDetail(const atm::NetworkSnapshot &network,
 
 const std::string page = buildNetworkInterfacePage(iface_snapshot, interfaces,
                                                       link_state, link_metrics,
-                                                      hardware, wireless, *found);
+                                                      hardware, wireless,
+                                                      link_stats, packet_mtu,
+                                                      *found);
   if (page.empty()) {
     std::cout << "Interface does not exist (not found in the current "
                  "interface list).\n";
@@ -7959,6 +8089,8 @@ int main() {
   atm::NetworkTrafficAlertMonitor network_alert_monitor(alerts);
   atm::NetworkLinkStateMonitor network_link_state(alerts);
   atm::NetworkLinkMetricsMonitor network_link_metrics;
+  atm::NetworkLinkStatsMonitor network_link_stats;
+  atm::NetworkPacketMtuMonitor network_packet_mtu;
   atm::NetworkInterfaceHardwareMonitor network_hardware_monitor;
   atm::NetworkWirelessMonitor network_wireless(alerts);
   atm::NotificationManager notifications;
@@ -7978,6 +8110,10 @@ int main() {
   network_traffic_history.setHistoryMaxSamples(
       static_cast<std::size_t>(settings.settings().history.max_samples));
   network_wireless.setHistoryMaxSamples(
+      static_cast<std::size_t>(settings.settings().history.max_samples));
+  network_link_stats.setHistoryMaxSamples(
+      static_cast<std::size_t>(settings.settings().history.max_samples));
+  network_packet_mtu.setHistoryMaxSamples(
       static_cast<std::size_t>(settings.settings().history.max_samples));
 
   // Forward alert state transitions to desktop notifications.
@@ -8093,6 +8229,8 @@ int main() {
   network_link_metrics.update(network_interface_details.current());
   network_hardware_monitor.update(network_interface_details.current());
   network_wireless.update(network_interface_details.current());
+  network_link_stats.update(network_interface_details.current());
+  network_packet_mtu.update(network_interface_details.current());
   network_alert_monitor.evaluate(network_traffic_history);
   const atm::GpuSnapshot first_gpu = gpu_monitor.read();
   const atm::SensorSnapshot first_sensors = sensor_monitor.read();
@@ -8143,7 +8281,8 @@ int main() {
              filesystem_monitor, fs_filter, network_interface_details,
              network_traffic_history, network_traffic_selection,
              network_alert_monitor, network_link_state, network_link_metrics,
-             network_hardware_monitor, network_wireless);
+             network_hardware_monitor, network_wireless, network_link_stats,
+             network_packet_mtu);
 
   atm::NetworkSnapshot network = first_network;
   atm::GpuSnapshot gpu = first_gpu;
@@ -8207,6 +8346,8 @@ int main() {
             network_link_metrics.update(network_interface_details.current());
             network_hardware_monitor.update(network_interface_details.current());
             network_wireless.update(network_interface_details.current());
+            network_link_stats.update(network_interface_details.current());
+            network_packet_mtu.update(network_interface_details.current());
             network_alert_monitor.evaluate(network_traffic_history);
             static_cast<void>(filesystem_monitor.read());
             gpu = gpu_monitor.read();
@@ -8249,7 +8390,8 @@ renderView(aggregateCpuPercent(cpu), mem_info, snapshot.processes,
                    network_interface_details, network_traffic_history,
                    network_traffic_selection, network_alert_monitor,
                    network_link_state, network_link_metrics,
-                   network_hardware_monitor, network_wireless);
+                   network_hardware_monitor, network_wireless, network_link_stats,
+                   network_packet_mtu);
           }
         }
         continue;
@@ -8266,7 +8408,7 @@ renderView(aggregateCpuPercent(cpu), mem_info, snapshot.processes,
           interactNetworkDetail(network, network_interface_details,
                                 network_link_state, network_link_metrics,
                                 network_hardware_monitor, network_wireless,
-                                input);
+                                network_link_stats, network_packet_mtu, input);
         }
         break;
       case ConsoleInput::Command::InspectDiskHealth:
@@ -8325,6 +8467,10 @@ renderView(aggregateCpuPercent(cpu), mem_info, snapshot.processes,
               static_cast<std::size_t>(settings.settings().history.max_samples));
           network_wireless.setHistoryMaxSamples(
               static_cast<std::size_t>(settings.settings().history.max_samples));
+          network_link_stats.setHistoryMaxSamples(
+              static_cast<std::size_t>(settings.settings().history.max_samples));
+          network_packet_mtu.setHistoryMaxSamples(
+              static_cast<std::size_t>(settings.settings().history.max_samples));
         }
         break;
       case ConsoleInput::Command::CycleNetworkTraffic:
@@ -8354,7 +8500,8 @@ renderView(aggregateCpuPercent(cpu), mem_info, snapshot.processes,
                                        network_interface_details,
                                        network_link_state,
                                        network_hardware_monitor,
-                                       network_wireless, input);
+                                       network_wireless, network_link_stats,
+                                       network_packet_mtu, input);
         }
         break;
       case ConsoleInput::Command::ToggleHistory:
@@ -8381,6 +8528,10 @@ renderView(aggregateCpuPercent(cpu), mem_info, snapshot.processes,
           network_traffic_history.setHistoryMaxSamples(
               static_cast<std::size_t>(settings.settings().history.max_samples));
           network_wireless.setHistoryMaxSamples(
+              static_cast<std::size_t>(settings.settings().history.max_samples));
+          network_link_stats.setHistoryMaxSamples(
+              static_cast<std::size_t>(settings.settings().history.max_samples));
+          network_packet_mtu.setHistoryMaxSamples(
               static_cast<std::size_t>(settings.settings().history.max_samples));
         }
         break;
@@ -8414,6 +8565,8 @@ renderView(aggregateCpuPercent(cpu), mem_info, snapshot.processes,
     network_link_metrics.update(network_interface_details.current());
     network_hardware_monitor.update(network_interface_details.current());
     network_wireless.update(network_interface_details.current());
+    network_link_stats.update(network_interface_details.current());
+    network_packet_mtu.update(network_interface_details.current());
     network_alert_monitor.evaluate(network_traffic_history);
     static_cast<void>(filesystem_monitor.read());
     gpu = gpu_monitor.read();
@@ -8455,7 +8608,8 @@ renderView(aggregateCpuPercent(cpu), mem_info, snapshot.processes,
                disk_health, filesystem_monitor, fs_filter, network_interface_details,
                network_traffic_history, network_traffic_selection,
                network_alert_monitor, network_link_state, network_link_metrics,
-               network_hardware_monitor, network_wireless);
+               network_hardware_monitor, network_wireless, network_link_stats,
+               network_packet_mtu);
   }
 
   // Clean shutdown: persist any pending settings changes.
