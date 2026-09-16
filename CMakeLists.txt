@@ -66,6 +66,7 @@ add_executable(arch-task-manager
   src/network_link_metrics.cpp
   src/network_link_state.cpp
   src/network_link_stats.cpp
+  src/network_packet_stats.cpp
   src/network_traffic_history.cpp
   src/network_traffic_history_export.cpp
   src/network_traffic_alert.cpp
@@ -430,6 +431,7 @@ add_executable(network-traffic-history-export-tests
   src/network_link_metrics.cpp
   src/network_link_state.cpp
   src/network_link_stats.cpp
+  src/network_packet_stats.cpp
   src/alert_manager.cpp
   src/process_report.cpp
   src/process_monitor.cpp
@@ -541,6 +543,18 @@ target_include_directories(network-link-stats-tests PRIVATE include)
 target_link_libraries(network-link-stats-tests PRIVATE Threads::Threads)
 
 add_test(NAME network-link-stats COMMAND network-link-stats-tests)
+
+add_executable(network-packet-mtu-stats-tests
+  tests/network_packet_stats_tests.cpp
+  src/network_packet_stats.cpp
+  src/network_interface_details.cpp
+)
+
+target_include_directories(network-packet-mtu-stats-tests PRIVATE include)
+
+target_link_libraries(network-packet-mtu-stats-tests PRIVATE Threads::Threads)
+
+add_test(NAME network-packet-mtu-stats COMMAND network-packet-mtu-stats-tests)
 
 add_executable(network-wireless-tests
   tests/network_wireless_tests.cpp

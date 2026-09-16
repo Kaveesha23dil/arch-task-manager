@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "network_link_stats.hpp"
+#include "network_packet_stats.hpp"
 #include "network_traffic_history.hpp"
 
 namespace atm {
@@ -302,6 +303,86 @@ struct NetworkTrafficExportLinkStats {
   std::vector<NetworkTrafficExportLinkStatsRow> samples;  // ascending order
 };
 
+/// One exported MTU/packet-size sample row (Step 54). Mirrors the live
+/// NetworkPacketMtuSample: stale ticks carry the last valid MTU and counter
+/// values with `valid == false`, and every value is an explicit null when it was
+/// unavailable. `mtu_available`/`counters_available` record which part was
+/// freshly read (they are independent), `mtu_changed` marks an actual value
+/// change and `counter_discontinuity_count` is the number of counters that
+/// decreased since the previous fresh tick (reset/wraparound).
+struct NetworkTrafficExportPacketMtuRow {
+  std::chrono::system_clock::time_point timestamp{};
+  bool valid = false;
+  bool mtu_available = false;
+  bool counters_available = false;
+  std::optional<int> mtu;
+  std::optional<int> previous_mtu;
+  bool mtu_changed = false;
+  std::optional<std::uint64_t> rx_packets;
+  std::optional<std::uint64_t> tx_packets;
+  std::optional<std::uint64_t> rx_bytes;
+  std::optional<std::uint64_t> tx_bytes;
+  NetworkPacketMtuRates rates;
+  NetworkPacketSizeEstimate estimate;
+  std::size_t counter_discontinuity_count = 0;
+};
+
+/// One exported MTU change event (Step 54): the wall-clock display time and the
+/// before/after configured values. Only actual value changes appear (never a
+/// preserved/stale value), so the timeline is free of duplicates.
+struct NetworkTrafficExportPacketMtuChangeEvent {
+  std::string timestamp_iso8601;   // wall-clock display time ("" when unknown)
+  std::optional<int> previous_mtu;
+  std::optional<int> new_mtu;
+};
+
+/// Series-scoped MTU/packet statistics (Step 54) captured into an export
+/// snapshot. Only present when the selected interface is tracked and its sample
+/// ring holds recorded samples. The summary numbers are the same ones the
+/// interface-details "Packet and MTU statistics" view renders (state, coverage,
+/// span, configured MTU plus its size class, cumulative current counters,
+/// retained-window deltas, interval rates and the estimated average frame
+/// sizes) — never a fabricated zero, and the frame sizes are explicitly
+/// estimates, never a claimed size distribution.
+struct NetworkTrafficExportPacketMtuStats {
+  std::string identity;         // stable key ("idx:<ifindex>" / "name:<name>")
+  std::string name;             // current kernel name
+  std::string state;            // networkPacketMtuStateName()
+  std::string mtu_size_class;   // networkPacketMtuSizeClassName()
+  bool present = false;         // interface still seen at the last discovery
+  std::size_t mtu_change_count = 0;
+  std::size_t discontinuity_count = 0;  // counter resets while tracked
+  std::size_t sample_count = 0;
+  std::size_t valid_sample_count = 0;
+  std::size_t stale_sample_count = 0;
+  std::size_t mtu_valid_count = 0;
+  std::size_t counter_valid_count = 0;
+  double coverage = 0.0;              // sample_count / retention bound
+  double span_seconds = 0.0;          // newest - oldest retained span
+  std::chrono::system_clock::time_point last_update{};
+
+  std::optional<int> current_mtu;
+  std::optional<int> previous_mtu;    // most recent distinct value before current
+  std::optional<int> min_mtu;         // retained-window minimum
+  std::optional<int> max_mtu;         // retained-window maximum
+
+  std::optional<std::uint64_t> current_rx_packets;
+  std::optional<std::uint64_t> current_tx_packets;
+  std::optional<std::uint64_t> current_rx_bytes;
+  std::optional<std::uint64_t> current_tx_bytes;
+  std::optional<std::uint64_t> window_rx_packets;  // first vs last fresh sample
+  std::optional<std::uint64_t> window_tx_packets;
+  std::optional<std::uint64_t> window_rx_bytes;
+  std::optional<std::uint64_t> window_tx_bytes;
+
+  NetworkPacketMtuRates rates;
+  NetworkPacketSizeEstimate estimate;        // newest window
+  NetworkPacketSizeEstimate window_estimate; // whole retained window
+
+  std::vector<NetworkTrafficExportPacketMtuRow> samples;  // ascending order
+  std::vector<NetworkTrafficExportPacketMtuChangeEvent> mtu_change_events;  // ascending
+};
+
 /// Implementation-free, immutable snapshot of one traffic series ready for
 /// serialization. Contains only plain data — no pointers, no mutexes, no UI
 /// objects and no internal bookkeeping. Building this snapshot before
@@ -341,6 +422,12 @@ struct NetworkTrafficExportSnapshot {
   // (std::nullopt for the aggregate / when no counters were captured). The
   // numbers match what the interface-details "Errors & drops" section shows.
   std::optional<NetworkTrafficExportLinkStats> link_stats;
+
+  // MTU and packet-size statistics (Step 54) when the monitoring layer tracked
+  // the selected interface and its sample ring holds recorded samples
+  // (std::nullopt for the aggregate / when no data was captured). The numbers
+  // match what the interface-details "Packet and MTU statistics" section shows.
+  std::optional<NetworkTrafficExportPacketMtuStats> packet_mtu;
 };
 
 /// Builds a stable snapshot of `series` for export. Reads only the series'
@@ -360,8 +447,10 @@ struct NetworkTrafficExportSnapshot {
 /// (per-sample rows anchored to the newest sample plus the summary numbers the
 /// wireless-history view shows). When `link_stats` points at the selected
 /// interface's error/drop statistics the summary and per-sample rows are
-/// captured into snapshot.link_stats. All parameters are additive — existing
-/// fields are unchanged and any missing one stays unavailable.
+/// captured into snapshot.link_stats. When `packet_mtu` points at the selected
+/// interface's MTU/packet statistics the summary, per-sample rows and MTU-change
+/// timeline are captured into snapshot.packet_mtu. All parameters are additive —
+/// existing fields are unchanged and any missing one stays unavailable.
 [[nodiscard]] NetworkTrafficExportSnapshot buildNetworkTrafficExportSnapshot(
     const NetworkTrafficSeries &series, std::size_t max_samples,
     const NetworkLinkMetrics *link_metrics = nullptr,
@@ -369,7 +458,8 @@ struct NetworkTrafficExportSnapshot {
     const NetworkWirelessInfo *wireless = nullptr,
     const NetworkInterfaceInfo *info = nullptr,
     const TrackedInterface *link_state = nullptr,
-    const NetworkLinkStats *link_stats = nullptr);
+    const NetworkLinkStats *link_stats = nullptr,
+    const NetworkPacketMtuStats *packet_mtu = nullptr);
 
 /// Formats a wall-clock time point as ISO-8601 local time
 /// "YYYY-MM-DDTHH:MM:SS". This is the timestamp format used by every export
@@ -395,9 +485,12 @@ struct NetworkTrafficExportSnapshot {
 /// the connection-quality summary follow as their own sections. When link error
 /// statistics (Step 53) were captured a link_stats metadata section (state,
 /// coverage, cumulative current counters and retained-window deltas) and a
-/// per-sample section are appended. Unavailable metrics are empty
-/// fields (never misleading zeros); headers are always emitted, so a snapshot
-/// with no rows still produces a valid, readable CSV.
+/// per-sample section are appended. When MTU/packet statistics (Step 54) were
+/// captured a packet_mtu metadata section (state, configured MTU, size class,
+/// current counters, rates, frame-size estimates, retained-window deltas), a
+/// per-sample section and an MTU-change timeline are appended. Unavailable
+/// metrics are empty fields (never misleading zeros); headers are always
+/// emitted, so a snapshot with no rows still produces a valid, readable CSV.
 [[nodiscard]] std::string generateNetworkTrafficCsv(
     const NetworkTrafficExportSnapshot &snapshot);
 
@@ -411,7 +504,10 @@ struct NetworkTrafficExportSnapshot {
 /// absent), an optional "wireless_history" object (per-sample rows plus the
 /// signal/quality summary the wireless-history view shows, null when absent),
 /// an optional "link_stats" object (Step 53: current counters, interval rates,
-/// retained-window deltas and per-sample rows, null when absent) and history
+/// retained-window deltas and per-sample rows, null when absent), an optional
+/// "packet_mtu" object (Step 54: configured MTU plus size class, MTU changes,
+/// cumulative counters, interval rates, estimated average frame sizes and
+/// per-sample rows, null when absent) and history
 /// span and sampling interval, unit information, the summary values and the
 /// sample array. Unavailable values are null; an empty sample array is valid; no
 /// internal implementation state is ever serialized.

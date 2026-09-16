@@ -18,6 +18,7 @@
 #include "network_link_metrics.hpp"
 #include "network_link_state.hpp"
 #include "network_link_stats.hpp"
+#include "network_packet_stats.hpp"
 #include "network_wireless.hpp"
 #include "process_report.hpp"  // sanitizeReportName (shared filename sanitizer)
 
@@ -157,6 +158,44 @@ static constexpr NetworkLinkStatRateColumn kLinkStatRateColumns[] = {
      &NetworkLinkStatRates::tx_carrier_errors_per_second},
 };
 
+/// Stable column/key order for the 6 derived interval rates (Step 54). The
+/// mapping links each human name to the NetworkPacketMtuRates member it reads,
+/// mirroring the kLinkStatRateColumns convention.
+struct NetworkPacketMtuRateColumn {
+  const char *name;
+  std::optional<double> NetworkPacketMtuRates::*member;
+};
+static constexpr NetworkPacketMtuRateColumn kPacketMtuRateColumns[] = {
+    {"rx_packets_per_second",
+     &NetworkPacketMtuRates::rx_packets_per_second},
+    {"tx_packets_per_second",
+     &NetworkPacketMtuRates::tx_packets_per_second},
+    {"combined_packets_per_second",
+     &NetworkPacketMtuRates::combined_packets_per_second},
+    {"rx_bytes_per_second",
+     &NetworkPacketMtuRates::rx_bytes_per_second},
+    {"tx_bytes_per_second",
+     &NetworkPacketMtuRates::tx_bytes_per_second},
+    {"combined_bytes_per_second",
+     &NetworkPacketMtuRates::combined_bytes_per_second},
+};
+
+/// Stable column/key order for the 3 estimated average frame sizes (Step 54).
+/// The names end in "_bytes_per_frame" and carry the estimate caveat in the
+/// surrounding metadata/units text.
+struct NetworkPacketMtuEstimateColumn {
+  const char *name;
+  std::optional<double> NetworkPacketSizeEstimate::*member;
+};
+static constexpr NetworkPacketMtuEstimateColumn kPacketMtuEstimateColumns[] = {
+    {"rx_bytes_per_frame",
+     &NetworkPacketSizeEstimate::rx_bytes_per_frame},
+    {"tx_bytes_per_frame",
+     &NetworkPacketSizeEstimate::tx_bytes_per_frame},
+    {"combined_bytes_per_frame",
+     &NetworkPacketSizeEstimate::combined_bytes_per_frame},
+};
+
 /// Builds a JSON object literal from ordered key/value members.
 std::string jsonObject(
     std::initializer_list<std::pair<std::string, std::string>> members) {
@@ -274,7 +313,8 @@ NetworkTrafficExportSnapshot buildNetworkTrafficExportSnapshot(
     const NetworkWirelessInfo *wireless,
     const NetworkInterfaceInfo *info,
     const TrackedInterface *link_state,
-    const NetworkLinkStats *link_stats) {
+    const NetworkLinkStats *link_stats,
+    const NetworkPacketMtuStats *packet_mtu) {
   NetworkTrafficExportSnapshot snapshot;
   snapshot.aggregate = series.aggregate;
   snapshot.identity = series.identity;
@@ -573,6 +613,81 @@ NetworkTrafficExportSnapshot buildNetworkTrafficExportSnapshot(
       ls.samples.push_back(std::move(row));
     }
     snapshot.link_stats = std::move(ls);
+  }
+
+  // Capture the MTU/packet statistics (Step 54) when the monitoring layer
+  // tracked the selected interface and its sample ring holds recorded samples.
+  // The summary numbers mirror summarizeNetworkPacketMtu, the same pure function
+  // the interface-details "Packet and MTU statistics" view renders, so the
+  // exported values always equal the UI numbers. Per-sample rows use each
+  // sample's own wall clock (never an anchored offset); unavailable MTU/counter
+  // values stay null — never a fabricated zero — and the frame sizes are
+  // explicitly estimates.
+  if (packet_mtu != nullptr && !packet_mtu->history.empty()) {
+    const NetworkPacketMtuSummary mtu =
+        summarizeNetworkPacketMtu(*packet_mtu, max_samples);
+    NetworkTrafficExportPacketMtuStats pm;
+    pm.identity = packet_mtu->identity;
+    pm.name = packet_mtu->name;
+    pm.state = networkPacketMtuStateName(packet_mtu->state);
+    pm.mtu_size_class = networkPacketMtuSizeClassName(mtu.current_mtu);
+    pm.present = packet_mtu->present;
+    pm.mtu_change_count = mtu.mtu_change_count;
+    pm.discontinuity_count = mtu.discontinuity_count;
+    pm.sample_count = mtu.sample_count;
+    pm.valid_sample_count = mtu.valid_sample_count;
+    pm.stale_sample_count = mtu.stale_sample_count;
+    pm.mtu_valid_count = mtu.mtu_valid_count;
+    pm.counter_valid_count = mtu.counter_valid_count;
+    pm.coverage = mtu.coverage;
+    pm.span_seconds = mtu.span_seconds;
+    pm.last_update = mtu.last_update;
+    pm.current_mtu = mtu.current_mtu;
+    pm.previous_mtu = mtu.previous_mtu;
+    pm.min_mtu = mtu.min_mtu;
+    pm.max_mtu = mtu.max_mtu;
+    pm.current_rx_packets = mtu.current_rx_packets;
+    pm.current_tx_packets = mtu.current_tx_packets;
+    pm.current_rx_bytes = mtu.current_rx_bytes;
+    pm.current_tx_bytes = mtu.current_tx_bytes;
+    pm.window_rx_packets = mtu.window_rx_packets;
+    pm.window_tx_packets = mtu.window_tx_packets;
+    pm.window_rx_bytes = mtu.window_rx_bytes;
+    pm.window_tx_bytes = mtu.window_tx_bytes;
+    pm.rates = mtu.rates;
+    pm.estimate = mtu.estimate;
+    pm.window_estimate = mtu.window_estimate;
+
+    const auto &samples = packet_mtu->history.samples();
+    pm.samples.reserve(samples.size());
+    for (const NetworkPacketMtuSample &sample : samples) {
+      NetworkTrafficExportPacketMtuRow row;
+      row.timestamp = sample.wall_clock;
+      row.valid = sample.valid;
+      row.mtu_available = sample.mtu_available;
+      row.counters_available = sample.counters_available;
+      row.mtu = sample.mtu;
+      row.previous_mtu = sample.previous_mtu;
+      row.mtu_changed = sample.mtu_changed;
+      row.rx_packets = sample.rx_packets;
+      row.tx_packets = sample.tx_packets;
+      row.rx_bytes = sample.rx_bytes;
+      row.tx_bytes = sample.tx_bytes;
+      row.rates = sample.rates;
+      row.estimate = sample.estimate;
+      row.counter_discontinuity_count = sample.counter_discontinuity_count;
+      pm.samples.push_back(std::move(row));
+    }
+    pm.mtu_change_events.reserve(packet_mtu->mtu_events.size());
+    for (const NetworkPacketMtuChangeEvent &event : packet_mtu->mtu_events) {
+      NetworkTrafficExportPacketMtuChangeEvent exported;
+      exported.timestamp_iso8601 =
+          formatNetworkTrafficTimestamp(event.wall_clock);
+      exported.previous_mtu = event.previous_mtu;
+      exported.new_mtu = event.new_mtu;
+      pm.mtu_change_events.push_back(std::move(exported));
+    }
+    snapshot.packet_mtu = std::move(pm);
   }
 
   // Merge every retained ring into one row per unique sample tick. A row is
@@ -1173,6 +1288,164 @@ std::string generateNetworkTrafficCsv(
       out += '\n';
     }
   }
+
+  // Step 54 MTU/packet statistics: three clearly-headed sections appended only
+  // when the selected interface is tracked and its ring holds samples. A
+  // packet_mtu_metadata line carries the series-scoped summary (state, configured
+  // MTU and size class, current counters, interval rates, frame-size estimates,
+  // retained-window deltas) and a samples section lists every retained tick with
+  // its MTU, counters, rates and estimates; unavailable values stay empty fields
+  // (never fabricated zeros) and the frame sizes are explicitly estimates. An
+  // MTU-change timeline closes the block with the actual value changes only.
+  if (snapshot.packet_mtu.has_value()) {
+    const NetworkTrafficExportPacketMtuStats &pm = *snapshot.packet_mtu;
+    const auto appendCounter = [](std::string &text,
+                                  const std::optional<std::uint64_t> &value) {
+      text += value.has_value() ? std::to_string(*value) : std::string{};
+      text += ',';
+    };
+    const auto appendInt = [](std::string &text,
+                              const std::optional<int> &value) {
+      text += value.has_value() ? std::to_string(*value) : std::string{};
+      text += ',';
+    };
+    const auto appendRate = [](std::string &text,
+                               const std::optional<double> &value) {
+      text += value.has_value() ? formatExportDouble(*value) : std::string{};
+      text += ',';
+    };
+
+    out += "\npacket_mtu_metadata,interface,state,mtu_size_class,present,"
+           "mtu_change_count,discontinuity_count,sample_count,"
+           "valid_sample_count,stale_sample_count,mtu_valid_count,"
+           "counter_valid_count,coverage,span_seconds,last_update,"
+           "current_mtu,previous_mtu,min_mtu,max_mtu,"
+           "current_rx_packets,current_tx_packets,current_rx_bytes,"
+           "current_tx_bytes,window_rx_packets,window_tx_packets,"
+           "window_rx_bytes,window_tx_bytes";
+    for (const NetworkPacketMtuRateColumn &rate : kPacketMtuRateColumns) {
+      out += ",rate_";
+      out += rate.name;
+    }
+    for (const NetworkPacketMtuEstimateColumn &estimate :
+         kPacketMtuEstimateColumns) {
+      out += ",estimate_";
+      out += estimate.name;
+    }
+    out += ",window_rx_bytes_per_frame,window_tx_bytes_per_frame\n";
+    out += "packet_mtu_metadata,";
+    out += escapeNetworkTrafficCsvField(pm.name);
+    out += ',';
+    out += escapeNetworkTrafficCsvField(pm.state);
+    out += ',';
+    out += escapeNetworkTrafficCsvField(pm.mtu_size_class);
+    out += ',';
+    out += pm.present ? "1" : "0";
+    out += ',';
+    out += std::to_string(pm.mtu_change_count);
+    out += ',';
+    out += std::to_string(pm.discontinuity_count);
+    out += ',';
+    out += std::to_string(pm.sample_count);
+    out += ',';
+    out += std::to_string(pm.valid_sample_count);
+    out += ',';
+    out += std::to_string(pm.stale_sample_count);
+    out += ',';
+    out += std::to_string(pm.mtu_valid_count);
+    out += ',';
+    out += std::to_string(pm.counter_valid_count);
+    out += ',';
+    out += formatExportDouble(pm.coverage);
+    out += ',';
+    out += formatExportDouble(pm.span_seconds);
+    out += ',';
+    out += escapeNetworkTrafficCsvField(
+        formatNetworkTrafficTimestamp(pm.last_update));
+    out += ',';
+    appendInt(out, pm.current_mtu);
+    appendInt(out, pm.previous_mtu);
+    appendInt(out, pm.min_mtu);
+    appendInt(out, pm.max_mtu);
+    appendCounter(out, pm.current_rx_packets);
+    appendCounter(out, pm.current_tx_packets);
+    appendCounter(out, pm.current_rx_bytes);
+    appendCounter(out, pm.current_tx_bytes);
+    appendCounter(out, pm.window_rx_packets);
+    appendCounter(out, pm.window_tx_packets);
+    appendCounter(out, pm.window_rx_bytes);
+    appendCounter(out, pm.window_tx_bytes);
+    for (const NetworkPacketMtuRateColumn &rate : kPacketMtuRateColumns) {
+      appendRate(out, pm.rates.*(rate.member));
+    }
+    for (const NetworkPacketMtuEstimateColumn &estimate :
+         kPacketMtuEstimateColumns) {
+      appendRate(out, pm.estimate.*(estimate.member));
+    }
+    appendRate(out, pm.window_estimate.rx_bytes_per_frame);
+    appendRate(out, pm.window_estimate.tx_bytes_per_frame);
+    if (out.back() == ',') {
+      out.pop_back();
+    }
+    out += '\n';
+
+    out += "\ntimestamp,interface,valid,mtu_available,counters_available,"
+           "mtu,previous_mtu,mtu_changed";
+    out += ",counter_rx_packets,counter_tx_packets,";
+    out += "counter_rx_bytes,counter_tx_bytes";
+    for (const NetworkPacketMtuRateColumn &rate : kPacketMtuRateColumns) {
+      out += ",rate_";
+      out += rate.name;
+    }
+    for (const NetworkPacketMtuEstimateColumn &estimate :
+         kPacketMtuEstimateColumns) {
+      out += ",estimate_";
+      out += estimate.name;
+    }
+    out += ",counter_discontinuity_count\n";
+    for (const NetworkTrafficExportPacketMtuRow &row : pm.samples) {
+      out += escapeNetworkTrafficCsvField(
+          formatNetworkTrafficTimestamp(row.timestamp));
+      out += ',';
+      out += interface;  // already-escaped display name
+      out += ',';
+      out += row.valid ? "1" : "0";
+      out += ',';
+      out += row.mtu_available ? "1" : "0";
+      out += ',';
+      out += row.counters_available ? "1" : "0";
+      out += ',';
+      appendInt(out, row.mtu);
+      appendInt(out, row.previous_mtu);
+      out += row.mtu_changed ? "1" : "0";
+      out += ',';
+      appendCounter(out, row.rx_packets);
+      appendCounter(out, row.tx_packets);
+      appendCounter(out, row.rx_bytes);
+      appendCounter(out, row.tx_bytes);
+      for (const NetworkPacketMtuRateColumn &rate : kPacketMtuRateColumns) {
+        appendRate(out, row.rates.*(rate.member));
+      }
+      for (const NetworkPacketMtuEstimateColumn &estimate :
+           kPacketMtuEstimateColumns) {
+        appendRate(out, row.estimate.*(estimate.member));
+      }
+      out += std::to_string(row.counter_discontinuity_count);
+      out += '\n';
+    }
+
+    out += "\npacket_mtu_events,timestamp,previous_mtu,new_mtu\n";
+    for (const NetworkTrafficExportPacketMtuChangeEvent &event :
+         pm.mtu_change_events) {
+      out += "packet_mtu_events,";
+      out += escapeNetworkTrafficCsvField(event.timestamp_iso8601);
+      out += ',';
+      appendInt(out, event.previous_mtu);
+      appendInt(out, event.new_mtu);
+      out.pop_back();  // drop the trailing comma from the last empty field
+      out += '\n';
+    }
+  }
   return out;
 }
 
@@ -1532,6 +1805,165 @@ std::string generateNetworkTrafficJson(
     });
   }();
 
+  // Step 54 MTU/packet statistics captured with the snapshot, or null when absent
+  // (aggregate / interface not tracked / no recorded samples). Series summary
+  // (configured MTU and size class, MTU changes, cumulative counters, interval
+  // rates, estimated average frame sizes, retained-window deltas) plus per-sample
+  // rows and the MTU-change timeline. Unavailable metrics are null and never
+  // fabricated zeros; the frame sizes are explicitly estimates (kernel counters
+  // do not expose a packet-size distribution).
+  const std::string packet_mtu_json = [&] {
+    if (!snapshot.packet_mtu.has_value()) {
+      return std::string("null");
+    }
+    const NetworkTrafficExportPacketMtuStats &pm = *snapshot.packet_mtu;
+    const auto countersObject =
+        [](std::optional<std::uint64_t> rx_packets,
+           std::optional<std::uint64_t> tx_packets,
+           std::optional<std::uint64_t> rx_bytes,
+           std::optional<std::uint64_t> tx_bytes) {
+          return jsonObject({
+              {"rx_packets", jsonNumber(rx_packets)},
+              {"tx_packets", jsonNumber(tx_packets)},
+              {"rx_bytes", jsonNumber(rx_bytes)},
+              {"tx_bytes", jsonNumber(tx_bytes)},
+          });
+        };
+    const std::string current_json = countersObject(
+        pm.current_rx_packets, pm.current_tx_packets, pm.current_rx_bytes,
+        pm.current_tx_bytes);
+    const std::string window_json = countersObject(
+        pm.window_rx_packets, pm.window_tx_packets, pm.window_rx_bytes,
+        pm.window_tx_bytes);
+
+    std::vector<std::string> rate_members;
+    rate_members.reserve(std::size(kPacketMtuRateColumns));
+    for (const NetworkPacketMtuRateColumn &rate : kPacketMtuRateColumns) {
+      rate_members.push_back(
+          jsonObject({{rate.name, jsonNumber(pm.rates.*(rate.member))}}));
+    }
+    std::string rates_json = "{";
+    for (const std::string &member : rate_members) {
+      rates_json += member;
+      rates_json += ',';
+    }
+    if (!rate_members.empty()) {
+      rates_json.pop_back();
+    }
+    rates_json += '}';
+
+    auto estimatesObject = [](const NetworkPacketSizeEstimate &estimate) {
+      std::vector<std::string> members;
+      members.reserve(std::size(kPacketMtuEstimateColumns));
+      for (const NetworkPacketMtuEstimateColumn &column :
+           kPacketMtuEstimateColumns) {
+        members.push_back(
+            jsonObject({{column.name, jsonNumber(estimate.*(column.member))}}));
+      }
+      std::string out = "{";
+      for (const std::string &member : members) {
+        out += member;
+        out += ',';
+      }
+      if (!members.empty()) {
+        out.pop_back();
+      }
+      out += '}';
+      return out;
+    };
+    const std::string estimate_json = estimatesObject(pm.estimate);
+    const std::string window_estimate_json =
+        jsonObject({
+            {"rx_bytes_per_frame",
+             jsonNumber(pm.window_estimate.rx_bytes_per_frame)},
+            {"tx_bytes_per_frame",
+             jsonNumber(pm.window_estimate.tx_bytes_per_frame)},
+        });
+
+    std::vector<std::string> sample_objects;
+    sample_objects.reserve(pm.samples.size());
+    for (const NetworkTrafficExportPacketMtuRow &row : pm.samples) {
+      std::vector<std::string> row_rate_members;
+      row_rate_members.reserve(std::size(kPacketMtuRateColumns));
+      for (const NetworkPacketMtuRateColumn &rate : kPacketMtuRateColumns) {
+        row_rate_members.push_back(
+            jsonObject({{rate.name, jsonNumber(row.rates.*(rate.member))}}));
+      }
+      std::string row_rates_json = "{";
+      for (const std::string &member : row_rate_members) {
+        row_rates_json += member;
+        row_rates_json += ',';
+      }
+      if (!row_rate_members.empty()) {
+        row_rates_json.pop_back();
+      }
+      row_rates_json += '}';
+
+      const std::string row_estimate_json =
+          estimatesObject(row.estimate);
+
+      sample_objects.push_back(jsonObject({
+          {"timestamp",
+           jsonEscape(formatNetworkTrafficTimestamp(row.timestamp))},
+          {"valid", row.valid ? "true" : "false"},
+          {"mtu_available", row.mtu_available ? "true" : "false"},
+          {"counters_available", row.counters_available ? "true" : "false"},
+          {"mtu", jsonNumber(row.mtu)},
+          {"previous_mtu", jsonNumber(row.previous_mtu)},
+          {"mtu_changed", row.mtu_changed ? "true" : "false"},
+          {"counters",
+           countersObject(row.rx_packets, row.tx_packets, row.rx_bytes,
+                          row.tx_bytes)},
+          {"rates", row_rates_json},
+          {"estimate", row_estimate_json},
+          {"counter_discontinuity_count",
+           std::to_string(row.counter_discontinuity_count)},
+      }));
+    }
+
+    std::vector<std::string> event_objects;
+    event_objects.reserve(pm.mtu_change_events.size());
+    for (const NetworkTrafficExportPacketMtuChangeEvent &event :
+         pm.mtu_change_events) {
+      event_objects.push_back(jsonObject({
+          {"timestamp", jsonEscape(event.timestamp_iso8601)},
+          {"previous_mtu", jsonNumber(event.previous_mtu)},
+          {"new_mtu", jsonNumber(event.new_mtu)},
+      }));
+    }
+
+    return jsonObject({
+        {"identity", jsonEscape(pm.identity)},
+        {"name", jsonEscape(pm.name)},
+        {"state", jsonEscape(pm.state)},
+        {"mtu_size_class", jsonEscape(pm.mtu_size_class)},
+        {"present", pm.present ? "true" : "false"},
+        {"mtu_change_count", std::to_string(pm.mtu_change_count)},
+        {"discontinuity_count", std::to_string(pm.discontinuity_count)},
+        {"sample_count", std::to_string(pm.sample_count)},
+        {"valid_sample_count", std::to_string(pm.valid_sample_count)},
+        {"stale_sample_count", std::to_string(pm.stale_sample_count)},
+        {"mtu_valid_count", std::to_string(pm.mtu_valid_count)},
+        {"counter_valid_count", std::to_string(pm.counter_valid_count)},
+        {"coverage", jsonNumber(std::optional<double>(pm.coverage))},
+        {"complete", pm.sample_count >= snapshot.max_samples ? "true" : "false"},
+        {"span_seconds", jsonNumber(std::optional<double>(pm.span_seconds))},
+        {"last_update",
+         jsonEscape(formatNetworkTrafficTimestamp(pm.last_update))},
+        {"current_mtu", jsonNumber(pm.current_mtu)},
+        {"previous_mtu", jsonNumber(pm.previous_mtu)},
+        {"min_mtu", jsonNumber(pm.min_mtu)},
+        {"max_mtu", jsonNumber(pm.max_mtu)},
+        {"current", current_json},
+        {"window_delta", window_json},
+        {"rates", rates_json},
+        {"estimate", estimate_json},
+        {"window_estimate", window_estimate_json},
+        {"samples", jsonArray(sample_objects)},
+        {"mtu_change_events", jsonArray(event_objects)},
+    });
+  }();
+
   const std::string history = jsonObject({
       {"start_timestamp", start_timestamp},
       {"end_timestamp", end_timestamp},
@@ -1602,6 +2034,7 @@ std::string generateNetworkTrafficJson(
       {"wireless", wireless_json},
       {"wireless_history", wireless_history_json},
       {"link_stats", link_stats_json},
+      {"packet_mtu", packet_mtu_json},
       {"history", history},
       {"units", units},
       {"summary", summary_json},
@@ -1687,8 +2120,8 @@ NetworkTrafficExportResult exportNetworkTrafficHistory(
     return {NetworkTrafficExportStatus::UnsupportedFormat, 0, 0, {}};
   }
   // A snapshot counts as content if it carries traffic rows, wireless history
-  // rows/events or Step 53 link error-statistics samples — an otherwise-empty
-  // snapshot with any of those still exports.
+  // rows/events, Step 53 link error-statistics samples or Step 54 MTU/packet
+  // samples — an otherwise-empty snapshot with any of those still exports.
   const bool has_wireless =
       snapshot.wireless_history.has_value() &&
       (!snapshot.wireless_history->samples.empty() ||
@@ -1696,7 +2129,11 @@ NetworkTrafficExportResult exportNetworkTrafficHistory(
   const bool has_link_stats =
       snapshot.link_stats.has_value() &&
       !snapshot.link_stats->samples.empty();
-  if (snapshot.samples.empty() && !has_wireless && !has_link_stats) {
+  const bool has_packet_mtu =
+      snapshot.packet_mtu.has_value() &&
+      !snapshot.packet_mtu->samples.empty();
+  if (snapshot.samples.empty() && !has_wireless && !has_link_stats &&
+      !has_packet_mtu) {
     return {NetworkTrafficExportStatus::EmptyHistory, 0, 0, {}};
   }
   const std::string contents =
